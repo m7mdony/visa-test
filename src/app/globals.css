@@ -18,3 +18,9 @@ body {
   font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
     sans-serif;
 }
+
+input::placeholder,
+textarea::placeholder {
+  color: #6b7280; /* zinc-500 */
+  opacity: 1;
+}
