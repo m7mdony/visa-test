@@ -27,7 +27,7 @@ export default function TestClient() {
   const [videoUrls, setVideoUrls] = useState<string[]>([
     "https://face-liveness-1758087237.s3.us-east-1.amazonaws.com/face-liveness/374100ab-4324-4fdb-b8be-8e8707ff7153_2026-03-09T08-40-04-510Z.webm",
   ]);
-  const [repetitions, setRepetitions] = useState(1);
+  const [repetitions, setRepetitions] = useState<string>("1");
   const [isFirstVerification, setIsFirstVerification] = useState(false);
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState<ResultItem[]>([]);
@@ -75,7 +75,8 @@ export default function TestClient() {
       setError("At least one video URL is required");
       return;
     }
-    if (repetitions <= 0) {
+    const repetitionsNum = Number((repetitions || "").trim());
+    if (!Number.isFinite(repetitionsNum) || repetitionsNum <= 0) {
       setError("Repetitions must be greater than 0");
       return;
     }
@@ -90,7 +91,7 @@ export default function TestClient() {
           sessionApiUrl,
           streamSuffix,
           videoUrls: filteredUrls,
-          repetitions,
+          repetitions: repetitionsNum,
           isFirstVerification,
         }),
       });
@@ -185,7 +186,7 @@ export default function TestClient() {
               type="number"
               min={1}
               value={repetitions}
-              onChange={(e) => setRepetitions(Number(e.target.value) || 1)}
+              onChange={(e) => setRepetitions(e.target.value)}
               className="w-32 rounded-lg border border-zinc-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900"
             />
           </div>
