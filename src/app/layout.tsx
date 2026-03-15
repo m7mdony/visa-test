@@ -49,6 +49,18 @@ export default function RootLayout({
                 >
                   Testing
                 </Link>
+                <Link
+                  href="/logs"
+                  className="hover:text-zinc-950 transition-colors"
+                >
+                  Logs
+                </Link>
+                <Link
+                  href="/report"
+                  className="hover:text-zinc-950 transition-colors"
+                >
+                  Report
+                </Link>
               </nav>
             </div>
           </header>
