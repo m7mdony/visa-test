@@ -33,10 +33,17 @@ function parseLogLine(line: string): ParsedLog | null {
     out.passportTime = parseFloat(pvMatch[2]);
   }
 
-  const fvalMatch = line.match(/FaceValidation=\{[^}]*Attempts=(\d+)[^}]*Time=([\d.]+)s/);
-  if (fvalMatch) {
-    out.faceValidationAttempts = parseInt(fvalMatch[1], 10);
-    out.faceValidationTime = parseFloat(fvalMatch[2]);
+  // FaceValidation can be a block with Attempts+Time, or a single value inside FaceVerification (e.g. FaceValidation=2.44s)
+  const fvalBlockMatch = line.match(/FaceValidation=\{[^}]*Attempts=(\d+)[^}]*Time=([\d.]+)s/);
+  if (fvalBlockMatch) {
+    out.faceValidationAttempts = parseInt(fvalBlockMatch[1], 10);
+    out.faceValidationTime = parseFloat(fvalBlockMatch[2]);
+  } else {
+    const fvalSimpleMatch = line.match(/FaceValidation=([\d.]+)s/);
+    if (fvalSimpleMatch) {
+      out.faceValidationTime = parseFloat(fvalSimpleMatch[1]);
+      out.faceValidationAttempts = 1;
+    }
   }
 
   return Object.keys(out).length > 0 ? out : null;

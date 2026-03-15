@@ -11,6 +11,31 @@ const INTERVAL_MS: Record<string, number> = {
   "24h": 24 * 60 * 60 * 1000,
 };
 
+const APP_LABEL_OPTIONS = [
+  "accounts-api",
+  "cainjector",
+  "cloudflare-api",
+  "continuous-cloudflare-api",
+  "coredns",
+  "event-exporter",
+  "face-verification",
+  "grafana",
+  "kube-state-metrics",
+  "kustomize-controller",
+  "liveness-bot",
+  "loki",
+  "notification-controller",
+  "prometheus",
+  "promtail",
+  "redis-stack",
+  "source-controller",
+  "traefik",
+  "vfs-global-bot",
+  "vfs-payments-bot",
+  "vfs-sms-bot",
+  "visaflow-dashboard",
+] as const;
+
 function toDatetimeLocal(d: Date): string {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
@@ -138,13 +163,17 @@ export default function LogsClient() {
         </div>
         <div>
           <label className="block text-sm font-medium text-zinc-700 mb-1">Target (app label)</label>
-          <input
-            type="text"
-            value={target}
+          <select
+            value={APP_LABEL_OPTIONS.includes(target as (typeof APP_LABEL_OPTIONS)[number]) ? target : "liveness-bot"}
             onChange={(e) => setTarget(e.target.value)}
-            placeholder="liveness-bot"
-            className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm bg-zinc-50 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900"
-          />
+            className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900"
+          >
+            {APP_LABEL_OPTIONS.map((opt) => (
+              <option key={opt} value={opt}>
+                {opt}
+              </option>
+            ))}
+          </select>
         </div>
         <div className="sm:col-span-2">
           <label className="block text-sm font-medium text-zinc-700 mb-1">Search query (optional)</label>
