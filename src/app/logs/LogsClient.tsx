@@ -30,6 +30,7 @@ const APP_LABEL_OPTIONS = [
   "redis-stack",
   "source-controller",
   "traefik",
+  "aws-liveness-automation-staging",
   "vfs-global-bot",
   "vfs-payments-bot",
   "vfs-sms-bot",

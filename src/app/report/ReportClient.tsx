@@ -268,6 +268,8 @@ type LivenessReportSection = {
   jobCount: number;
   longWebsocketCount: number;
   longWebsocketExamples: Array<{ jobId: string; videoUrl: string }>;
+  shortWebsocketCount: number;
+  shortWebsocketExamples: Array<{ jobId: string; videoUrl: string }>;
   longVideoPrep: { count: number; examples: LongExample[] };
   longVideoFileLoaded: { count: number; examples: LongExample[] };
   longBrowserSetup: { count: number; examples: LongExample[] };
@@ -289,6 +291,7 @@ function computeLivenessSection(
 ): LivenessReportSection | null {
   const metrics: LivenessJobMetrics[] = [];
   const longWebsocket: Array<{ fullJobId: string; videoUrl: string; ws: number }> = [];
+  const shortWebsocket: Array<{ fullJobId: string; videoUrl: string; ws: number }> = [];
   const longVideoPrep: Array<{ fullJobId: string; videoUrl: string; value: number }> = [];
   const longVideoFileLoaded: Array<{ fullJobId: string; videoUrl: string; value: number }> = [];
   const longBrowserSetup: Array<{ fullJobId: string; videoUrl: string; value: number }> = [];
@@ -302,6 +305,9 @@ function computeLivenessSection(
     metrics.push(m);
     if (m.websocketDisconnect != null && m.websocketDisconnect > 11) {
       longWebsocket.push({ ...meta, ws: m.websocketDisconnect });
+    }
+    if (m.websocketDisconnect != null && m.websocketDisconnect < 10) {
+      shortWebsocket.push({ ...meta, ws: m.websocketDisconnect });
     }
     if (m.videoPrep != null && m.videoPrep > 0.2) {
       longVideoPrep.push({ ...meta, value: m.videoPrep });
@@ -336,6 +342,8 @@ function computeLivenessSection(
     jobCount: n,
     longWebsocketExamples: longWebsocket.slice(0, 3).map(({ fullJobId, videoUrl }) => ({ jobId: fullJobId, videoUrl })),
     longWebsocketCount: longWebsocket.length,
+    shortWebsocketExamples: shortWebsocket.slice(0, 3).map(({ fullJobId, videoUrl }) => ({ jobId: fullJobId, videoUrl })),
+    shortWebsocketCount: shortWebsocket.length,
     longVideoPrep: { count: longVideoPrep.length, examples: take3WithValue(longVideoPrep) },
     longVideoFileLoaded: { count: longVideoFileLoaded.length, examples: take3WithValue(longVideoFileLoaded) },
     longBrowserSetup: { count: longBrowserSetup.length, examples: take3WithValue(longBrowserSetup) },
@@ -389,6 +397,25 @@ function LivenessSectionBlock({ section, fmt }: { section: LivenessReportSection
           <div className="text-sm font-medium text-amber-900">Jobs with websocket &gt; 11s: {section.longWebsocketCount}</div>
           <div className="mt-2 text-xs space-y-2">
             {section.longWebsocketExamples.map((ex, i) => (
+              <div key={i}>
+                <span className="text-zinc-600">Job ID: </span>
+                <code className="text-zinc-800">{ex.jobId}</code>
+                {ex.videoUrl && (
+                  <>
+                    {" · "}
+                    <a href={ex.videoUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 underline break-all">Video</a>
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {section.shortWebsocketCount > 0 && (
+        <div className="rounded-lg border border-zinc-200 bg-zinc-50/50 p-3 mt-2">
+          <div className="text-sm font-medium text-zinc-800">Jobs with websocket &lt; 10s: {section.shortWebsocketCount}</div>
+          <div className="mt-2 text-xs space-y-2">
+            {section.shortWebsocketExamples.map((ex, i) => (
               <div key={i}>
                 <span className="text-zinc-600">Job ID: </span>
                 <code className="text-zinc-800">{ex.jobId}</code>
