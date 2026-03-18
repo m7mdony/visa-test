@@ -63,6 +63,8 @@ type ReportMetrics = {
   avgFaceValidationTime: number;
   avgFaceSolve: number;
   avgFaceGetResult: number;
+  avgFaceAttemptsPerIdentity: number;
+  avgPassportAttemptsPerIdentity: number;
 };
 
 type LogEntry = { time: string; line: string };
@@ -102,6 +104,37 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
   const passportStartStacks = new Map<string, number[]>();
   // For identity total time: per-(URN + email) stacks of "Initiating identity verification portal" timestamps
   const identityStartStacks = new Map<string, number[]>();
+
+  type IdentityAgg = {
+    faceAttempts: number;
+    faceTimeSum: number;
+    faceSolveSum: number;
+    faceGetResultSum: number;
+    passportAttempts: number;
+    passportTimeSum: number;
+    faceValidationTimeSum: number;
+    faceValidationCount: number;
+  };
+  const identityAgg = new Map<string, IdentityAgg>();
+
+  const getIdentityAgg = (key: string | undefined | null): IdentityAgg | null => {
+    if (!key) return null;
+    let v = identityAgg.get(key);
+    if (!v) {
+      v = {
+        faceAttempts: 0,
+        faceTimeSum: 0,
+        faceSolveSum: 0,
+        faceGetResultSum: 0,
+        passportAttempts: 0,
+        passportTimeSum: 0,
+        faceValidationTimeSum: 0,
+        faceValidationCount: 0,
+      };
+      identityAgg.set(key, v);
+    }
+    return v;
+  };
 
   for (const { time, line } of sorted) {
     const urnMatch = line.match(/\burn=([^\s]+)/);
@@ -151,20 +184,37 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
         if (isSuccess) faceSuccess += 1;
         if (isFailed) faceFailed += 1;
 
+        const agg = getIdentityAgg(identityKey);
+
         const timeTakenMatch = line.match(/TimeTaken=([\d.]+)s/);
         if (timeTakenMatch) {
-          sumFaceTime += parseFloat(timeTakenMatch[1]);
+          const v = parseFloat(timeTakenMatch[1]);
+          sumFaceTime += v;
           faceTimeCount += 1;
+          if (agg) {
+            agg.faceTimeSum += v;
+          }
         }
         const solveMatch = line.match(/Solve=([\d.]+)s/);
         if (solveMatch) {
-          sumFaceSolve += parseFloat(solveMatch[1]);
+          const v = parseFloat(solveMatch[1]);
+          sumFaceSolve += v;
           faceSolveCount += 1;
+          if (agg) {
+            agg.faceSolveSum += v;
+          }
         }
         const getResultMatch = line.match(/GetResult=([\d.]+)s/);
         if (getResultMatch) {
-          sumFaceGetResult += parseFloat(getResultMatch[1]);
+          const v = parseFloat(getResultMatch[1]);
+          sumFaceGetResult += v;
           faceGetResultCount += 1;
+          if (agg) {
+            agg.faceGetResultSum += v;
+          }
+        }
+        if (agg) {
+          agg.faceAttempts += 1;
         }
       }
     }
@@ -200,14 +250,28 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
         const diffSec = Math.max(0, (tsMs - startMs) / 1000);
         sumPassportTime += diffSec;
         passportTimeCount += 1;
+        const agg = getIdentityAgg(identityKey);
+        if (agg) {
+          agg.passportTimeSum += diffSec;
+        }
+      }
+      const agg = getIdentityAgg(identityKey);
+      if (agg) {
+        agg.passportAttempts += 1;
       }
     }
 
     // Face validation timings sometimes appear as FaceValidation=2.44s on detailed logs
     const fvalMatch = line.match(/FaceValidation=([\d.]+)s/);
     if (fvalMatch) {
-      sumFaceValidationTime += parseFloat(fvalMatch[1]);
+      const v = parseFloat(fvalMatch[1]);
+      sumFaceValidationTime += v;
       faceValidationCount += 1;
+      const agg = getIdentityAgg(identityKey);
+      if (agg) {
+        agg.faceValidationTimeSum += v;
+        agg.faceValidationCount += 1;
+      }
     }
   }
 
@@ -225,6 +289,43 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
     identityCountForTiming ||
     (totalFaceAttempts > 0 || totalPassportAttempts > 0 ? 1 : 0);
 
+  const identityKeys = [...identityAgg.keys()];
+  const identityCount = identityKeys.length || identityCountForTiming || 1;
+
+  const avgAttemptsPerIdentityFace =
+    identityCount > 0 ? totalFaceAttempts / identityCount : 0;
+  const avgAttemptsPerIdentityPassport =
+    identityCount > 0 ? totalPassportAttempts / identityCount : 0;
+
+  const perIdentityFaceTime: number[] = [];
+  const perIdentityFaceSolve: number[] = [];
+  const perIdentityFaceGetResult: number[] = [];
+  const perIdentityPassportTime: number[] = [];
+  const perIdentityFaceValidation: number[] = [];
+
+  for (const key of identityKeys) {
+    const agg = identityAgg.get(key);
+    if (!agg) continue;
+    if (agg.faceAttempts > 0 && agg.faceTimeSum > 0) {
+      perIdentityFaceTime.push(agg.faceTimeSum / agg.faceAttempts);
+    }
+    if (agg.faceAttempts > 0 && agg.faceSolveSum > 0) {
+      perIdentityFaceSolve.push(agg.faceSolveSum / agg.faceAttempts);
+    }
+    if (agg.faceAttempts > 0 && agg.faceGetResultSum > 0) {
+      perIdentityFaceGetResult.push(agg.faceGetResultSum / agg.faceAttempts);
+    }
+    if (agg.passportAttempts > 0 && agg.passportTimeSum > 0) {
+      perIdentityPassportTime.push(agg.passportTimeSum / agg.passportAttempts);
+    }
+    if (agg.faceValidationCount > 0 && agg.faceValidationTimeSum > 0) {
+      perIdentityFaceValidation.push(agg.faceValidationTimeSum / agg.faceValidationCount);
+    }
+  }
+
+  const avgFromArray = (arr: number[]): number =>
+    arr.length > 0 ? arr.reduce((s, v) => s + v, 0) / arr.length : 0;
+
   return {
     count,
     totalFaceAttempts,
@@ -234,11 +335,13 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
     passportFailed,
     passportSuccess,
     avgTotalTime: identityCountForTiming > 0 ? sumIdentityTotalTime / identityCountForTiming : 0,
-    avgFaceTime: faceTimeCount > 0 ? sumFaceTime / faceTimeCount : 0,
-    avgPassportTime: passportTimeCount > 0 ? sumPassportTime / passportTimeCount : 0,
-    avgFaceValidationTime: faceValidationCount > 0 ? sumFaceValidationTime / faceValidationCount : 0,
-    avgFaceSolve: faceSolveCount > 0 ? sumFaceSolve / faceSolveCount : 0,
-    avgFaceGetResult: faceGetResultCount > 0 ? sumFaceGetResult / faceGetResultCount : 0,
+    avgFaceTime: avgFromArray(perIdentityFaceTime),
+    avgPassportTime: avgFromArray(perIdentityPassportTime),
+    avgFaceValidationTime: avgFromArray(perIdentityFaceValidation),
+    avgFaceSolve: avgFromArray(perIdentityFaceSolve),
+    avgFaceGetResult: avgFromArray(perIdentityFaceGetResult),
+    avgFaceAttemptsPerIdentity: avgAttemptsPerIdentityFace,
+    avgPassportAttemptsPerIdentity: avgAttemptsPerIdentityPassport,
   };
 }
 
@@ -276,6 +379,8 @@ function computeMetrics(logs: { line: string }[]): ReportMetrics | null {
     avgFaceValidationTime: totalFaceValidationAttempts > 0 ? sumFaceValidationTime / totalFaceValidationAttempts : 0,
     avgFaceSolve: totalFaceAttempts > 0 ? sumFaceSolve / totalFaceAttempts : 0,
     avgFaceGetResult: totalFaceAttempts > 0 ? sumFaceGetResult / totalFaceAttempts : 0,
+    avgFaceAttemptsPerIdentity: 0,
+    avgPassportAttemptsPerIdentity: 0,
   };
 }
 
@@ -1012,6 +1117,10 @@ export default function ReportClient() {
                   <span className="font-medium tabular-nums">{reportMetrics.totalFaceAttempts}</span>
                 </li>
                 <li className="flex justify-between gap-4">
+                  <span className="text-zinc-700">Avg face attempts per identity</span>
+                  <span className="font-medium tabular-nums">{fmt(reportMetrics.avgFaceAttemptsPerIdentity)}</span>
+                </li>
+                <li className="flex justify-between gap-4">
                   <span className="text-zinc-700">Face verification — failed</span>
                   <span className="font-medium tabular-nums text-amber-700">{reportMetrics.faceFailed}</span>
                 </li>
@@ -1022,6 +1131,10 @@ export default function ReportClient() {
                 <li className="flex justify-between gap-4">
                   <span className="text-zinc-700">Total passport verification attempts</span>
                   <span className="font-medium tabular-nums">{reportMetrics.totalPassportAttempts}</span>
+                </li>
+                <li className="flex justify-between gap-4">
+                  <span className="text-zinc-700">Avg passport attempts per identity</span>
+                  <span className="font-medium tabular-nums">{fmt(reportMetrics.avgPassportAttemptsPerIdentity)}</span>
                 </li>
                 <li className="flex justify-between gap-4">
                   <span className="text-zinc-700">Passport verification — failed</span>
