@@ -100,6 +100,8 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
 
   // For passport timing: per-(URN + email) stacks of "Initiating passport validation" timestamps
   const passportStartStacks = new Map<string, number[]>();
+  // For identity total time: per-(URN + email) stacks of "Initiating identity verification portal" timestamps
+  const identityStartStacks = new Map<string, number[]>();
 
   for (const { time, line } of sorted) {
     const urnMatch = line.match(/\burn=([^\s]+)/);
@@ -108,15 +110,29 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
     const email = emailMatch?.[1]?.trim();
     if (urn) urns.add(urn);
     const passportKey = urn && email ? `${urn}|${email}` : urn ?? "";
+    const identityKey = urn && email ? `${urn}|${email}` : urn ?? email ?? "";
 
     const tsMs = Number.isFinite(Date.parse(time)) ? Date.parse(time) : NaN;
 
-    // Identity verification summary (for total time per verification)
-    if (line.includes("Identity verification completed successfully")) {
-      const totalTimeMatch = line.match(/TotalTime=([\d.]+)s/);
-      if (totalTimeMatch) {
+    // Identity total time: Initiating identity portal -> completed/failed for same URN+email
+    if (identityKey && line.includes("Initiating identity verification portal")) {
+      if (!Number.isNaN(tsMs)) {
+        const stack = identityStartStacks.get(identityKey) ?? [];
+        stack.push(tsMs);
+        identityStartStacks.set(identityKey, stack);
+      }
+    } else if (
+      identityKey &&
+      (line.includes("Identity verification completed successfully") ||
+        line.includes("Identity verification failed"))
+    ) {
+      const stack = identityStartStacks.get(identityKey);
+      if (stack && stack.length > 0 && !Number.isNaN(tsMs)) {
+        const startMs = stack.shift()!;
+        const diffSec = Math.max(0, (tsMs - startMs) / 1000);
         identityCountForTiming += 1;
-        sumIdentityTotalTime += parseFloat(totalTimeMatch[1]);
+        sumIdentityTotalTime += diffSec;
+        identityStartStacks.set(identityKey, stack);
       }
     }
 
@@ -128,6 +144,9 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
       const isSuccess = line.includes("Face verification completed successfully");
       const isFailed = line.includes("Face verification failed");
       if (isSuccess || isFailed) {
+        if (isFailed && isTlsRelated(line)) {
+          continue;
+        }
         totalFaceAttempts += 1;
         if (isSuccess) faceSuccess += 1;
         if (isFailed) faceFailed += 1;
@@ -163,6 +182,9 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
       (line.includes("Passport validation completed successfully") ||
         line.includes("Passport validation failed"))
     ) {
+      if (line.includes("Passport validation failed") && isTlsRelated(line)) {
+        continue;
+      }
       // Count attempts
       totalPassportAttempts += 1;
       if (line.includes("Passport validation completed successfully")) {
@@ -274,8 +296,13 @@ function extractEmailsFromLogs(logs: { line: string }[]): string[] {
 type FaceErrorEntry = { key: string; count: number; videoUrl?: string; sessionId?: string };
 type PassportErrorEntry = { key: string; count: number; imageUrl?: string };
 
+function isTlsRelated(line: string): boolean {
+  return /\bTLS\b|\bssl\b|\bSSL\b|\btls\b/.test(line);
+}
+
 function parseFaceError(line: string): { key: string; videoUrl?: string; sessionId?: string } | null {
   if (!line.includes("Face verification failed")) return null;
+  if (isTlsRelated(line)) return null;
   const videoUrl = line.match(/VideoURL=(https:\/\/[^\s,\]]+)/)?.[1];
   const sessionId = line.match(/SessionID[=:\s]+([a-f0-9-]+)/i)?.[1]
     ?? line.match(/SessionID: ([a-f0-9-]+)/i)?.[1];
@@ -298,6 +325,7 @@ function parseFaceError(line: string): { key: string; videoUrl?: string; session
 function parsePassportError(line: string): { key: string; imageUrl?: string } | null {
   const m = line.match(/Passport validation failed: ([^\[]+)/);
   if (!m) return null;
+  if (isTlsRelated(line)) return null;
   const imageUrl = line.match(/PassportImageURL=(https:\/\/[^\s,\]]+)/)?.[1];
   return { key: m[1].trim(), imageUrl };
 }
