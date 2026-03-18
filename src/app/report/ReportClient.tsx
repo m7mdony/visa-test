@@ -65,6 +65,162 @@ type ReportMetrics = {
   avgFaceGetResult: number;
 };
 
+type LogEntry = { time: string; line: string };
+
+function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | null {
+  if (entries.length === 0) return null;
+
+  // Ensure chronological order so start/end pairing works
+  const sorted = [...entries].sort((a, b) => a.time.localeCompare(b.time));
+
+  // Count attempts/success/failure and timings from detailed per-email logs
+  let totalFaceAttempts = 0;
+  let faceSuccess = 0;
+  let faceFailed = 0;
+  let totalPassportAttempts = 0;
+  let passportSuccess = 0;
+  let passportFailed = 0;
+  const urns = new Set<string>();
+
+  let identityCountForTiming = 0;
+  let sumIdentityTotalTime = 0;
+
+  let sumFaceTime = 0;
+  let faceTimeCount = 0;
+  let sumFaceSolve = 0;
+  let faceSolveCount = 0;
+  let sumFaceGetResult = 0;
+  let faceGetResultCount = 0;
+
+  let sumPassportTime = 0;
+  let passportTimeCount = 0;
+
+  let sumFaceValidationTime = 0;
+  let faceValidationCount = 0;
+
+  // For passport timing: per-(URN + email) stacks of "Initiating passport validation" timestamps
+  const passportStartStacks = new Map<string, number[]>();
+
+  for (const { time, line } of sorted) {
+    const urnMatch = line.match(/\burn=([^\s]+)/);
+    const urn = urnMatch?.[1]?.trim();
+    const emailMatch = line.match(/email=([^\s]+)/);
+    const email = emailMatch?.[1]?.trim();
+    if (urn) urns.add(urn);
+    const passportKey = urn && email ? `${urn}|${email}` : urn ?? "";
+
+    const tsMs = Number.isFinite(Date.parse(time)) ? Date.parse(time) : NaN;
+
+    // Identity verification summary (for total time per verification)
+    if (line.includes("Identity verification completed successfully")) {
+      const totalTimeMatch = line.match(/TotalTime=([\d.]+)s/);
+      if (totalTimeMatch) {
+        identityCountForTiming += 1;
+        sumIdentityTotalTime += parseFloat(totalTimeMatch[1]);
+      }
+    }
+
+    // Face verification attempts (success + failed), ignore helper "[VerifyJob]" logs
+    if (
+      line.includes("Face verification") &&
+      !line.includes("[VerifyJob] - Face verification completed successfully")
+    ) {
+      const isSuccess = line.includes("Face verification completed successfully");
+      const isFailed = line.includes("Face verification failed");
+      if (isSuccess || isFailed) {
+        totalFaceAttempts += 1;
+        if (isSuccess) faceSuccess += 1;
+        if (isFailed) faceFailed += 1;
+
+        const timeTakenMatch = line.match(/TimeTaken=([\d.]+)s/);
+        if (timeTakenMatch) {
+          sumFaceTime += parseFloat(timeTakenMatch[1]);
+          faceTimeCount += 1;
+        }
+        const solveMatch = line.match(/Solve=([\d.]+)s/);
+        if (solveMatch) {
+          sumFaceSolve += parseFloat(solveMatch[1]);
+          faceSolveCount += 1;
+        }
+        const getResultMatch = line.match(/GetResult=([\d.]+)s/);
+        if (getResultMatch) {
+          sumFaceGetResult += parseFloat(getResultMatch[1]);
+          faceGetResultCount += 1;
+        }
+      }
+    }
+
+    // Passport validation attempts and optional timings
+    // Passport validation timing: Initiating passport validation -> completed/failed
+    if (passportKey && line.includes("Initiating passport validation")) {
+      if (!Number.isNaN(tsMs)) {
+        const stack = passportStartStacks.get(passportKey) ?? [];
+        stack.push(tsMs);
+        passportStartStacks.set(passportKey, stack);
+      }
+    } else if (
+      passportKey &&
+      (line.includes("Passport validation completed successfully") ||
+        line.includes("Passport validation failed"))
+    ) {
+      // Count attempts
+      totalPassportAttempts += 1;
+      if (line.includes("Passport validation completed successfully")) {
+        passportSuccess += 1;
+      } else if (line.includes("Passport validation failed")) {
+        passportFailed += 1;
+      }
+
+      // Compute duration from last unmatched "Initiating passport validation" for this URN
+      const stack = passportStartStacks.get(passportKey);
+      if (stack && stack.length > 0 && !Number.isNaN(tsMs)) {
+        const startMs = stack.shift()!;
+        const diffSec = Math.max(0, (tsMs - startMs) / 1000);
+        sumPassportTime += diffSec;
+        passportTimeCount += 1;
+      }
+    }
+
+    // Face validation timings sometimes appear as FaceValidation=2.44s on detailed logs
+    const fvalMatch = line.match(/FaceValidation=([\d.]+)s/);
+    if (fvalMatch) {
+      sumFaceValidationTime += parseFloat(fvalMatch[1]);
+      faceValidationCount += 1;
+    }
+  }
+
+  if (
+    totalFaceAttempts === 0 &&
+    totalPassportAttempts === 0 &&
+    identityCountForTiming === 0 &&
+    urns.size === 0
+  ) {
+    return null;
+  }
+
+  const count =
+    urns.size ||
+    identityCountForTiming ||
+    (totalFaceAttempts > 0 || totalPassportAttempts > 0 ? 1 : 0);
+
+  return {
+    count,
+    totalFaceAttempts,
+    totalPassportAttempts,
+    faceFailed,
+    faceSuccess,
+    passportFailed,
+    passportSuccess,
+    avgTotalTime: identityCountForTiming > 0 ? sumIdentityTotalTime / identityCountForTiming : 0,
+    avgFaceTime: faceTimeCount > 0 ? sumFaceTime / faceTimeCount : 0,
+    avgPassportTime: passportTimeCount > 0 ? sumPassportTime / passportTimeCount : 0,
+    avgFaceValidationTime: faceValidationCount > 0 ? sumFaceValidationTime / faceValidationCount : 0,
+    avgFaceSolve: faceSolveCount > 0 ? sumFaceSolve / faceSolveCount : 0,
+    avgFaceGetResult: faceGetResultCount > 0 ? sumFaceGetResult / faceGetResultCount : 0,
+  };
+}
+
+// Legacy helper kept for compatibility (not used in the new flow)
 function computeMetrics(logs: { line: string }[]): ReportMetrics | null {
   const parsed = logs.map((l) => parseLogLine(l.line)).filter((p): p is ParsedLog => p != null);
   if (parsed.length === 0) return null;
@@ -544,6 +700,9 @@ export default function ReportClient() {
   const [faceErrors, setFaceErrors] = useState<FaceErrorEntry[]>([]);
   const [passportErrors, setPassportErrors] = useState<PassportErrorEntry[]>([]);
   const [livenessReport, setLivenessReport] = useState<LivenessReport | null>(null);
+  const [livenessTarget, setLivenessTarget] = useState<"liveness-bot" | "aws-liveness-automation-staging">(
+    "liveness-bot"
+  );
 
   const applyPreset = useCallback((interval: string) => {
     const ms = INTERVAL_MS[interval] ?? INTERVAL_MS["24h"];
@@ -569,26 +728,25 @@ export default function ReportClient() {
       return;
     }
     try {
-      setLoadingProgress("Fetching identity verification logs…");
-      const res = await fetch("/api/grafana-logs", {
+      // 1) Portal logs to discover all emails (success + failed)
+      setLoadingProgress("Fetching identity portal logs…");
+      const portalRes = await fetch("/api/grafana-logs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           from: fromMs,
           to: toMs,
           target: "vfs-global-bot",
-          query: "Identity verification completed",
+          query: "Initiating identity verification portal",
           ...(additionalFilter.trim() && { additionalFilter: additionalFilter.trim() }),
         }),
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setError(data.error || `HTTP ${res.status}`);
+      const portalData = await portalRes.json().catch(() => ({}));
+      if (!portalRes.ok) {
+        setError(portalData.error || `HTTP ${portalRes.status}`);
         return;
       }
-      const logs = data.logs ?? [];
-      const metrics = computeMetrics(logs);
-      setReportMetrics(metrics ?? null);
+      const portalLogs = (portalData.logs ?? []) as { time: string; line: string }[];
 
       const EMAIL_BATCH = 1;
       const LIVENESS_BATCH = 1;
@@ -608,8 +766,8 @@ export default function ReportClient() {
         return;
       }
 
-      const emails = extractEmailsFromLogs(logs);
-      const allLines: string[] = [];
+      const emails = extractEmailsFromLogs(portalLogs);
+      const allEntries: { time: string; line: string }[] = [];
       for (let start = 0; start < emails.length; start += EMAIL_BATCH) {
         const end = Math.min(start + EMAIL_BATCH, emails.length);
         setLoadingProgress(`Fetching logs for emails ${start + 1}-${end} of ${emails.length}…`);
@@ -629,13 +787,20 @@ export default function ReportClient() {
               }),
             }).then(async (r) => {
               const d = await r.json().catch(() => ({}));
-              return r.ok && Array.isArray(d.logs) ? (d.logs as { line: string }[]).map((e) => e.line) : [];
+              return r.ok && Array.isArray(d.logs)
+                ? (d.logs as { time: string; line: string }[])
+                : [];
             })
           )
         );
-        for (const lines of results) allLines.push(...lines);
+        for (const entries of results) allEntries.push(...entries);
       }
+      setLoadingProgress("Computing identity & attempt stats…");
+      const metrics = computeMetricsFromDetailedLogs(allEntries);
+      setReportMetrics(metrics ?? null);
       setLoadingProgress(null);
+
+      const allLines = allEntries.map((e) => e.line);
       setFaceErrors(aggregateFaceErrors(allLines));
       setPassportErrors(aggregatePassportErrors(allLines));
 
@@ -648,7 +813,9 @@ export default function ReportClient() {
 
       for (let start = 0; start < prefixes.length; start += LIVENESS_BATCH) {
         const end = Math.min(start + LIVENESS_BATCH, prefixes.length);
-        setLoadingProgress(`Fetching liveness-bot logs (success) ${start + 1}-${end} of ${prefixes.length}…`);
+        setLoadingProgress(
+          `Fetching ${livenessTarget} logs (success) ${start + 1}-${end} of ${prefixes.length}…`
+        );
         const batch = prefixes.slice(start, end);
         const results = await Promise.all(
           batch.map((prefix, i) =>
@@ -658,7 +825,7 @@ export default function ReportClient() {
               body: JSON.stringify({
                 from: fromMs,
                 to: toMs,
-                target: "liveness-bot",
+                target: livenessTarget,
                 query: `JOB_ID:${prefix}`,
                 cookie: sessionCookies[(start + i) % sessionCookies.length],
               }),
@@ -674,7 +841,9 @@ export default function ReportClient() {
       }
       for (let start = 0; start < failedPrefixes.length; start += LIVENESS_BATCH) {
         const end = Math.min(start + LIVENESS_BATCH, failedPrefixes.length);
-        setLoadingProgress(`Fetching liveness-bot logs (failed) ${start + 1}-${end} of ${failedPrefixes.length}…`);
+        setLoadingProgress(
+          `Fetching ${livenessTarget} logs (failed) ${start + 1}-${end} of ${failedPrefixes.length}…`
+        );
         const batch = failedPrefixes.slice(start, end);
         const results = await Promise.all(
           batch.map((prefix, i) =>
@@ -684,7 +853,7 @@ export default function ReportClient() {
               body: JSON.stringify({
                 from: fromMs,
                 to: toMs,
-                target: "liveness-bot",
+                target: livenessTarget,
                 query: `JOB_ID:${prefix}`,
                 cookie: sessionCookies[(start + i) % sessionCookies.length],
               }),
@@ -751,6 +920,26 @@ export default function ReportClient() {
               </button>
             ))}
           </div>
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-zinc-700 mb-1">Liveness app (for JOB_ID logs)</label>
+          <select
+            value={livenessTarget}
+            onChange={(e) =>
+              setLivenessTarget(
+                e.target.value === "aws-liveness-automation-staging"
+                  ? "aws-liveness-automation-staging"
+                  : "liveness-bot"
+              )
+            }
+            className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900"
+          >
+            <option value="liveness-bot">liveness-bot</option>
+            <option value="aws-liveness-automation-staging">aws-liveness-automation-staging</option>
+          </select>
+          <p className="mt-1 text-xs text-zinc-500">
+            Used only when fetching JOB_ID-based liveness logs (video solver metrics).
+          </p>
         </div>
       </div>
 
