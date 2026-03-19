@@ -95,6 +95,11 @@ export async function POST(request: Request) {
   const videoUrls: string[] = body.videoUrls || [];
   const repetitions: number = body.repetitions || 1;
   const isFirstVerification: boolean = !!body.isFirstVerification;
+  const timeoutSecondsRaw: unknown = body.timeoutSeconds;
+  const timeoutSeconds =
+    typeof timeoutSecondsRaw === "number" && Number.isFinite(timeoutSecondsRaw) && timeoutSecondsRaw > 0
+      ? timeoutSecondsRaw
+      : 0;
 
   if (!redisUrl) {
     return NextResponse.json({ error: "Redis URL is required" }, { status: 400 });
@@ -128,60 +133,72 @@ export async function POST(request: Request) {
 
   const redis = new Redis(redisUrl);
 
-  const results = await Promise.all(
-    expandedVideoUrls.map(async (videoUrl, index) => {
-      try {
-        const sessionData = await fetchNewSession(sessionApiUrl);
-        if (!sessionData.success) {
-          throw new Error(
-            `Failed to create session for video ${index + 1}: ${
-              sessionData.message || "unknown error"
-            }`,
-          );
-        }
+  const results: Array<{
+    success: boolean;
+    sessionId?: string;
+    messageId?: string;
+    videoUrl: string;
+    error?: string;
+  }> = [];
 
-        if (!sessionData.sessionId || !sessionData.region) {
-          throw new Error("Session response missing sessionId or region");
-        }
-
-        const message = {
-          id: sessionData.sessionId,
-          sessionId: sessionData.sessionId,
-          region: sessionData.region,
-          credentials: sessionData.credentials,
-          videoUrl,
-          passportNumber: generateRandomPassportNumber(),
-          isFirstVerification,
-          deviceProperties: {
-            userAgent:
-              "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.135 Mobile Safari/537.36",
-            width: 1100,
-            height: 982,
-          },
-        };
-
-        const messageId = await redis.xadd(
-          streamKey,
-          "*",
-          "body",
-          JSON.stringify(message),
+  for (let index = 0; index < expandedVideoUrls.length; index++) {
+    const videoUrl = expandedVideoUrls[index];
+    if (index > 0 && timeoutSeconds > 0) {
+      await new Promise((resolve) =>
+        setTimeout(resolve, timeoutSeconds * 1000),
+      );
+    }
+    try {
+      const sessionData = await fetchNewSession(sessionApiUrl);
+      if (!sessionData.success) {
+        throw new Error(
+          `Failed to create session for video ${index + 1}: ${
+            sessionData.message || "unknown error"
+          }`,
         );
-
-        return {
-          success: true as const,
-          sessionId: sessionData.sessionId!,
-          messageId,
-          videoUrl,
-        };
-      } catch (error: any) {
-        return {
-          success: false as const,
-          error: error.message || String(error),
-          videoUrl,
-        };
       }
-    }),
-  );
+
+      if (!sessionData.sessionId || !sessionData.region) {
+        throw new Error("Session response missing sessionId or region");
+      }
+
+      const message = {
+        id: sessionData.sessionId,
+        sessionId: sessionData.sessionId,
+        region: sessionData.region,
+        credentials: sessionData.credentials,
+        videoUrl,
+        passportNumber: generateRandomPassportNumber(),
+        isFirstVerification,
+        deviceProperties: {
+          userAgent:
+            "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.135 Mobile Safari/537.36",
+          width: 1100,
+          height: 982,
+        },
+      };
+
+      const messageId = await redis.xadd(
+        streamKey,
+        "*",
+        "body",
+        JSON.stringify(message),
+      );
+
+      results.push({
+        success: true,
+        sessionId: sessionData.sessionId!,
+        messageId,
+        videoUrl,
+      });
+    } catch (error: any) {
+      results.push({
+        success: false,
+        error: error.message || String(error),
+        videoUrl,
+      });
+    }
+  }
 
   await redis.quit();
 

@@ -51,6 +51,7 @@ function parseLogLine(line: string): ParsedLog | null {
 
 type ReportMetrics = {
   count: number;
+  identityVerificationsAvg: number;
   totalFaceAttempts: number;
   totalPassportAttempts: number;
   faceFailed: number;
@@ -58,13 +59,16 @@ type ReportMetrics = {
   passportFailed: number;
   passportSuccess: number;
   avgTotalTime: number;
-  avgFaceTime: number;
-  avgPassportTime: number;
-  avgFaceValidationTime: number;
-  avgFaceSolve: number;
-  avgFaceGetResult: number;
   avgFaceAttemptsPerIdentity: number;
+  avgFaceTime: number;
+  avgFaceSolve: number;
+  avgPassportTime: number;
   avgPassportAttemptsPerIdentity: number;
+  avgFaceValidationTime: number;
+  avgFaceValidationAttemptsPerIdentity: number;
+  avgFaceGetResult: number;
+  faceAttemptsDistribution: Array<{ attempts: number; identities: number }>;
+  passportAttemptsDistribution: Array<{ attempts: number; identities: number }>;
 };
 
 type LogEntry = { time: string; line: string };
@@ -75,15 +79,19 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
   // Ensure chronological order so start/end pairing works
   const sorted = [...entries].sort((a, b) => a.time.localeCompare(b.time));
 
-  // Count attempts/success/failure and timings from detailed per-email logs
+  // Attempts/success/failure (used for the "Attempts" section)
   let totalFaceAttempts = 0;
   let faceSuccess = 0;
   let faceFailed = 0;
   let totalPassportAttempts = 0;
   let passportSuccess = 0;
   let passportFailed = 0;
-  const urns = new Set<string>();
 
+  // Identity-level stacks for total identity time and passport time
+  const identityStartStacks = new Map<string, number[]>();
+  const passportStartStacks = new Map<string, number[]>();
+
+  // Per-attempt timing sums (all averages below except total are per attempt)
   let identityCountForTiming = 0;
   let sumIdentityTotalTime = 0;
 
@@ -100,40 +108,15 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
   let sumFaceValidationTime = 0;
   let faceValidationCount = 0;
 
-  // For passport timing: per-(URN + email) stacks of "Initiating passport validation" timestamps
-  const passportStartStacks = new Map<string, number[]>();
-  // For identity total time: per-(URN + email) stacks of "Initiating identity verification portal" timestamps
-  const identityStartStacks = new Map<string, number[]>();
-
-  type IdentityAgg = {
-    faceAttempts: number;
-    faceTimeSum: number;
-    faceSolveSum: number;
-    faceGetResultSum: number;
-    passportAttempts: number;
-    passportTimeSum: number;
-    faceValidationTimeSum: number;
-    faceValidationCount: number;
-  };
-  const identityAgg = new Map<string, IdentityAgg>();
-
-  const getIdentityAgg = (key: string | undefined | null): IdentityAgg | null => {
-    if (!key) return null;
-    let v = identityAgg.get(key);
-    if (!v) {
-      v = {
-        faceAttempts: 0,
-        faceTimeSum: 0,
-        faceSolveSum: 0,
-        faceGetResultSum: 0,
-        passportAttempts: 0,
-        passportTimeSum: 0,
-        faceValidationTimeSum: 0,
-        faceValidationCount: 0,
-      };
-      identityAgg.set(key, v);
+  // For attempt-count distributions per identity
+  const identityAttemptStats = new Map<string, { faceAttempts: number; passportAttempts: number }>();
+  const getIdentityAttempts = (key: string) => {
+    let cur = identityAttemptStats.get(key);
+    if (!cur) {
+      cur = { faceAttempts: 0, passportAttempts: 0 };
+      identityAttemptStats.set(key, cur);
     }
-    return v;
+    return cur;
   };
 
   for (const { time, line } of sorted) {
@@ -141,13 +124,11 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
     const urn = urnMatch?.[1]?.trim();
     const emailMatch = line.match(/email=([^\s]+)/);
     const email = emailMatch?.[1]?.trim();
-    if (urn) urns.add(urn);
-    const passportKey = urn && email ? `${urn}|${email}` : urn ?? "";
-    const identityKey = urn && email ? `${urn}|${email}` : urn ?? email ?? "";
+    const identityKey = urn ?? email ?? "";
 
     const tsMs = Number.isFinite(Date.parse(time)) ? Date.parse(time) : NaN;
 
-    // Identity total time: Initiating identity portal -> completed/failed for same URN+email
+    // Identity total time: Initiating identity portal -> completed/failed for same identity
     if (identityKey && line.includes("Initiating identity verification portal")) {
       if (!Number.isNaN(tsMs)) {
         const stack = identityStartStacks.get(identityKey) ?? [];
@@ -184,51 +165,37 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
         if (isSuccess) faceSuccess += 1;
         if (isFailed) faceFailed += 1;
 
-        const agg = getIdentityAgg(identityKey);
+        if (identityKey) {
+          getIdentityAttempts(identityKey).faceAttempts += 1;
+        }
 
         const timeTakenMatch = line.match(/TimeTaken=([\d.]+)s/);
         if (timeTakenMatch) {
-          const v = parseFloat(timeTakenMatch[1]);
-          sumFaceTime += v;
+          sumFaceTime += parseFloat(timeTakenMatch[1]);
           faceTimeCount += 1;
-          if (agg) {
-            agg.faceTimeSum += v;
-          }
         }
         const solveMatch = line.match(/Solve=([\d.]+)s/);
         if (solveMatch) {
-          const v = parseFloat(solveMatch[1]);
-          sumFaceSolve += v;
+          sumFaceSolve += parseFloat(solveMatch[1]);
           faceSolveCount += 1;
-          if (agg) {
-            agg.faceSolveSum += v;
-          }
         }
         const getResultMatch = line.match(/GetResult=([\d.]+)s/);
         if (getResultMatch) {
-          const v = parseFloat(getResultMatch[1]);
-          sumFaceGetResult += v;
+          sumFaceGetResult += parseFloat(getResultMatch[1]);
           faceGetResultCount += 1;
-          if (agg) {
-            agg.faceGetResultSum += v;
-          }
-        }
-        if (agg) {
-          agg.faceAttempts += 1;
         }
       }
     }
 
-    // Passport validation attempts and optional timings
-    // Passport validation timing: Initiating passport validation -> completed/failed
-    if (passportKey && line.includes("Initiating passport validation")) {
+    // Passport validation attempts and timings
+    if (identityKey && line.includes("Initiating passport validation")) {
       if (!Number.isNaN(tsMs)) {
-        const stack = passportStartStacks.get(passportKey) ?? [];
+        const stack = passportStartStacks.get(identityKey) ?? [];
         stack.push(tsMs);
-        passportStartStacks.set(passportKey, stack);
+        passportStartStacks.set(identityKey, stack);
       }
     } else if (
-      passportKey &&
+      identityKey &&
       (line.includes("Passport validation completed successfully") ||
         line.includes("Passport validation failed"))
     ) {
@@ -237,41 +204,31 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
       }
       // Count attempts
       totalPassportAttempts += 1;
+      if (identityKey) {
+        getIdentityAttempts(identityKey).passportAttempts += 1;
+      }
       if (line.includes("Passport validation completed successfully")) {
         passportSuccess += 1;
       } else if (line.includes("Passport validation failed")) {
         passportFailed += 1;
       }
 
-      // Compute duration from last unmatched "Initiating passport validation" for this URN
-      const stack = passportStartStacks.get(passportKey);
+      // Compute duration from last unmatched "Initiating passport validation" for this identity
+      const stack = passportStartStacks.get(identityKey);
       if (stack && stack.length > 0 && !Number.isNaN(tsMs)) {
         const startMs = stack.shift()!;
         const diffSec = Math.max(0, (tsMs - startMs) / 1000);
         sumPassportTime += diffSec;
         passportTimeCount += 1;
-        const agg = getIdentityAgg(identityKey);
-        if (agg) {
-          agg.passportTimeSum += diffSec;
-        }
-      }
-      const agg = getIdentityAgg(identityKey);
-      if (agg) {
-        agg.passportAttempts += 1;
+        passportStartStacks.set(identityKey, stack);
       }
     }
 
     // Face validation timings sometimes appear as FaceValidation=2.44s on detailed logs
     const fvalMatch = line.match(/FaceValidation=([\d.]+)s/);
     if (fvalMatch) {
-      const v = parseFloat(fvalMatch[1]);
-      sumFaceValidationTime += v;
+      sumFaceValidationTime += parseFloat(fvalMatch[1]);
       faceValidationCount += 1;
-      const agg = getIdentityAgg(identityKey);
-      if (agg) {
-        agg.faceValidationTimeSum += v;
-        agg.faceValidationCount += 1;
-      }
     }
   }
 
@@ -279,55 +236,47 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
     totalFaceAttempts === 0 &&
     totalPassportAttempts === 0 &&
     identityCountForTiming === 0 &&
-    urns.size === 0
+    identityAttemptStats.size === 0
   ) {
     return null;
   }
 
   const count =
-    urns.size ||
-    identityCountForTiming ||
-    (totalFaceAttempts > 0 || totalPassportAttempts > 0 ? 1 : 0);
+    identityCountForTiming > 0
+      ? identityCountForTiming
+      : identityAttemptStats.size > 0
+        ? identityAttemptStats.size
+        : totalFaceAttempts > 0 || totalPassportAttempts > 0
+          ? 1
+          : 0;
 
-  const identityKeys = [...identityAgg.keys()];
-  const identityCount = identityKeys.length || identityCountForTiming || 1;
+  // Build attempt-count histograms per identity
+  const buildDistribution = (values: number[]): Array<{ attempts: number; identities: number }> => {
+    const nonZero = values.filter((v) => v > 0);
+    if (nonZero.length === 0) return [];
+    const max = Math.max(...nonZero);
+    const hist = new Map<number, number>();
+    for (const v of nonZero) {
+      hist.set(v, (hist.get(v) ?? 0) + 1);
+    }
+    const out: Array<{ attempts: number; identities: number }> = [];
+    for (let a = 1; a <= max; a++) {
+      const identities = hist.get(a) ?? 0;
+      if (identities > 0) out.push({ attempts: a, identities });
+    }
+    return out;
+  };
 
-  const avgAttemptsPerIdentityFace =
-    identityCount > 0 ? totalFaceAttempts / identityCount : 0;
-  const avgAttemptsPerIdentityPassport =
-    identityCount > 0 ? totalPassportAttempts / identityCount : 0;
-
-  const perIdentityFaceTime: number[] = [];
-  const perIdentityFaceSolve: number[] = [];
-  const perIdentityFaceGetResult: number[] = [];
-  const perIdentityPassportTime: number[] = [];
-  const perIdentityFaceValidation: number[] = [];
-
-  for (const key of identityKeys) {
-    const agg = identityAgg.get(key);
-    if (!agg) continue;
-    if (agg.faceAttempts > 0 && agg.faceTimeSum > 0) {
-      perIdentityFaceTime.push(agg.faceTimeSum / agg.faceAttempts);
-    }
-    if (agg.faceAttempts > 0 && agg.faceSolveSum > 0) {
-      perIdentityFaceSolve.push(agg.faceSolveSum / agg.faceAttempts);
-    }
-    if (agg.faceAttempts > 0 && agg.faceGetResultSum > 0) {
-      perIdentityFaceGetResult.push(agg.faceGetResultSum / agg.faceAttempts);
-    }
-    if (agg.passportAttempts > 0 && agg.passportTimeSum > 0) {
-      perIdentityPassportTime.push(agg.passportTimeSum / agg.passportAttempts);
-    }
-    if (agg.faceValidationCount > 0 && agg.faceValidationTimeSum > 0) {
-      perIdentityFaceValidation.push(agg.faceValidationTimeSum / agg.faceValidationCount);
-    }
-  }
-
-  const avgFromArray = (arr: number[]): number =>
-    arr.length > 0 ? arr.reduce((s, v) => s + v, 0) / arr.length : 0;
+  const faceAttemptsDistribution = buildDistribution(
+    [...identityAttemptStats.values()].map((s) => s.faceAttempts)
+  );
+  const passportAttemptsDistribution = buildDistribution(
+    [...identityAttemptStats.values()].map((s) => s.passportAttempts)
+  );
 
   return {
     count,
+    identityVerificationsAvg: NaN,
     totalFaceAttempts,
     totalPassportAttempts,
     faceFailed,
@@ -335,13 +284,16 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
     passportFailed,
     passportSuccess,
     avgTotalTime: identityCountForTiming > 0 ? sumIdentityTotalTime / identityCountForTiming : 0,
-    avgFaceTime: avgFromArray(perIdentityFaceTime),
-    avgPassportTime: avgFromArray(perIdentityPassportTime),
-    avgFaceValidationTime: avgFromArray(perIdentityFaceValidation),
-    avgFaceSolve: avgFromArray(perIdentityFaceSolve),
-    avgFaceGetResult: avgFromArray(perIdentityFaceGetResult),
-    avgFaceAttemptsPerIdentity: avgAttemptsPerIdentityFace,
-    avgPassportAttemptsPerIdentity: avgAttemptsPerIdentityPassport,
+    avgFaceAttemptsPerIdentity: NaN,
+    avgFaceTime: faceTimeCount > 0 ? sumFaceTime / faceTimeCount : 0,
+    avgFaceSolve: faceSolveCount > 0 ? sumFaceSolve / faceSolveCount : 0,
+    avgFaceGetResult: faceGetResultCount > 0 ? sumFaceGetResult / faceGetResultCount : 0,
+    avgPassportTime: passportTimeCount > 0 ? sumPassportTime / passportTimeCount : 0,
+    avgPassportAttemptsPerIdentity: NaN,
+    avgFaceValidationTime: faceValidationCount > 0 ? sumFaceValidationTime / faceValidationCount : 0,
+    avgFaceValidationAttemptsPerIdentity: NaN,
+    faceAttemptsDistribution,
+    passportAttemptsDistribution,
   };
 }
 
@@ -367,6 +319,7 @@ function computeMetrics(logs: { line: string }[]): ReportMetrics | null {
 
   return {
     count,
+    identityVerificationsAvg: NaN,
     totalFaceAttempts,
     totalPassportAttempts,
     faceFailed,
@@ -374,13 +327,16 @@ function computeMetrics(logs: { line: string }[]): ReportMetrics | null {
     passportFailed,
     passportSuccess: count,
     avgTotalTime: withTotal ? sumTotal / withTotal : 0,
+    avgFaceAttemptsPerIdentity: NaN,
     avgFaceTime: totalFaceAttempts > 0 ? sumFaceTime / totalFaceAttempts : 0,
     avgPassportTime: totalPassportAttempts > 0 ? sumPassportTime / totalPassportAttempts : 0,
     avgFaceValidationTime: totalFaceValidationAttempts > 0 ? sumFaceValidationTime / totalFaceValidationAttempts : 0,
     avgFaceSolve: totalFaceAttempts > 0 ? sumFaceSolve / totalFaceAttempts : 0,
     avgFaceGetResult: totalFaceAttempts > 0 ? sumFaceGetResult / totalFaceAttempts : 0,
-    avgFaceAttemptsPerIdentity: 0,
-    avgPassportAttemptsPerIdentity: 0,
+    avgPassportAttemptsPerIdentity: NaN,
+    avgFaceValidationAttemptsPerIdentity: NaN,
+    faceAttemptsDistribution: [],
+    passportAttemptsDistribution: [],
   };
 }
 
@@ -1106,7 +1062,7 @@ export default function ReportClient() {
       {reportMetrics !== null && (
         <div className="rounded-xl border border-zinc-200 bg-white overflow-hidden">
           <h2 className="text-sm font-semibold text-zinc-900 px-4 py-2 border-b border-zinc-200 bg-zinc-50">
-            Report <span className="font-normal text-zinc-500">· {reportMetrics.count} identity verifications</span>
+            Report <span className="font-normal text-zinc-500">· {reportMetrics.count} identities</span>
           </h2>
           <div className="px-4 py-3 space-y-4">
             <section>
@@ -1115,10 +1071,6 @@ export default function ReportClient() {
                 <li className="flex justify-between gap-4">
                   <span className="text-zinc-700">Total face verification attempts</span>
                   <span className="font-medium tabular-nums">{reportMetrics.totalFaceAttempts}</span>
-                </li>
-                <li className="flex justify-between gap-4">
-                  <span className="text-zinc-700">Avg face attempts per identity</span>
-                  <span className="font-medium tabular-nums">{fmt(reportMetrics.avgFaceAttemptsPerIdentity)}</span>
                 </li>
                 <li className="flex justify-between gap-4">
                   <span className="text-zinc-700">Face verification — failed</span>
@@ -1131,10 +1083,6 @@ export default function ReportClient() {
                 <li className="flex justify-between gap-4">
                   <span className="text-zinc-700">Total passport verification attempts</span>
                   <span className="font-medium tabular-nums">{reportMetrics.totalPassportAttempts}</span>
-                </li>
-                <li className="flex justify-between gap-4">
-                  <span className="text-zinc-700">Avg passport attempts per identity</span>
-                  <span className="font-medium tabular-nums">{fmt(reportMetrics.avgPassportAttemptsPerIdentity)}</span>
                 </li>
                 <li className="flex justify-between gap-4">
                   <span className="text-zinc-700">Passport verification — failed</span>
@@ -1150,28 +1098,74 @@ export default function ReportClient() {
               <h3 className="text-xs font-medium text-zinc-500 uppercase tracking-wide mb-2">Average times (s) · per attempt except total (per verification)</h3>
               <ul className="space-y-1.5 text-sm">
                 <li className="flex justify-between gap-4">
-                  <span className="text-zinc-700">Identity verification (total, per verification)</span>
-                  <span className="font-medium tabular-nums">{fmt(reportMetrics.avgTotalTime)}s</span>
+                  <span className="text-zinc-700">Identity verification (total)</span>
+                  <span className="font-medium tabular-nums">
+                    {fmt(reportMetrics.avgTotalTime)}s
+                  </span>
                 </li>
                 <li className="flex justify-between gap-4">
                   <span className="text-zinc-700">Face verification</span>
-                  <span className="font-medium tabular-nums">{fmt(reportMetrics.avgFaceTime)}s</span>
+                  <span className="font-medium tabular-nums">
+                    {fmt(reportMetrics.avgFaceTime)}s
+                  </span>
+                </li>
+                <li>
+                  <div className="text-xs text-zinc-500 mt-2 mb-1">Face attempts distribution (per identity)</div>
+                  {reportMetrics.faceAttemptsDistribution.some((r) => r.identities > 0) ? (
+                    <div className="space-y-0.5">
+                      {reportMetrics.faceAttemptsDistribution
+                        .filter((r) => r.identities > 0)
+                        .map((r) => (
+                          <div key={r.attempts}>
+                            <span className="tabular-nums">{r.attempts}</span> attempts:{" "}
+                            <span className="tabular-nums">{r.identities}</span> identities
+                          </div>
+                        ))}
+                    </div>
+                  ) : (
+                    <div className="text-xs text-zinc-500">No face attempt data in this range.</div>
+                  )}
                 </li>
                 <li className="flex justify-between gap-4">
                   <span className="text-zinc-700">Face verification — Solve</span>
-                  <span className="font-medium tabular-nums">{fmt(reportMetrics.avgFaceSolve)}s</span>
+                  <span className="font-medium tabular-nums">
+                    {fmt(reportMetrics.avgFaceSolve)}s
+                  </span>
                 </li>
                 <li className="flex justify-between gap-4">
                   <span className="text-zinc-700">Face verification — GetResult</span>
-                  <span className="font-medium tabular-nums">{fmt(reportMetrics.avgFaceGetResult)}s</span>
+                  <span className="font-medium tabular-nums">
+                    {fmt(reportMetrics.avgFaceGetResult)}s
+                  </span>
                 </li>
                 <li className="flex justify-between gap-4">
                   <span className="text-zinc-700">Passport verification</span>
-                  <span className="font-medium tabular-nums">{fmt(reportMetrics.avgPassportTime)}s</span>
+                  <span className="font-medium tabular-nums">
+                    {fmt(reportMetrics.avgPassportTime)}s
+                  </span>
+                </li>
+                <li>
+                  <div className="text-xs text-zinc-500 mt-2 mb-1">Passport attempts distribution (per identity)</div>
+                  {reportMetrics.passportAttemptsDistribution.some((r) => r.identities > 0) ? (
+                    <div className="space-y-0.5">
+                      {reportMetrics.passportAttemptsDistribution
+                        .filter((r) => r.identities > 0)
+                        .map((r) => (
+                          <div key={r.attempts}>
+                            <span className="tabular-nums">{r.attempts}</span> attempts:{" "}
+                            <span className="tabular-nums">{r.identities}</span> identities
+                          </div>
+                        ))}
+                    </div>
+                  ) : (
+                    <div className="text-xs text-zinc-500">No passport attempt data in this range.</div>
+                  )}
                 </li>
                 <li className="flex justify-between gap-4">
                   <span className="text-zinc-700">Face validation</span>
-                  <span className="font-medium tabular-nums">{fmt(reportMetrics.avgFaceValidationTime)}s</span>
+                  <span className="font-medium tabular-nums">
+                    {fmt(reportMetrics.avgFaceValidationTime)}s
+                  </span>
                 </li>
               </ul>
             </section>

@@ -28,6 +28,7 @@ export default function TestClient() {
     "https://face-liveness-1758087237.s3.us-east-1.amazonaws.com/face-liveness/374100ab-4324-4fdb-b8be-8e8707ff7153_2026-03-09T08-40-04-510Z.webm",
   ]);
   const [repetitions, setRepetitions] = useState<string>("1");
+  const [timeoutSeconds, setTimeoutSeconds] = useState<string>("");
   const [isFirstVerification, setIsFirstVerification] = useState(false);
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState<ResultItem[]>([]);
@@ -39,6 +40,31 @@ export default function TestClient() {
   }, [streamSuffix]);
 
   function updateVideoUrl(index: number, value: string) {
+    const trimmed = value.trim();
+    // If the user pasted a JSON-like array of URLs, e.g. ["link1","link2"] or ['link1','link2'],
+    // parse it and replace the list so each URL gets its own input.
+    const listCandidate =
+      trimmed.endsWith(";") && trimmed.startsWith("[")
+        ? trimmed.slice(0, -1).trim()
+        : trimmed;
+    if (listCandidate.startsWith("[") && listCandidate.endsWith("]")) {
+      try {
+        const normalized = listCandidate.replace(/'/g, '"');
+        const parsed = JSON.parse(normalized);
+        if (Array.isArray(parsed)) {
+          const urls = parsed
+            .map((u) => (typeof u === "string" ? u.trim() : ""))
+            .filter(Boolean);
+          if (urls.length > 0) {
+            setVideoUrls(urls);
+            return;
+          }
+        }
+      } catch {
+        // fall back to normal single-input behavior
+      }
+    }
+
     setVideoUrls((prev) => {
       const copy = [...prev];
       copy[index] = value;
@@ -92,6 +118,7 @@ export default function TestClient() {
           streamSuffix,
           videoUrls: filteredUrls,
           repetitions: repetitionsNum,
+          timeoutSeconds: Number((timeoutSeconds || "").trim()) || 0,
           isFirstVerification,
         }),
       });
@@ -189,6 +216,22 @@ export default function TestClient() {
               onChange={(e) => setRepetitions(e.target.value)}
               className="w-32 rounded-lg border border-zinc-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900"
             />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-zinc-700 mb-1">
+              Timeout between submits (seconds)
+            </label>
+            <input
+              type="number"
+              min={0}
+              value={timeoutSeconds}
+              onChange={(e) => setTimeoutSeconds(e.target.value)}
+              placeholder="0"
+              className="w-40 rounded-lg border border-zinc-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900"
+            />
+            <p className="mt-1 text-xs text-zinc-500">
+              If empty or 0, submits are sent with no delay.
+            </p>
           </div>
         </div>
 
