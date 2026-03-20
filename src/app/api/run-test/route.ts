@@ -195,6 +195,10 @@ export async function POST(request: Request) {
         JSON.stringify(message),
       );
 
+      if (messageId === null) {
+        throw new Error("Failed to add message to Redis stream");
+      }
+
       results.push({
         success: true,
         sessionId: sessionData.sessionId!,
