@@ -61,6 +61,7 @@ type ReportMetrics = {
   avgTotalTime: number;
   avgFaceAttemptsPerIdentity: number;
   avgFaceTime: number;
+  avgFaceSessionInit: number;
   avgFaceSolve: number;
   avgPassportTime: number;
   avgPassportAttemptsPerIdentity: number;
@@ -69,6 +70,8 @@ type ReportMetrics = {
   avgFaceGetResult: number;
   faceAttemptsDistribution: Array<{ attempts: number; identities: number }>;
   passportAttemptsDistribution: Array<{ attempts: number; identities: number }>;
+  passportSlowerThanFace: number;
+  faceSlowerThanPassport: number;
 };
 
 type LogEntry = { time: string; line: string };
@@ -97,6 +100,8 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
 
   let sumFaceTime = 0;
   let faceTimeCount = 0;
+  let sumFaceSessionInit = 0;
+  let faceSessionInitCount = 0;
   let sumFaceSolve = 0;
   let faceSolveCount = 0;
   let sumFaceGetResult = 0;
@@ -108,12 +113,22 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
   let sumFaceValidationTime = 0;
   let faceValidationCount = 0;
 
-  // For attempt-count distributions per identity
-  const identityAttemptStats = new Map<string, { faceAttempts: number; passportAttempts: number }>();
+  // For attempt-count distributions and face/passport comparison per identity
+  const identityAttemptStats = new Map<
+    string,
+    { faceAttempts: number; passportAttempts: number; faceTimes: number[]; passportTimes: number[] }
+  >();
+
+  // Pair `FaceValidation=...` timings onto the corresponding face verification attempt times.
+  // - If validation is on a different log line than the face attempt, queue it (FIFO) and attach later.
+  // - If validation is already on the same face attempt log line, attach immediately.
+  const unassignedFaceAttemptIndicesByIdentity = new Map<string, number[]>();
+  const pendingFaceValidationTimesByIdentity = new Map<string, number[]>();
+
   const getIdentityAttempts = (key: string) => {
     let cur = identityAttemptStats.get(key);
     if (!cur) {
-      cur = { faceAttempts: 0, passportAttempts: 0 };
+      cur = { faceAttempts: 0, passportAttempts: 0, faceTimes: [], passportTimes: [] };
       identityAttemptStats.set(key, cur);
     }
     return cur;
@@ -127,6 +142,9 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
     const identityKey = urn ?? email ?? "";
 
     const tsMs = Number.isFinite(Date.parse(time)) ? Date.parse(time) : NaN;
+
+    // Used to prevent double-adding the same FaceValidation=... value to face verification time.
+    let faceValidationAlreadyAddedToFaceTimeOnThisIteration = false;
 
     // Identity total time: Initiating identity portal -> completed/failed for same identity
     if (identityKey && line.includes("Initiating identity verification portal")) {
@@ -166,23 +184,79 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
         if (isFailed) faceFailed += 1;
 
         if (identityKey) {
-          getIdentityAttempts(identityKey).faceAttempts += 1;
+          const s = getIdentityAttempts(identityKey);
+          s.faceAttempts += 1;
         }
 
-        const timeTakenMatch = line.match(/TimeTaken=([\d.]+)s/);
-        if (timeTakenMatch) {
-          sumFaceTime += parseFloat(timeTakenMatch[1]);
-          faceTimeCount += 1;
-        }
+        const sessionInitMatch = line.match(/SessionInit=([\d.]+)s/);
         const solveMatch = line.match(/Solve=([\d.]+)s/);
-        if (solveMatch) {
-          sumFaceSolve += parseFloat(solveMatch[1]);
+        const getResultMatch = line.match(/GetResult=([\d.]+)s/);
+        const timeTakenMatch = line.match(/TimeTaken=([\d.]+)s/);
+
+        const sessionInit = sessionInitMatch ? parseFloat(sessionInitMatch[1]) : undefined;
+        const solve = solveMatch ? parseFloat(solveMatch[1]) : undefined;
+        const getResult = getResultMatch ? parseFloat(getResultMatch[1]) : undefined;
+        const timeTaken = timeTakenMatch ? parseFloat(timeTakenMatch[1]) : undefined;
+
+        if (sessionInit != null) {
+          sumFaceSessionInit += sessionInit;
+          faceSessionInitCount += 1;
+        }
+        if (solve != null) {
+          sumFaceSolve += solve;
           faceSolveCount += 1;
         }
-        const getResultMatch = line.match(/GetResult=([\d.]+)s/);
-        if (getResultMatch) {
-          sumFaceGetResult += parseFloat(getResultMatch[1]);
+        if (getResult != null) {
+          sumFaceGetResult += getResult;
           faceGetResultCount += 1;
+        }
+
+        const hasAllFaceParts = sessionInit != null && solve != null && getResult != null;
+        const baseFaceTime =
+          hasAllFaceParts
+            ? sessionInit + solve + getResult
+            : timeTaken != null
+              ? timeTaken
+              : sessionInit != null || solve != null || getResult != null
+                ? (sessionInit ?? 0) + (solve ?? 0) + (getResult ?? 0)
+                : undefined;
+
+        if (baseFaceTime != null) {
+          let v = baseFaceTime;
+          let usedFaceValidation = false;
+
+          // If validation is logged on the same line as the face attempt, attach immediately.
+          const faceValidationOnSameLineMatch = line.match(/FaceValidation=([\d.]+)s/);
+          if (faceValidationOnSameLineMatch) {
+            const fval = parseFloat(faceValidationOnSameLineMatch[1]);
+            v += fval;
+            usedFaceValidation = true;
+            faceValidationAlreadyAddedToFaceTimeOnThisIteration = true;
+          } else if (identityKey) {
+            // Otherwise, if we already saw FaceValidation for this identity earlier, attach from the pending queue.
+            const pending = pendingFaceValidationTimesByIdentity.get(identityKey);
+            if (pending && pending.length > 0) {
+              const pendingFval = pending.shift()!;
+              v += pendingFval;
+              usedFaceValidation = true;
+              if (pending.length === 0) pendingFaceValidationTimesByIdentity.delete(identityKey);
+            }
+          }
+
+          sumFaceTime += v;
+          faceTimeCount += 1;
+          if (identityKey) {
+            const s = getIdentityAttempts(identityKey);
+            const faceIdx = s.faceTimes.length;
+            s.faceTimes.push(v);
+
+            // If FaceValidation wasn't attached yet, queue this attempt index for a future FaceValidation=... line.
+            if (!usedFaceValidation) {
+              const q = unassignedFaceAttemptIndicesByIdentity.get(identityKey) ?? [];
+              q.push(faceIdx);
+              unassignedFaceAttemptIndicesByIdentity.set(identityKey, q);
+            }
+          }
         }
       }
     }
@@ -205,7 +279,8 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
       // Count attempts
       totalPassportAttempts += 1;
       if (identityKey) {
-        getIdentityAttempts(identityKey).passportAttempts += 1;
+        const s = getIdentityAttempts(identityKey);
+        s.passportAttempts += 1;
       }
       if (line.includes("Passport validation completed successfully")) {
         passportSuccess += 1;
@@ -221,14 +296,40 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
         sumPassportTime += diffSec;
         passportTimeCount += 1;
         passportStartStacks.set(identityKey, stack);
+        if (identityKey) {
+          getIdentityAttempts(identityKey).passportTimes.push(diffSec);
+        }
       }
     }
 
     // Face validation timings sometimes appear as FaceValidation=2.44s on detailed logs
     const fvalMatch = line.match(/FaceValidation=([\d.]+)s/);
     if (fvalMatch) {
-      sumFaceValidationTime += parseFloat(fvalMatch[1]);
+      const fval = parseFloat(fvalMatch[1]);
+      sumFaceValidationTime += fval;
       faceValidationCount += 1;
+
+      // If we already added this FaceValidation value to face verification time for this same line,
+      // don't attach it again to a queued attempt.
+      if (!faceValidationAlreadyAddedToFaceTimeOnThisIteration) {
+        if (identityKey) {
+          const q = unassignedFaceAttemptIndicesByIdentity.get(identityKey);
+          if (q && q.length > 0) {
+            const faceIdx = q.shift()!;
+            if (q.length === 0) unassignedFaceAttemptIndicesByIdentity.delete(identityKey);
+
+            const s = identityAttemptStats.get(identityKey);
+            if (s && Number.isFinite(s.faceTimes[faceIdx])) {
+              s.faceTimes[faceIdx] += fval;
+              sumFaceTime += fval;
+            }
+          } else {
+            const pending = pendingFaceValidationTimesByIdentity.get(identityKey) ?? [];
+            pending.push(fval);
+            pendingFaceValidationTimesByIdentity.set(identityKey, pending);
+          }
+        }
+      }
     }
   }
 
@@ -274,6 +375,20 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
     [...identityAttemptStats.values()].map((s) => s.passportAttempts)
   );
 
+  // Compare per-identity paired face/passport attempt durations
+  let passportSlowerThanFace = 0;
+  let faceSlowerThanPassport = 0;
+  for (const s of identityAttemptStats.values()) {
+    const n = Math.min(s.faceTimes.length, s.passportTimes.length);
+    for (let i = 0; i < n; i++) {
+      const f = s.faceTimes[i];
+      const p = s.passportTimes[i];
+      if (!Number.isFinite(f) || !Number.isFinite(p)) continue;
+      if (p > f) passportSlowerThanFace += 1;
+      else if (f > p) faceSlowerThanPassport += 1;
+    }
+  }
+
   return {
     count,
     identityVerificationsAvg: NaN,
@@ -286,6 +401,7 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
     avgTotalTime: identityCountForTiming > 0 ? sumIdentityTotalTime / identityCountForTiming : 0,
     avgFaceAttemptsPerIdentity: NaN,
     avgFaceTime: faceTimeCount > 0 ? sumFaceTime / faceTimeCount : 0,
+    avgFaceSessionInit: faceSessionInitCount > 0 ? sumFaceSessionInit / faceSessionInitCount : 0,
     avgFaceSolve: faceSolveCount > 0 ? sumFaceSolve / faceSolveCount : 0,
     avgFaceGetResult: faceGetResultCount > 0 ? sumFaceGetResult / faceGetResultCount : 0,
     avgPassportTime: passportTimeCount > 0 ? sumPassportTime / passportTimeCount : 0,
@@ -294,6 +410,8 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
     avgFaceValidationAttemptsPerIdentity: NaN,
     faceAttemptsDistribution,
     passportAttemptsDistribution,
+    passportSlowerThanFace,
+    faceSlowerThanPassport,
   };
 }
 
@@ -329,6 +447,7 @@ function computeMetrics(logs: { line: string }[]): ReportMetrics | null {
     avgTotalTime: withTotal ? sumTotal / withTotal : 0,
     avgFaceAttemptsPerIdentity: NaN,
     avgFaceTime: totalFaceAttempts > 0 ? sumFaceTime / totalFaceAttempts : 0,
+    avgFaceSessionInit: 0,
     avgPassportTime: totalPassportAttempts > 0 ? sumPassportTime / totalPassportAttempts : 0,
     avgFaceValidationTime: totalFaceValidationAttempts > 0 ? sumFaceValidationTime / totalFaceValidationAttempts : 0,
     avgFaceSolve: totalFaceAttempts > 0 ? sumFaceSolve / totalFaceAttempts : 0,
@@ -337,6 +456,8 @@ function computeMetrics(logs: { line: string }[]): ReportMetrics | null {
     avgFaceValidationAttemptsPerIdentity: NaN,
     faceAttemptsDistribution: [],
     passportAttemptsDistribution: [],
+    passportSlowerThanFace: 0,
+    faceSlowerThanPassport: 0,
   };
 }
 
@@ -1109,6 +1230,12 @@ export default function ReportClient() {
                     {fmt(reportMetrics.avgFaceTime)}s
                   </span>
                 </li>
+                <li className="flex justify-between gap-4">
+                  <span className="text-zinc-700">Face verification — SessionInit</span>
+                  <span className="font-medium tabular-nums">
+                    {fmt(reportMetrics.avgFaceSessionInit)}s
+                  </span>
+                </li>
                 <li>
                   <div className="text-xs text-zinc-500 mt-2 mb-1">Face attempts distribution (per identity)</div>
                   {reportMetrics.faceAttemptsDistribution.some((r) => r.identities > 0) ? (
@@ -1139,6 +1266,12 @@ export default function ReportClient() {
                   </span>
                 </li>
                 <li className="flex justify-between gap-4">
+                  <span className="text-zinc-700">Face validation</span>
+                  <span className="font-medium tabular-nums">
+                    {fmt(reportMetrics.avgFaceValidationTime)}s
+                  </span>
+                </li>
+                <li className="flex justify-between gap-4">
                   <span className="text-zinc-700">Passport verification</span>
                   <span className="font-medium tabular-nums">
                     {fmt(reportMetrics.avgPassportTime)}s
@@ -1161,10 +1294,16 @@ export default function ReportClient() {
                     <div className="text-xs text-zinc-500">No passport attempt data in this range.</div>
                   )}
                 </li>
-                <li className="flex justify-between gap-4">
-                  <span className="text-zinc-700">Face validation</span>
-                  <span className="font-medium tabular-nums">
-                    {fmt(reportMetrics.avgFaceValidationTime)}s
+                <li className="flex justify-between gap-4 text-xs text-zinc-600">
+                  <span>Attempts where passport verification took longer than face verification</span>
+                  <span className="font-medium tabular-nums text-zinc-800">
+                    {reportMetrics.passportSlowerThanFace}
+                  </span>
+                </li>
+                <li className="flex justify-between gap-4 text-xs text-zinc-600">
+                  <span>Attempts where face verification took longer than passport verification</span>
+                  <span className="font-medium tabular-nums text-zinc-800">
+                    {reportMetrics.faceSlowerThanPassport}
                   </span>
                 </li>
               </ul>

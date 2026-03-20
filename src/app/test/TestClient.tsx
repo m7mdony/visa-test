@@ -30,6 +30,7 @@ export default function TestClient() {
   const [repetitions, setRepetitions] = useState<string>("1");
   const [timeoutSeconds, setTimeoutSeconds] = useState<string>("");
   const [isFirstVerification, setIsFirstVerification] = useState(false);
+  const [randomizeOrder, setRandomizeOrder] = useState(false);
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState<ResultItem[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -120,6 +121,7 @@ export default function TestClient() {
           repetitions: repetitionsNum,
           timeoutSeconds: Number((timeoutSeconds || "").trim()) || 0,
           isFirstVerification,
+          randomizeOrder,
         }),
       });
       if (!res.ok) {
@@ -202,6 +204,21 @@ export default function TestClient() {
                 className="text-sm text-zinc-700"
               >
                 isFirstVerification
+              </label>
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                id="randomize-order"
+                type="checkbox"
+                checked={randomizeOrder}
+                onChange={(e) => setRandomizeOrder(e.target.checked)}
+                className="h-4 w-4 rounded border-zinc-300 text-zinc-900 focus:ring-zinc-900"
+              />
+              <label
+                htmlFor="randomize-order"
+                className="text-sm text-zinc-700"
+              >
+                Randomize order
               </label>
             </div>
           </div>

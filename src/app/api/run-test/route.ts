@@ -131,6 +131,16 @@ export async function POST(request: Request) {
     .flat()
     .slice(0); // copy
 
+  const randomizeOrder: boolean = !!body.randomizeOrder;
+  if (randomizeOrder && expandedVideoUrls.length > 1) {
+    for (let i = expandedVideoUrls.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = expandedVideoUrls[i];
+      expandedVideoUrls[i] = expandedVideoUrls[j];
+      expandedVideoUrls[j] = tmp;
+    }
+  }
+
   const redis = new Redis(redisUrl);
 
   const results: Array<{
