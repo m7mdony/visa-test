@@ -2,6 +2,12 @@
 
 import { useMemo, useState } from "react";
 
+type VideoGroup = {
+  key: string;
+  label: string;
+  links: string[];
+};
+
 type ResultItem =
   | {
       success: true;
@@ -16,7 +22,23 @@ type ResultItem =
       error: string;
     };
 
-export default function TestClient() {
+function pickRandomWithoutReplacement<T>(items: T[], n: number): T[] {
+  if (n >= items.length) return [...items];
+
+  // Fisher–Yates shuffle partial: shuffle first n elements in-place.
+  const copy = [...items];
+  for (let i = 0; i < n; i++) {
+    const j = i + Math.floor(Math.random() * (copy.length - i));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy.slice(0, n);
+}
+
+export default function TestClient({
+  videoGroups,
+}: {
+  videoGroups: VideoGroup[];
+}) {
   const [redisUrl, setRedisUrl] = useState(
     process.env.NEXT_PUBLIC_DEFAULT_REDIS_URL ?? "",
   );
@@ -27,6 +49,17 @@ export default function TestClient() {
   const [videoUrls, setVideoUrls] = useState<string[]>([
     "https://face-liveness-1758087237.s3.us-east-1.amazonaws.com/face-liveness/374100ab-4324-4fdb-b8be-8e8707ff7153_2026-03-09T08-40-04-510Z.webm",
   ]);
+
+  const hasGroups = videoGroups.length > 0;
+  const [videoSourceMode, setVideoSourceMode] = useState<"group" | "manual">(
+    hasGroups ? "group" : "manual",
+  );
+  const [selectedGroupKey, setSelectedGroupKey] = useState<string>(
+    hasGroups ? videoGroups[0].key : "",
+  );
+  const [pickMode, setPickMode] = useState<"random" | "all">("random");
+  const [pickN, setPickN] = useState<string>("1");
+
   const [repetitions, setRepetitions] = useState<string>("1");
   const [timeoutSeconds, setTimeoutSeconds] = useState<string>("");
   const [isFirstVerification, setIsFirstVerification] = useState(false);
@@ -39,6 +72,11 @@ export default function TestClient() {
     const prefix = process.env.NEXT_PUBLIC_STREAM_KEY_PREFIX ?? "";
     return prefix + (streamSuffix || "");
   }, [streamSuffix]);
+
+  const selectedGroup = useMemo(() => {
+    if (!selectedGroupKey) return null;
+    return videoGroups.find((g) => g.key === selectedGroupKey) ?? null;
+  }, [selectedGroupKey, videoGroups]);
 
   function updateVideoUrl(index: number, value: string) {
     const trimmed = value.trim();
@@ -84,8 +122,6 @@ export default function TestClient() {
   async function handleRun() {
     setError(null);
     setResults([]);
-
-    const filteredUrls = videoUrls.map((u) => u.trim()).filter(Boolean);
     if (!redisUrl.trim()) {
       setError("Redis URL is required");
       return;
@@ -98,9 +134,44 @@ export default function TestClient() {
       setError("Stream key suffix is required");
       return;
     }
-    if (filteredUrls.length === 0) {
-      setError("At least one video URL is required");
-      return;
+
+    let filteredUrls: string[] = [];
+    if (videoSourceMode === "group") {
+      if (!selectedGroup) {
+        setError("Select a video group");
+        return;
+      }
+
+      if (selectedGroup.links.length === 0) {
+        setError("Selected video group is empty");
+        return;
+      }
+
+      if (pickMode === "all") {
+        filteredUrls = selectedGroup.links;
+      } else {
+        const n = Number((pickN || "").trim());
+        if (!Number.isFinite(n) || n <= 0) {
+          setError("Random N must be greater than 0");
+          return;
+        }
+        if (n > selectedGroup.links.length) {
+          setError(
+            `Random N (${n}) is greater than group size (${selectedGroup.links.length})`,
+          );
+          return;
+        }
+        filteredUrls = pickRandomWithoutReplacement(
+          selectedGroup.links,
+          n,
+        );
+      }
+    } else {
+      filteredUrls = videoUrls.map((u) => u.trim()).filter(Boolean);
+      if (filteredUrls.length === 0) {
+        setError("At least one video URL is required");
+        return;
+      }
     }
     const repetitionsNum = Number((repetitions || "").trim());
     if (!Number.isFinite(repetitionsNum) || repetitionsNum <= 0) {
@@ -254,35 +325,129 @@ export default function TestClient() {
 
         <div className="space-y-3">
           <label className="block text-sm font-medium text-zinc-700">
-            Video URLs
+            Video source
           </label>
-          {videoUrls.map((url, index) => (
-            <div key={index} className="flex items-center gap-2">
+
+          <div className="flex items-center gap-4">
+            <label className="flex items-center gap-2 text-sm text-zinc-700">
               <input
-                type="text"
-                value={url}
-                onChange={(e) => updateVideoUrl(index, e.target.value)}
-                className="flex-1 rounded-lg border border-zinc-300 px-3 py-2 text-xs bg-zinc-50 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900"
-                placeholder="https://...webm"
+                type="radio"
+                name="videoSourceMode"
+                checked={videoSourceMode === "group"}
+                onChange={() => setVideoSourceMode("group")}
+                disabled={!hasGroups}
+                className="h-4 w-4 rounded border-zinc-300 text-zinc-900 focus:ring-zinc-900"
               />
-              {videoUrls.length > 1 && (
-                <button
-                  type="button"
-                  onClick={() => removeVideoUrl(index)}
-                  className="rounded-lg border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
+              Group
+            </label>
+            <label className="flex items-center gap-2 text-sm text-zinc-700">
+              <input
+                type="radio"
+                name="videoSourceMode"
+                checked={videoSourceMode === "manual"}
+                onChange={() => setVideoSourceMode("manual")}
+                className="h-4 w-4 rounded border-zinc-300 text-zinc-900 focus:ring-zinc-900"
+              />
+              Manual
+            </label>
+          </div>
+
+          {videoSourceMode === "group" ? (
+            <div className="space-y-3">
+              <div>
+                <label className="block text-sm font-medium text-zinc-700 mb-1">
+                  Video group
+                </label>
+                <select
+                  value={selectedGroupKey}
+                  onChange={(e) => setSelectedGroupKey(e.target.value)}
+                  className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm bg-zinc-50 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900"
                 >
-                  Remove
-                </button>
-              )}
+                  {videoGroups.map((g) => (
+                    <option key={g.key} value={g.key}>
+                      {g.label} ({g.links.length})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-zinc-700 mb-1">
+                  Pick
+                </label>
+                <div className="flex items-center gap-4">
+                  <label className="flex items-center gap-2 text-sm text-zinc-700">
+                    <input
+                      type="radio"
+                      name="pickMode"
+                      checked={pickMode === "random"}
+                      onChange={() => setPickMode("random")}
+                      className="h-4 w-4 rounded border-zinc-300 text-zinc-900 focus:ring-zinc-900"
+                    />
+                    Random N
+                  </label>
+                  <label className="flex items-center gap-2 text-sm text-zinc-700">
+                    <input
+                      type="radio"
+                      name="pickMode"
+                      checked={pickMode === "all"}
+                      onChange={() => setPickMode("all")}
+                      className="h-4 w-4 rounded border-zinc-300 text-zinc-900 focus:ring-zinc-900"
+                    />
+                    All
+                  </label>
+                </div>
+
+                {pickMode === "random" ? (
+                  <input
+                    type="number"
+                    min={1}
+                    value={pickN}
+                    onChange={(e) => setPickN(e.target.value)}
+                    className="mt-2 w-32 rounded-lg border border-zinc-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900"
+                    placeholder="N"
+                  />
+                ) : (
+                  <p className="mt-2 text-xs text-zinc-500">
+                    Will submit every link in the selected group.
+                  </p>
+                )}
+              </div>
             </div>
-          ))}
-          <button
-            type="button"
-            onClick={addVideoUrl}
-            className="mt-1 rounded-lg border border-dashed border-zinc-300 px-3 py-1.5 text-xs text-zinc-700 hover:bg-zinc-100"
-          >
-            Add video URL
-          </button>
+          ) : (
+            <div className="space-y-3">
+              <label className="block text-sm font-medium text-zinc-700">
+                Video URLs
+              </label>
+              {videoUrls.map((url, index) => (
+                <div key={index} className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={url}
+                    onChange={(e) => updateVideoUrl(index, e.target.value)}
+                    className="flex-1 rounded-lg border border-zinc-300 px-3 py-2 text-xs bg-zinc-50 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900"
+                    placeholder="https://...webm"
+                  />
+                  {videoUrls.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={() => removeVideoUrl(index)}
+                      className="rounded-lg border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
+                    >
+                      Remove
+                    </button>
+                  )}
+                </div>
+              ))}
+              <button
+                type="button"
+                onClick={addVideoUrl}
+                className="mt-1 rounded-lg border border-dashed border-zinc-300 px-3 py-1.5 text-xs text-zinc-700 hover:bg-zinc-100"
+              >
+                Add video URL
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
