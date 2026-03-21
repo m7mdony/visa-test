@@ -84,8 +84,6 @@ type SolverReportSection = {
   jobCount: number;
   longWebsocketCount: number;
   longWebsocketExamples: Array<{ jobId: string }>;
-  shortWebsocketCount: number;
-  shortWebsocketExamples: Array<{ jobId: string }>;
   longVideoPrep: { count: number; examples: LongExample[] };
   longVideoFileLoaded: { count: number; examples: LongExample[] };
   longBrowserSetup: { count: number; examples: LongExample[] };
@@ -99,7 +97,6 @@ function take3WithValue<T extends { jobId: string }>(arr: (T & { value: number }
 function computeSolverSection(jobLogs: Map<string, LogEntry[]>): SolverReportSection | null {
   const metrics: LivenessJobMetrics[] = [];
   const longWebsocket: Array<{ jobId: string; ws: number }> = [];
-  const shortWebsocket: Array<{ jobId: string; ws: number }> = [];
   const longVideoPrep: Array<{ jobId: string; value: number }> = [];
   const longVideoFileLoaded: Array<{ jobId: string; value: number }> = [];
   const longBrowserSetup: Array<{ jobId: string; value: number }> = [];
@@ -111,9 +108,6 @@ function computeSolverSection(jobLogs: Map<string, LogEntry[]>): SolverReportSec
     metrics.push(m);
     if (m.websocketDisconnect != null && m.websocketDisconnect > 11) {
       longWebsocket.push({ jobId, ws: m.websocketDisconnect });
-    }
-    if (m.websocketDisconnect != null && m.websocketDisconnect < 10) {
-      shortWebsocket.push({ jobId, ws: m.websocketDisconnect });
     }
     if (m.videoPrep != null && m.videoPrep > 0.2) {
       longVideoPrep.push({ jobId, value: m.videoPrep });
@@ -149,8 +143,6 @@ function computeSolverSection(jobLogs: Map<string, LogEntry[]>): SolverReportSec
     jobCount: metrics.length,
     longWebsocketExamples: longWebsocket.slice(0, 3).map(({ jobId }) => ({ jobId })),
     longWebsocketCount: longWebsocket.length,
-    shortWebsocketExamples: shortWebsocket.slice(0, 3).map(({ jobId }) => ({ jobId })),
-    shortWebsocketCount: shortWebsocket.length,
     longVideoPrep: { count: longVideoPrep.length, examples: take3WithValue(longVideoPrep) },
     longVideoFileLoaded: {
       count: longVideoFileLoaded.length,
@@ -423,22 +415,6 @@ export default function LogsClient() {
                 </div>
                 <div className="mt-2 text-xs space-y-2">
                   {section.longWebsocketExamples.map((ex, i) => (
-                    <div key={i}>
-                      <span className="text-zinc-600">Job ID: </span>
-                      <code className="text-zinc-800">{ex.jobId}</code>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {section.shortWebsocketCount > 0 && (
-              <div className="rounded-lg border border-zinc-200 bg-zinc-50/50 p-3 mt-2">
-                <div className="text-sm font-medium text-zinc-800">
-                  Jobs with websocket &lt; 10s: {section.shortWebsocketCount}
-                </div>
-                <div className="mt-2 text-xs space-y-2">
-                  {section.shortWebsocketExamples.map((ex, i) => (
                     <div key={i}>
                       <span className="text-zinc-600">Job ID: </span>
                       <code className="text-zinc-800">{ex.jobId}</code>

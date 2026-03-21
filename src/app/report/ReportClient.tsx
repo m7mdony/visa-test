@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, Fragment } from "react";
 
 type ParsedLog = {
   totalTime?: number;
@@ -49,6 +49,34 @@ function parseLogLine(line: string): ParsedLog | null {
   return Object.keys(out).length > 0 ? out : null;
 }
 
+type LogEntry = { time: string; line: string };
+
+/** One row in an attempts-distribution bucket (click → session log drill-down). */
+export type DistributionSessionRef = {
+  sessionKey: string;
+  displayLabel: string;
+  /** Paired face vs passport duration (same index in session), for compare drill-down */
+  faceSec?: number;
+  passportSec?: number;
+  /** 1-based index within that session’s paired face/passport timings */
+  attemptPairIndex?: number;
+};
+
+/** Portal start → identity completed/failed window in sorted log order. */
+export type IdentitySessionTrace = {
+  sessionKey: string;
+  displayLabel: string;
+  email?: string;
+  urn?: string;
+  startSortedIndex: number;
+  endSortedIndex: number;
+  closed: boolean;
+  outcome?: "success" | "failed";
+  identityDurationSec: number | null;
+  faceAttempts: number;
+  passportAttempts: number;
+};
+
 type ReportMetrics = {
   count: number;
   identityVerificationsAvg: number;
@@ -68,19 +96,154 @@ type ReportMetrics = {
   avgFaceValidationTime: number;
   avgFaceValidationAttemptsPerIdentity: number;
   avgFaceGetResult: number;
-  faceAttemptsDistribution: Array<{ attempts: number; identities: number }>;
-  passportAttemptsDistribution: Array<{ attempts: number; identities: number }>;
+  faceAttemptsDistribution: Array<{
+    attempts: number;
+    identities: number;
+    sessions: DistributionSessionRef[];
+  }>;
+  passportAttemptsDistribution: Array<{
+    attempts: number;
+    identities: number;
+    sessions: DistributionSessionRef[];
+  }>;
   passportSlowerThanFace: number;
   faceSlowerThanPassport: number;
+  passportSlowerThanFaceSessions: DistributionSessionRef[];
+  faceSlowerThanPassportSessions: DistributionSessionRef[];
 };
 
-type LogEntry = { time: string; line: string };
+export type ComputeMetricsResult = {
+  metrics: ReportMetrics;
+  sortedLogs: LogEntry[];
+  sessionTraces: Record<string, IdentitySessionTrace>;
+};
 
-function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | null {
+/** Identity-level rollup (e.g. "Identity verification failed: face verification failed [Attempts=5]") — not one face attempt. */
+function isIdentityLevelFaceSummaryLine(line: string): boolean {
+  const l = line.toLowerCase();
+  return (
+    l.includes("identity verification failed") &&
+    l.includes("face verification failed") &&
+    /\battempts=\d+/i.test(line)
+  );
+}
+
+/** Per-attempt face success/fail lines only (case-insensitive); excludes rollups and "exhausted all retries" summary. */
+function isPerAttemptFaceLine(line: string): boolean {
+  const l = line.toLowerCase();
+  if (!l.includes("face verification")) return false;
+  if (line.includes("[VerifyJob] - Face verification completed successfully")) return false;
+  if (isIdentityLevelFaceSummaryLine(line)) return false;
+  if (/face verification failed:\s*exhausted all retries/i.test(l)) return false;
+  const isSuccess = l.includes("face verification completed successfully");
+  const isFailed = l.includes("face verification failed");
+  return isSuccess || isFailed;
+}
+
+/**
+ * When Loki returns the same timestamp for several lines, sort so session-close runs *after*
+ * per-attempt face logs (otherwise FIFO closes the session and the last attempts aren't attributed).
+ */
+function sameTimestampProcessingRank(line: string): number {
+  const l = line.toLowerCase();
+  if (l.includes("initiating identity verification portal")) return 0;
+  if (
+    l.includes("identity verification completed successfully") ||
+    l.includes("identity verification failed")
+  ) {
+    return 30;
+  }
+  if (isPerAttemptFaceLine(line)) return 10;
+  return 20;
+}
+
+/** From `Identity verification completed successfully ... FaceVerification={Attempts=3,...}` */
+function parseFaceAttemptsFromIdentitySuccessRollup(line: string): number | null {
+  if (!line.includes("Identity verification completed successfully")) return null;
+  const m = line.match(/FaceVerification=\{\s*Attempts=(\d+)/);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parsePassportAttemptsFromIdentitySuccessRollup(line: string): number | null {
+  if (!line.includes("Identity verification completed successfully")) return null;
+  const m = line.match(/PassportVerification=\{\s*Attempts=(\d+)/);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** From `Identity verification failed: face verification failed [Attempts=5]` */
+function parseFaceAttemptsFromIdentityFailureRollup(line: string): number | null {
+  if (!line.includes("Identity verification failed")) return null;
+  const m = line.match(/face verification failed\s*\[\s*Attempts=(\d+)/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+type ComputeMetricsOptions = {
+  /** When set, append human-readable trace lines (can be large). */
+  debugLog?: string[];
+};
+
+function computeMetricsFromDetailedLogs(
+  entries: LogEntry[],
+  options?: ComputeMetricsOptions,
+): ComputeMetricsResult | null {
   if (entries.length === 0) return null;
 
-  // Ensure chronological order so start/end pairing works
-  const sorted = [...entries].sort((a, b) => a.time.localeCompare(b.time));
+  const debugLog = options?.debugLog;
+  const D = (msg: string) => {
+    if (debugLog) debugLog.push(msg);
+  };
+
+  const withIndex = entries.map((e, originalIndex) => ({ ...e, originalIndex }));
+  const sorted = withIndex.sort((a, b) => {
+    const tc = a.time.localeCompare(b.time);
+    if (tc !== 0) return tc;
+    const ra = sameTimestampProcessingRank(a.line);
+    const rb = sameTimestampProcessingRank(b.line);
+    if (ra !== rb) return ra - rb;
+    return a.originalIndex - b.originalIndex;
+  });
+
+  D(`--- metrics debug: ${sorted.length} lines after sort (stable index + same-ts rank) ---`);
+  if (debugLog && sorted.length <= 400) {
+    for (let i = 0; i < sorted.length; i++) {
+      const { time, line, originalIndex: orig } = sorted[i];
+      const rank = sameTimestampProcessingRank(line);
+      const face = isPerAttemptFaceLine(line) ? "FACE" : "";
+      const idc =
+        line.includes("Identity verification completed successfully") ||
+        line.includes("Identity verification failed")
+          ? "ID_END"
+          : "";
+      const portal = line.includes("Initiating identity verification portal") ? "PORTAL" : "";
+      if (face || idc || portal) {
+        D(
+          `  [${i}] t=${time} origIdx=${orig} rank=${rank} ${portal}${face}${idc} ${line.slice(0, 140)}${line.length > 140 ? "…" : ""}`,
+        );
+      }
+    }
+  } else if (debugLog) {
+    D(`  (compact: Face / ID_END / PORTAL lines only; total ${sorted.length} lines) ---`);
+    for (let i = 0; i < sorted.length; i++) {
+      const { time, line, originalIndex: orig } = sorted[i];
+      if (
+        !isPerAttemptFaceLine(line) &&
+        !line.includes("Identity verification completed successfully") &&
+        !line.includes("Identity verification failed") &&
+        !line.includes("Initiating identity verification portal")
+      ) {
+        continue;
+      }
+      D(
+        `  [${i}] t=${time} origIdx=${orig} rank=${sameTimestampProcessingRank(line)} ${line.slice(0, 160)}${line.length > 160 ? "…" : ""}`,
+      );
+    }
+  }
 
   // Attempts/success/failure (used for the "Attempts" section)
   let totalFaceAttempts = 0;
@@ -90,9 +253,8 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
   let passportSuccess = 0;
   let passportFailed = 0;
 
-  // Identity-level stacks for total identity time and passport time
-  const identityStartStacks = new Map<string, number[]>();
-  const passportStartStacks = new Map<string, number[]>();
+  // Passport "Initiating ..." → completion timing, scoped per identity *session* key
+  const passportStartStacksBySession = new Map<string, number[]>();
 
   // Per-attempt timing sums (all averages below except total are per attempt)
   let identityCountForTiming = 0;
@@ -113,28 +275,78 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
   let sumFaceValidationTime = 0;
   let faceValidationCount = 0;
 
-  // For attempt-count distributions and face/passport comparison per identity
+  // Per *identity verification session* (portal start → success/fail). Same email can repeat across sessions.
   const identityAttemptStats = new Map<
     string,
-    { faceAttempts: number; passportAttempts: number; faceTimes: number[]; passportTimes: number[] }
+    {
+      faceAttempts: number;
+      passportAttempts: number;
+      faceTimes: number[];
+      passportTimes: number[];
+      email?: string;
+      urn?: string;
+    }
   >();
 
-  // Pair `FaceValidation=...` timings onto the corresponding face verification attempt times.
-  // - If validation is on a different log line than the face attempt, queue it (FIFO) and attach later.
-  // - If validation is already on the same face attempt log line, attach immediately.
-  const unassignedFaceAttemptIndicesByIdentity = new Map<string, number[]>();
-  const pendingFaceValidationTimesByIdentity = new Map<string, number[]>();
+  /** Oldest-open first (FIFO) for pairing completion lines; extra completions with empty queue are ignored. */
+  const openIdentitySessions: Array<{
+    key: string;
+    startMs: number;
+    startSortedIdx: number;
+    urn?: string;
+    email?: string;
+  }> = [];
+  let nextIdentitySessionId = 0;
 
-  const getIdentityAttempts = (key: string) => {
-    let cur = identityAttemptStats.get(key);
+  const sessionTraces = new Map<string, IdentitySessionTrace>();
+
+  // Pair `FaceValidation=...` timings onto the corresponding face verification attempt times (per session key).
+  const unassignedFaceAttemptIndicesBySession = new Map<string, number[]>();
+  const pendingFaceValidationTimesBySession = new Map<string, number[]>();
+
+  function getSessionStats(sessionKey: string) {
+    let cur = identityAttemptStats.get(sessionKey);
     if (!cur) {
-      cur = { faceAttempts: 0, passportAttempts: 0, faceTimes: [], passportTimes: [] };
-      identityAttemptStats.set(key, cur);
+      cur = {
+        faceAttempts: 0,
+        passportAttempts: 0,
+        faceTimes: [],
+        passportTimes: [],
+      };
+      identityAttemptStats.set(sessionKey, cur);
     }
     return cur;
-  };
+  }
 
-  for (const { time, line } of sorted) {
+  /** Prefer newest open session that matches urn, then email. No “sole open session” fallback — that mis-attributes other users’ lines when concurrency is low. */
+  function findOpenSessionKeyForLine(urnLine?: string, emailLine?: string): string | null {
+    if (openIdentitySessions.length === 0) return null;
+    if (urnLine) {
+      for (let i = openIdentitySessions.length - 1; i >= 0; i--) {
+        const s = openIdentitySessions[i];
+        if (s.urn && s.urn === urnLine) return s.key;
+      }
+    }
+    if (emailLine) {
+      for (let i = openIdentitySessions.length - 1; i >= 0; i--) {
+        const s = openIdentitySessions[i];
+        if (s.email && s.email === emailLine) return s.key;
+      }
+    }
+    return null;
+  }
+
+  function labelForIdentity(sessionKey: string, email?: string, urn?: string): string {
+    const e = email?.trim();
+    if (e) return e;
+    const u = urn?.trim();
+    if (u) return `(no email in logs) ${u}`;
+    if (sessionKey.includes("@")) return sessionKey;
+    return `(session ${sessionKey})`;
+  }
+
+  for (let sortedIdx = 0; sortedIdx < sorted.length; sortedIdx++) {
+    const { time, line, originalIndex: origIdx } = sorted[sortedIdx];
     const urnMatch = line.match(/\burn=([^\s]+)/);
     const urn = urnMatch?.[1]?.trim();
     const emailMatch = line.match(/email=([^\s]+)/);
@@ -146,46 +358,138 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
     // Used to prevent double-adding the same FaceValidation=... value to face verification time.
     let faceValidationAlreadyAddedToFaceTimeOnThisIteration = false;
 
-    // Identity total time: Initiating identity portal -> completed/failed for same identity
-    if (identityKey && line.includes("Initiating identity verification portal")) {
-      if (!Number.isNaN(tsMs)) {
-        const stack = identityStartStacks.get(identityKey) ?? [];
-        stack.push(tsMs);
-        identityStartStacks.set(identityKey, stack);
-      }
+    // Identity session: portal open → close on success/fail line whose email/urn matches that session (not blind FIFO).
+    if (line.includes("Initiating identity verification portal")) {
+      const sessionKey = `idv-${++nextIdentitySessionId}`;
+      const stats = getSessionStats(sessionKey);
+      if (email) stats.email = email;
+      if (urn) stats.urn = urn;
+      openIdentitySessions.push({
+        key: sessionKey,
+        startMs: tsMs,
+        startSortedIdx: sortedIdx,
+        urn: urn || undefined,
+        email: email || undefined,
+      });
+      D(
+        `[${sortedIdx}] PORTAL open ${sessionKey} queueLen=${openIdentitySessions.length} email=${email ?? "—"} urn=${urn ?? "—"} orig=${origIdx}`,
+      );
     } else if (
-      identityKey &&
-      (line.includes("Identity verification completed successfully") ||
-        line.includes("Identity verification failed"))
+      line.includes("Identity verification completed successfully") ||
+      line.includes("Identity verification failed")
     ) {
-      const stack = identityStartStacks.get(identityKey);
-      if (stack && stack.length > 0 && !Number.isNaN(tsMs)) {
-        const startMs = stack.shift()!;
-        const diffSec = Math.max(0, (tsMs - startMs) / 1000);
-        identityCountForTiming += 1;
-        sumIdentityTotalTime += diffSec;
-        identityStartStacks.set(identityKey, stack);
+      if (openIdentitySessions.length === 0) {
+        D(`[${sortedIdx}] ID_END ignored (no open session) orig=${origIdx}`);
+      } else {
+        let closeIdx = -1;
+        for (let i = 0; i < openIdentitySessions.length; i++) {
+          const o = openIdentitySessions[i];
+          if (logMarkersMatchLine(email, urn, o.email, o.urn)) {
+            closeIdx = i;
+            break;
+          }
+        }
+        if (closeIdx < 0) {
+          D(
+            `[${sortedIdx}] ID_END orphan (no open portal matches completion email/urn) email=${email ?? "—"} urn=${urn ?? "—"} open=${openIdentitySessions.length} orig=${origIdx}`,
+          );
+        } else {
+        const [sess] = openIdentitySessions.splice(closeIdx, 1);
+        const s = getSessionStats(sess.key);
+
+        if (line.includes("Identity verification completed successfully")) {
+          const rollFace = parseFaceAttemptsFromIdentitySuccessRollup(line);
+          const rollPass = parsePassportAttemptsFromIdentitySuccessRollup(line);
+          if (rollFace != null && rollFace > s.faceAttempts) {
+            const delta = rollFace - s.faceAttempts;
+            D(
+              `[${sortedIdx}] RECONCILE ${sess.key} faceAttempts ${s.faceAttempts}→${rollFace} (+${delta} from FaceVerification summary) orig=${origIdx}`,
+            );
+            totalFaceAttempts += delta;
+            faceSuccess += delta;
+            s.faceAttempts = rollFace;
+          }
+          if (rollPass != null && rollPass > s.passportAttempts) {
+            const delta = rollPass - s.passportAttempts;
+            D(
+              `[${sortedIdx}] RECONCILE ${sess.key} passportAttempts ${s.passportAttempts}→${rollPass} (+${delta} from PassportVerification summary) orig=${origIdx}`,
+            );
+            totalPassportAttempts += delta;
+            passportSuccess += delta;
+            s.passportAttempts = rollPass;
+          }
+        } else {
+          const rollFaceFail = parseFaceAttemptsFromIdentityFailureRollup(line);
+          if (rollFaceFail != null && rollFaceFail > s.faceAttempts) {
+            const delta = rollFaceFail - s.faceAttempts;
+            D(
+              `[${sortedIdx}] RECONCILE ${sess.key} faceAttempts ${s.faceAttempts}→${rollFaceFail} (+${delta} from identity-failure summary) orig=${origIdx}`,
+            );
+            totalFaceAttempts += delta;
+            faceFailed += delta;
+            s.faceAttempts = rollFaceFail;
+          }
+        }
+
+        let identityDurationSec: number | null = null;
+        if (!Number.isNaN(tsMs) && !Number.isNaN(sess.startMs)) {
+          const diffSec = Math.max(0, (tsMs - sess.startMs) / 1000);
+          identityDurationSec = diffSec;
+          identityCountForTiming += 1;
+          sumIdentityTotalTime += diffSec;
+        }
+        const stFinal = getSessionStats(sess.key);
+        sessionTraces.set(sess.key, {
+          sessionKey: sess.key,
+          displayLabel: labelForIdentity(sess.key, stFinal.email, stFinal.urn),
+          email: stFinal.email,
+          urn: stFinal.urn,
+          startSortedIndex: sess.startSortedIdx,
+          endSortedIndex: sortedIdx,
+          closed: true,
+          outcome: line.includes("Identity verification completed successfully")
+            ? "success"
+            : "failed",
+          identityDurationSec,
+          faceAttempts: stFinal.faceAttempts,
+          passportAttempts: stFinal.passportAttempts,
+        });
+        D(
+          `[${sortedIdx}] ID_END closed ${sess.key} queueLen=${openIdentitySessions.length} orig=${origIdx}`,
+        );
+        }
       }
     }
 
-    // Face verification attempts (success + failed), ignore helper "[VerifyJob]" logs
-    if (
-      line.includes("Face verification") &&
-      !line.includes("[VerifyJob] - Face verification completed successfully")
-    ) {
-      const isSuccess = line.includes("Face verification completed successfully");
-      const isFailed = line.includes("Face verification failed");
+    const sessionKeyForLine =
+      identityKey !== "" ? findOpenSessionKeyForLine(urn, email) : null;
+
+    // Face verification attempts (success + failed): per-attempt lines only; see isPerAttemptFaceLine
+    if (isPerAttemptFaceLine(line)) {
+      const l = line.toLowerCase();
+      const isSuccess = l.includes("face verification completed successfully");
+      const isFailed = l.includes("face verification failed");
       if (isSuccess || isFailed) {
         if (isFailed && isTlsRelated(line)) {
+          D(`[${sortedIdx}] FACE skipped (TLS) orig=${origIdx}`);
           continue;
         }
         totalFaceAttempts += 1;
         if (isSuccess) faceSuccess += 1;
         if (isFailed) faceFailed += 1;
 
-        if (identityKey) {
-          const s = getIdentityAttempts(identityKey);
+        const attemptNo = line.match(/\bAttempt=(\d+)/)?.[1];
+        const jobId = line.match(/JobID=([a-f0-9-]+)/i)?.[1];
+        if (sessionKeyForLine) {
+          const s = getSessionStats(sessionKeyForLine);
           s.faceAttempts += 1;
+          D(
+            `[${sortedIdx}] FACE line +1 → ${sessionKeyForLine} (now faceAttempts=${s.faceAttempts}) Attempt=${attemptNo ?? "?"} JobID=${jobId ?? "—"} orig=${origIdx}`,
+          );
+        } else {
+          D(
+            `[${sortedIdx}] FACE line +1 → NO SESSION (not attributed) Attempt=${attemptNo ?? "?"} JobID=${jobId ?? "—"} openQueues=${openIdentitySessions.length} orig=${origIdx}`,
+          );
         }
 
         const sessionInitMatch = line.match(/SessionInit=([\d.]+)s/);
@@ -232,29 +536,30 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
             v += fval;
             usedFaceValidation = true;
             faceValidationAlreadyAddedToFaceTimeOnThisIteration = true;
-          } else if (identityKey) {
+          } else if (sessionKeyForLine) {
             // Otherwise, if we already saw FaceValidation for this identity earlier, attach from the pending queue.
-            const pending = pendingFaceValidationTimesByIdentity.get(identityKey);
+            const pending = pendingFaceValidationTimesBySession.get(sessionKeyForLine);
             if (pending && pending.length > 0) {
               const pendingFval = pending.shift()!;
               v += pendingFval;
               usedFaceValidation = true;
-              if (pending.length === 0) pendingFaceValidationTimesByIdentity.delete(identityKey);
+              if (pending.length === 0)
+                pendingFaceValidationTimesBySession.delete(sessionKeyForLine);
             }
           }
 
           sumFaceTime += v;
           faceTimeCount += 1;
-          if (identityKey) {
-            const s = getIdentityAttempts(identityKey);
+          if (sessionKeyForLine) {
+            const s = getSessionStats(sessionKeyForLine);
             const faceIdx = s.faceTimes.length;
             s.faceTimes.push(v);
 
             // If FaceValidation wasn't attached yet, queue this attempt index for a future FaceValidation=... line.
             if (!usedFaceValidation) {
-              const q = unassignedFaceAttemptIndicesByIdentity.get(identityKey) ?? [];
+              const q = unassignedFaceAttemptIndicesBySession.get(sessionKeyForLine) ?? [];
               q.push(faceIdx);
-              unassignedFaceAttemptIndicesByIdentity.set(identityKey, q);
+              unassignedFaceAttemptIndicesBySession.set(sessionKeyForLine, q);
             }
           }
         }
@@ -262,14 +567,14 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
     }
 
     // Passport validation attempts and timings
-    if (identityKey && line.includes("Initiating passport validation")) {
+    if (sessionKeyForLine && line.includes("Initiating passport validation")) {
       if (!Number.isNaN(tsMs)) {
-        const stack = passportStartStacks.get(identityKey) ?? [];
+        const stack = passportStartStacksBySession.get(sessionKeyForLine) ?? [];
         stack.push(tsMs);
-        passportStartStacks.set(identityKey, stack);
+        passportStartStacksBySession.set(sessionKeyForLine, stack);
       }
     } else if (
-      identityKey &&
+      sessionKeyForLine &&
       (line.includes("Passport validation completed successfully") ||
         line.includes("Passport validation failed"))
     ) {
@@ -278,8 +583,8 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
       }
       // Count attempts
       totalPassportAttempts += 1;
-      if (identityKey) {
-        const s = getIdentityAttempts(identityKey);
+      if (sessionKeyForLine) {
+        const s = getSessionStats(sessionKeyForLine);
         s.passportAttempts += 1;
       }
       if (line.includes("Passport validation completed successfully")) {
@@ -288,16 +593,16 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
         passportFailed += 1;
       }
 
-      // Compute duration from last unmatched "Initiating passport validation" for this identity
-      const stack = passportStartStacks.get(identityKey);
+      // Compute duration from last unmatched "Initiating passport validation" for this session
+      const stack = passportStartStacksBySession.get(sessionKeyForLine);
       if (stack && stack.length > 0 && !Number.isNaN(tsMs)) {
         const startMs = stack.shift()!;
         const diffSec = Math.max(0, (tsMs - startMs) / 1000);
         sumPassportTime += diffSec;
         passportTimeCount += 1;
-        passportStartStacks.set(identityKey, stack);
-        if (identityKey) {
-          getIdentityAttempts(identityKey).passportTimes.push(diffSec);
+        passportStartStacksBySession.set(sessionKeyForLine, stack);
+        if (sessionKeyForLine) {
+          getSessionStats(sessionKeyForLine).passportTimes.push(diffSec);
         }
       }
     }
@@ -312,25 +617,52 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
       // If we already added this FaceValidation value to face verification time for this same line,
       // don't attach it again to a queued attempt.
       if (!faceValidationAlreadyAddedToFaceTimeOnThisIteration) {
-        if (identityKey) {
-          const q = unassignedFaceAttemptIndicesByIdentity.get(identityKey);
+        if (sessionKeyForLine) {
+          const q = unassignedFaceAttemptIndicesBySession.get(sessionKeyForLine);
           if (q && q.length > 0) {
             const faceIdx = q.shift()!;
-            if (q.length === 0) unassignedFaceAttemptIndicesByIdentity.delete(identityKey);
+            if (q.length === 0)
+              unassignedFaceAttemptIndicesBySession.delete(sessionKeyForLine);
 
-            const s = identityAttemptStats.get(identityKey);
+            const s = identityAttemptStats.get(sessionKeyForLine);
             if (s && Number.isFinite(s.faceTimes[faceIdx])) {
               s.faceTimes[faceIdx] += fval;
               sumFaceTime += fval;
             }
           } else {
-            const pending = pendingFaceValidationTimesByIdentity.get(identityKey) ?? [];
+            const pending = pendingFaceValidationTimesBySession.get(sessionKeyForLine) ?? [];
             pending.push(fval);
-            pendingFaceValidationTimesByIdentity.set(identityKey, pending);
+            pendingFaceValidationTimesBySession.set(sessionKeyForLine, pending);
           }
         }
       }
     }
+  }
+
+  for (const sess of openIdentitySessions) {
+    const stAfter = getSessionStats(sess.key);
+    sessionTraces.set(sess.key, {
+      sessionKey: sess.key,
+      displayLabel: labelForIdentity(sess.key, stAfter.email, stAfter.urn),
+      email: stAfter.email,
+      urn: stAfter.urn,
+      startSortedIndex: sess.startSortedIdx,
+      endSortedIndex: Math.max(0, sorted.length - 1),
+      closed: false,
+      outcome: undefined,
+      identityDurationSec: null,
+      faceAttempts: stAfter.faceAttempts,
+      passportAttempts: stAfter.passportAttempts,
+    });
+  }
+
+  D(
+    `--- summary: totalFace=${totalFaceAttempts} totalPassport=${totalPassportAttempts} idClosures=${identityCountForTiming} sessionRows=${identityAttemptStats.size} stillOpen=${openIdentitySessions.length} ---`,
+  );
+  if (openIdentitySessions.length > 0 && debugLog) {
+    D(
+      `  still-open sessions: ${openIdentitySessions.map((s) => s.key).join(", ")} (no matching ID_END in range)`,
+    );
   }
 
   if (
@@ -351,67 +683,114 @@ function computeMetricsFromDetailedLogs(entries: LogEntry[]): ReportMetrics | nu
           ? 1
           : 0;
 
-  // Build attempt-count histograms per identity
-  const buildDistribution = (values: number[]): Array<{ attempts: number; identities: number }> => {
-    const nonZero = values.filter((v) => v > 0);
-    if (nonZero.length === 0) return [];
-    const max = Math.max(...nonZero);
-    const hist = new Map<number, number>();
-    for (const v of nonZero) {
-      hist.set(v, (hist.get(v) ?? 0) + 1);
+  function buildAttemptDistribution(
+    mode: "face" | "passport",
+  ): Array<{
+    attempts: number;
+    identities: number;
+    sessions: DistributionSessionRef[];
+  }> {
+    const bucketToSessions = new Map<number, DistributionSessionRef[]>();
+    for (const [key, s] of identityAttemptStats) {
+      const n = mode === "face" ? s.faceAttempts : s.passportAttempts;
+      if (n <= 0) continue;
+      const displayLabel = labelForIdentity(key, s.email, s.urn);
+      const arr = bucketToSessions.get(n) ?? [];
+      arr.push({ sessionKey: key, displayLabel });
+      bucketToSessions.set(n, arr);
     }
-    const out: Array<{ attempts: number; identities: number }> = [];
-    for (let a = 1; a <= max; a++) {
-      const identities = hist.get(a) ?? 0;
-      if (identities > 0) out.push({ attempts: a, identities });
+    if (bucketToSessions.size === 0) return [];
+    const maxAttempts = Math.max(...bucketToSessions.keys());
+    const out: Array<{
+      attempts: number;
+      identities: number;
+      sessions: DistributionSessionRef[];
+    }> = [];
+    for (let a = 1; a <= maxAttempts; a++) {
+      const sessions = bucketToSessions.get(a);
+      if (!sessions || sessions.length === 0) continue;
+      sessions.sort(
+        (x, y) =>
+          x.displayLabel.localeCompare(y.displayLabel) ||
+          x.sessionKey.localeCompare(y.sessionKey),
+      );
+      out.push({ attempts: a, identities: sessions.length, sessions });
     }
     return out;
-  };
+  }
 
-  const faceAttemptsDistribution = buildDistribution(
-    [...identityAttemptStats.values()].map((s) => s.faceAttempts)
-  );
-  const passportAttemptsDistribution = buildDistribution(
-    [...identityAttemptStats.values()].map((s) => s.passportAttempts)
-  );
+  const faceAttemptsDistribution = buildAttemptDistribution("face");
+  const passportAttemptsDistribution = buildAttemptDistribution("passport");
 
-  // Compare per-identity paired face/passport attempt durations
+  // Compare per-identity paired face/passport attempt durations (same index = paired attempt)
   let passportSlowerThanFace = 0;
   let faceSlowerThanPassport = 0;
-  for (const s of identityAttemptStats.values()) {
+  const passportSlowerThanFaceSessions: DistributionSessionRef[] = [];
+  const faceSlowerThanPassportSessions: DistributionSessionRef[] = [];
+  for (const [sessionKey, s] of identityAttemptStats) {
     const n = Math.min(s.faceTimes.length, s.passportTimes.length);
+    const displayLabel = labelForIdentity(sessionKey, s.email, s.urn);
     for (let i = 0; i < n; i++) {
       const f = s.faceTimes[i];
       const p = s.passportTimes[i];
       if (!Number.isFinite(f) || !Number.isFinite(p)) continue;
-      if (p > f) passportSlowerThanFace += 1;
-      else if (f > p) faceSlowerThanPassport += 1;
+      const ref: DistributionSessionRef = {
+        sessionKey,
+        displayLabel,
+        faceSec: f,
+        passportSec: p,
+        attemptPairIndex: i + 1,
+      };
+      if (p > f) {
+        passportSlowerThanFace += 1;
+        passportSlowerThanFaceSessions.push(ref);
+      } else if (f > p) {
+        faceSlowerThanPassport += 1;
+        faceSlowerThanPassportSessions.push(ref);
+      }
     }
   }
+  const cmpCompareSession = (a: DistributionSessionRef, b: DistributionSessionRef) => {
+    const l = a.displayLabel.localeCompare(b.displayLabel);
+    if (l !== 0) return l;
+    const k = a.sessionKey.localeCompare(b.sessionKey);
+    if (k !== 0) return k;
+    return (a.attemptPairIndex ?? 0) - (b.attemptPairIndex ?? 0);
+  };
+  passportSlowerThanFaceSessions.sort(cmpCompareSession);
+  faceSlowerThanPassportSessions.sort(cmpCompareSession);
+
+  const sortedLogs: LogEntry[] = sorted.map(({ time, line }) => ({ time, line }));
 
   return {
-    count,
-    identityVerificationsAvg: NaN,
-    totalFaceAttempts,
-    totalPassportAttempts,
-    faceFailed,
-    faceSuccess,
-    passportFailed,
-    passportSuccess,
-    avgTotalTime: identityCountForTiming > 0 ? sumIdentityTotalTime / identityCountForTiming : 0,
-    avgFaceAttemptsPerIdentity: NaN,
-    avgFaceTime: faceTimeCount > 0 ? sumFaceTime / faceTimeCount : 0,
-    avgFaceSessionInit: faceSessionInitCount > 0 ? sumFaceSessionInit / faceSessionInitCount : 0,
-    avgFaceSolve: faceSolveCount > 0 ? sumFaceSolve / faceSolveCount : 0,
-    avgFaceGetResult: faceGetResultCount > 0 ? sumFaceGetResult / faceGetResultCount : 0,
-    avgPassportTime: passportTimeCount > 0 ? sumPassportTime / passportTimeCount : 0,
-    avgPassportAttemptsPerIdentity: NaN,
-    avgFaceValidationTime: faceValidationCount > 0 ? sumFaceValidationTime / faceValidationCount : 0,
-    avgFaceValidationAttemptsPerIdentity: NaN,
-    faceAttemptsDistribution,
-    passportAttemptsDistribution,
-    passportSlowerThanFace,
-    faceSlowerThanPassport,
+    metrics: {
+      count,
+      identityVerificationsAvg: NaN,
+      totalFaceAttempts,
+      totalPassportAttempts,
+      faceFailed,
+      faceSuccess,
+      passportFailed,
+      passportSuccess,
+      avgTotalTime: identityCountForTiming > 0 ? sumIdentityTotalTime / identityCountForTiming : 0,
+      avgFaceAttemptsPerIdentity: NaN,
+      avgFaceTime: faceTimeCount > 0 ? sumFaceTime / faceTimeCount : 0,
+      avgFaceSessionInit: faceSessionInitCount > 0 ? sumFaceSessionInit / faceSessionInitCount : 0,
+      avgFaceSolve: faceSolveCount > 0 ? sumFaceSolve / faceSolveCount : 0,
+      avgFaceGetResult: faceGetResultCount > 0 ? sumFaceGetResult / faceGetResultCount : 0,
+      avgPassportTime: passportTimeCount > 0 ? sumPassportTime / passportTimeCount : 0,
+      avgPassportAttemptsPerIdentity: NaN,
+      avgFaceValidationTime: faceValidationCount > 0 ? sumFaceValidationTime / faceValidationCount : 0,
+      avgFaceValidationAttemptsPerIdentity: NaN,
+      faceAttemptsDistribution,
+      passportAttemptsDistribution,
+      passportSlowerThanFace,
+      faceSlowerThanPassport,
+      passportSlowerThanFaceSessions,
+      faceSlowerThanPassportSessions,
+    },
+    sortedLogs,
+    sessionTraces: Object.fromEntries(sessionTraces),
   };
 }
 
@@ -458,12 +837,149 @@ function computeMetrics(logs: { line: string }[]): ReportMetrics | null {
     passportAttemptsDistribution: [],
     passportSlowerThanFace: 0,
     faceSlowerThanPassport: 0,
+    passportSlowerThanFaceSessions: [],
+    faceSlowerThanPassportSessions: [],
   };
 }
 
 
 function fmt(s: number): string {
   return Number.isFinite(s) ? s.toFixed(2) : "—";
+}
+
+/** Hide vfs-global-bot debug-level lines in session log UI (Winston colorize + plain). */
+function isSessionLogDebugLine(line: string): boolean {
+  if (/\x1b\[3\d*mdebug\x1b\[[\d;]*m\s*:/i.test(line)) return true;
+  if (/\[[0-9;]*mdebug\[[0-9;]*m\s*:/i.test(line)) return true;
+  if (/\d{2}:\d{2}:\d{2}\.\d{3}\s+debug\s*:/i.test(line)) return true;
+  return false;
+}
+
+/** `email=` / `urn=` on a log line vs session markers (portal / trace). */
+function logMarkersMatchLine(
+  lineEmail?: string,
+  lineUrn?: string,
+  markerEmail?: string,
+  markerUrn?: string,
+): boolean {
+  const le = lineEmail?.trim();
+  const lu = lineUrn?.trim();
+  const te = markerEmail?.trim();
+  const tu = markerUrn?.trim();
+  if (!le && !lu) return false;
+  if (te && le && le !== te) return false;
+  if (tu && lu && lu !== tu) return false;
+  if (te && tu) {
+    if (le && lu) return le === te && lu === tu;
+    if (le) return le === te;
+    if (lu) return lu === tu;
+    return false;
+  }
+  if (te) return Boolean(le && le === te);
+  if (tu) return Boolean(lu && lu === tu);
+  return false;
+}
+
+/**
+ * Session log window is a contiguous range in globally sorted logs — other identities' lines can fall
+ * between portal and identity completion by timestamp. Keep only lines whose email=/urn= match this trace.
+ */
+function lineBelongsToSessionTrace(trace: IdentitySessionTrace, line: string): boolean {
+  const le = line.match(/email=([^\s]+)/)?.[1]?.trim();
+  const lu = line.match(/\burn=([^\s]+)/)?.[1]?.trim();
+  if (!le && !lu) return false;
+  return logMarkersMatchLine(le, lu, trace.email, trace.urn);
+}
+
+/** Real ESC + Winston-style visible `[34m` SGR tokens (no leading ESC). */
+const SESSION_LOG_SGR =
+  /\x1b\[([\d;]*)m|\[(\d+(?:;\d+)*)m/g;
+
+const ANSI_FG: Record<number, string> = {
+  30: "#242424",
+  31: "#cd3131",
+  32: "#0dbc79",
+  33: "#b58900",
+  34: "#2472c8",
+  35: "#bc3fbc",
+  36: "#11a8cd",
+  37: "#e5e5e5",
+};
+const ANSI_BRIGHT: Record<number, string> = {
+  90: "#666666",
+  91: "#f14c4c",
+  92: "#23d18b",
+  93: "#f5f543",
+  94: "#3b8eea",
+  95: "#d670d6",
+  96: "#29b8db",
+  97: "#ffffff",
+};
+
+function applySgrCodes(codeStr: string, st: { color?: string; bold: boolean }) {
+  const raw = codeStr.trim();
+  const parts = raw === "" ? ["0"] : raw.split(";");
+  let i = 0;
+  while (i < parts.length) {
+    const n = parseInt(parts[i], 10);
+    if (Number.isNaN(n)) {
+      i += 1;
+      continue;
+    }
+    if (n === 0) {
+      st.color = undefined;
+      st.bold = false;
+    } else if (n === 1) st.bold = true;
+    else if (n === 22) st.bold = false;
+    else if (n === 39) st.color = undefined;
+    else if (n >= 30 && n <= 37) st.color = ANSI_FG[n];
+    else if (n >= 90 && n <= 97) st.color = ANSI_BRIGHT[n];
+    i += 1;
+  }
+}
+
+type AnsiSeg = { text: string; color?: string; bold: boolean };
+
+function parseAnsiSegments(input: string): AnsiSeg[] {
+  const out: AnsiSeg[] = [];
+  const st = { color: undefined as string | undefined, bold: false };
+  let last = 0;
+  let m: RegExpExecArray | null;
+  const re = new RegExp(SESSION_LOG_SGR.source, "g");
+  const push = (text: string) => {
+    if (!text) return;
+    const prev = out[out.length - 1];
+    if (prev && prev.color === st.color && prev.bold === st.bold) prev.text += text;
+    else out.push({ text, color: st.color, bold: st.bold });
+  };
+  while ((m = re.exec(input)) !== null) {
+    push(input.slice(last, m.index));
+    last = m.index + m[0].length;
+    const g = m[1] !== undefined ? m[1] : m[2];
+    applySgrCodes(g ?? "0", st);
+  }
+  push(input.slice(last));
+  return out;
+}
+
+function stripSessionLogAnsi(input: string): string {
+  return input.replace(SESSION_LOG_SGR, "");
+}
+
+function SessionLogAnsiLine({ value }: { value: string }) {
+  const segs = parseAnsiSegments(value);
+  return (
+    <>
+      {segs.map((s, i) => (
+        <span
+          key={i}
+          style={s.bold || s.color ? { color: s.color, fontWeight: s.bold ? 600 : undefined } : undefined}
+        >
+          {s.text}
+        </span>
+      ))}
+    </>
+  );
 }
 
 function extractEmailsFromLogs(logs: { line: string }[]): string[] {
@@ -634,8 +1150,6 @@ type LivenessReportSection = {
   jobCount: number;
   longWebsocketCount: number;
   longWebsocketExamples: Array<{ jobId: string; videoUrl: string }>;
-  shortWebsocketCount: number;
-  shortWebsocketExamples: Array<{ jobId: string; videoUrl: string }>;
   longVideoPrep: { count: number; examples: LongExample[] };
   longVideoFileLoaded: { count: number; examples: LongExample[] };
   longBrowserSetup: { count: number; examples: LongExample[] };
@@ -657,7 +1171,6 @@ function computeLivenessSection(
 ): LivenessReportSection | null {
   const metrics: LivenessJobMetrics[] = [];
   const longWebsocket: Array<{ fullJobId: string; videoUrl: string; ws: number }> = [];
-  const shortWebsocket: Array<{ fullJobId: string; videoUrl: string; ws: number }> = [];
   const longVideoPrep: Array<{ fullJobId: string; videoUrl: string; value: number }> = [];
   const longVideoFileLoaded: Array<{ fullJobId: string; videoUrl: string; value: number }> = [];
   const longBrowserSetup: Array<{ fullJobId: string; videoUrl: string; value: number }> = [];
@@ -671,9 +1184,6 @@ function computeLivenessSection(
     metrics.push(m);
     if (m.websocketDisconnect != null && m.websocketDisconnect > 11) {
       longWebsocket.push({ ...meta, ws: m.websocketDisconnect });
-    }
-    if (m.websocketDisconnect != null && m.websocketDisconnect < 10) {
-      shortWebsocket.push({ ...meta, ws: m.websocketDisconnect });
     }
     if (m.videoPrep != null && m.videoPrep > 0.2) {
       longVideoPrep.push({ ...meta, value: m.videoPrep });
@@ -708,8 +1218,6 @@ function computeLivenessSection(
     jobCount: n,
     longWebsocketExamples: longWebsocket.slice(0, 3).map(({ fullJobId, videoUrl }) => ({ jobId: fullJobId, videoUrl })),
     longWebsocketCount: longWebsocket.length,
-    shortWebsocketExamples: shortWebsocket.slice(0, 3).map(({ fullJobId, videoUrl }) => ({ jobId: fullJobId, videoUrl })),
-    shortWebsocketCount: shortWebsocket.length,
     longVideoPrep: { count: longVideoPrep.length, examples: take3WithValue(longVideoPrep) },
     longVideoFileLoaded: { count: longVideoFileLoaded.length, examples: take3WithValue(longVideoFileLoaded) },
     longBrowserSetup: { count: longBrowserSetup.length, examples: take3WithValue(longBrowserSetup) },
@@ -763,25 +1271,6 @@ function LivenessSectionBlock({ section, fmt }: { section: LivenessReportSection
           <div className="text-sm font-medium text-amber-900">Jobs with websocket &gt; 11s: {section.longWebsocketCount}</div>
           <div className="mt-2 text-xs space-y-2">
             {section.longWebsocketExamples.map((ex, i) => (
-              <div key={i}>
-                <span className="text-zinc-600">Job ID: </span>
-                <code className="text-zinc-800">{ex.jobId}</code>
-                {ex.videoUrl && (
-                  <>
-                    {" · "}
-                    <a href={ex.videoUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 underline break-all">Video</a>
-                  </>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-      {section.shortWebsocketCount > 0 && (
-        <div className="rounded-lg border border-zinc-200 bg-zinc-50/50 p-3 mt-2">
-          <div className="text-sm font-medium text-zinc-800">Jobs with websocket &lt; 10s: {section.shortWebsocketCount}</div>
-          <div className="mt-2 text-xs space-y-2">
-            {section.shortWebsocketExamples.map((ex, i) => (
               <div key={i}>
                 <span className="text-zinc-600">Job ID: </span>
                 <code className="text-zinc-800">{ex.jobId}</code>
@@ -896,6 +1385,29 @@ function toDatetimeLocal(d: Date): string {
   return `${y}-${m}-${day}T${h}:${min}`;
 }
 
+/** Loki/Grafana return UTC ISO strings; show this in the UI so it matches datetime-local From/To. */
+function formatLogTimeLocal(iso: string): string {
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return iso;
+  try {
+    return new Date(ms).toLocaleString(undefined, {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  } catch {
+    return iso;
+  }
+}
+
+function sessionLogSearchHaystack(e: LogEntry): string {
+  const plain = stripSessionLogAnsi(e.line);
+  return `${e.time}\t${formatLogTimeLocal(e.time)}\t${plain}`.toLowerCase();
+}
+
 export default function ReportClient() {
   const now = Date.now();
   const defaultFrom = new Date(now - INTERVAL_MS["24h"]);
@@ -913,6 +1425,34 @@ export default function ReportClient() {
   const [livenessTarget, setLivenessTarget] = useState<"liveness-bot" | "aws-liveness-automation-staging">(
     "liveness-bot"
   );
+  const [identityPopup, setIdentityPopup] = useState<{
+    title: string;
+    sessions: DistributionSessionRef[];
+    hint?: string;
+  } | null>(null);
+  const [sessionLogPopup, setSessionLogPopup] = useState<string | null>(null);
+  const [sessionLogSearch, setSessionLogSearch] = useState("");
+  const [reportSortedLogs, setReportSortedLogs] = useState<LogEntry[]>([]);
+  const [reportSessionTraces, setReportSessionTraces] = useState<
+    Record<string, IdentitySessionTrace>
+  >({});
+  const [metricsDebugEnabled, setMetricsDebugEnabled] = useState(false);
+  const [metricsDebugText, setMetricsDebugText] = useState("");
+
+  useEffect(() => {
+    if (!identityPopup && !sessionLogPopup) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (sessionLogPopup) setSessionLogPopup(null);
+      else setIdentityPopup(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [identityPopup, sessionLogPopup]);
+
+  useEffect(() => {
+    setSessionLogSearch("");
+  }, [sessionLogPopup]);
 
   const applyPreset = useCallback((interval: string) => {
     const ms = INTERVAL_MS[interval] ?? INTERVAL_MS["24h"];
@@ -924,6 +1464,11 @@ export default function ReportClient() {
 
   async function handleGenerate() {
     setError(null);
+    setIdentityPopup(null);
+    setSessionLogPopup(null);
+    setMetricsDebugText("");
+    setReportSortedLogs([]);
+    setReportSessionTraces({});
     setReportMetrics(null);
     setFaceErrors([]);
     setPassportErrors([]);
@@ -1006,8 +1551,15 @@ export default function ReportClient() {
         for (const entries of results) allEntries.push(...entries);
       }
       setLoadingProgress("Computing identity & attempt stats…");
-      const metrics = computeMetricsFromDetailedLogs(allEntries);
-      setReportMetrics(metrics ?? null);
+      const dbg: string[] = [];
+      const metricsResult = computeMetricsFromDetailedLogs(
+        allEntries,
+        metricsDebugEnabled ? { debugLog: dbg } : undefined,
+      );
+      setReportMetrics(metricsResult?.metrics ?? null);
+      setReportSortedLogs(metricsResult?.sortedLogs ?? []);
+      setReportSessionTraces(metricsResult?.sessionTraces ?? {});
+      setMetricsDebugText(metricsDebugEnabled ? dbg.join("\n") : "");
       setLoadingProgress(null);
 
       const allLines = allEntries.map((e) => e.line);
@@ -1088,6 +1640,166 @@ export default function ReportClient() {
     }
   }
 
+  function renderSessionLogModal() {
+    if (!sessionLogPopup) return null;
+    const trace = reportSessionTraces[sessionLogPopup];
+    const windowSlice =
+      trace && reportSortedLogs.length > 0
+        ? reportSortedLogs.slice(trace.startSortedIndex, trace.endSortedIndex + 1)
+        : [];
+    const slice = trace ? windowSlice.filter((e) => lineBelongsToSessionTrace(trace, e.line)) : windowSlice;
+    const droppedOtherIdentity = trace ? windowSlice.length - slice.length : 0;
+    const displaySlice = slice.filter((e) => !isSessionLogDebugLine(e.line));
+    const q = sessionLogSearch.trim().toLowerCase();
+    const filteredRows =
+      q === ""
+        ? displaySlice.map((e, idx) => ({ e, idx }))
+        : displaySlice
+            .map((e, idx) => ({ e, idx }))
+            .filter(({ e }) => sessionLogSearchHaystack(e).includes(q));
+    const filteredDisplaySlice = filteredRows.map((r) => r.e);
+    const logText = filteredDisplaySlice
+      .map(
+        (e) =>
+          `${formatLogTimeLocal(e.time)}\t${e.time}\t${stripSessionLogAnsi(e.line)}`,
+      )
+      .join("\n");
+    const hiddenDebug = slice.length - displaySlice.length;
+    return (
+      <div
+        className="fixed inset-0 z-[110] flex flex-col w-screen h-[100dvh] max-h-[100dvh] bg-white shadow-2xl"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="session-log-title"
+      >
+        <div className="flex flex-col flex-1 min-h-0 w-full overflow-hidden">
+          <div className="flex items-center justify-between gap-2 border-b border-zinc-200 px-4 py-3 shrink-0">
+            <h2 id="session-log-title" className="text-sm font-semibold text-zinc-900 pr-2">
+              Session log · {trace?.displayLabel ?? sessionLogPopup}
+            </h2>
+            <button
+              type="button"
+              onClick={() => setSessionLogPopup(null)}
+              className="shrink-0 rounded-lg px-2 py-1 text-sm text-zinc-600 hover:bg-zinc-100"
+            >
+              Close
+            </button>
+          </div>
+          {trace ? (
+            <div className="px-4 py-2 border-b border-zinc-100 bg-zinc-50 text-xs space-y-1 shrink-0">
+              <div>
+                <span className="text-zinc-500">Session:</span>{" "}
+                <code className="text-zinc-800">{trace.sessionKey}</code>
+                {trace.closed ? (
+                  <span className="ml-2 text-zinc-600">
+                    · {trace.outcome === "success" ? "Completed" : "Failed"}
+                    {trace.identityDurationSec != null && (
+                      <span className="ml-1">· {fmt(trace.identityDurationSec)}s portal→end</span>
+                    )}
+                  </span>
+                ) : (
+                  <span className="ml-2 text-amber-700">· No identity end in range (open)</span>
+                )}
+              </div>
+              <div className="tabular-nums">
+                <span className="text-zinc-500">Counts:</span> faceAttempts={trace.faceAttempts}{" "}
+                passportAttempts={trace.passportAttempts}
+                <span className="text-zinc-500 ml-2">· Window</span> {trace.startSortedIndex}–{trace.endSortedIndex}
+                {droppedOtherIdentity > 0 ? (
+                  <span className="ml-1 text-zinc-600">
+                    · {slice.length} for this identity ({droppedOtherIdentity} other filtered out)
+                  </span>
+                ) : (
+                  <span className="ml-1">· {slice.length} for this identity</span>
+                )}
+                {hiddenDebug > 0 ? (
+                  <span className="ml-1">
+                    · {displaySlice.length} shown, {hiddenDebug} debug hidden
+                  </span>
+                ) : null}
+              </div>
+              {trace.urn && (
+                <div className="break-all">
+                  <span className="text-zinc-500">urn:</span> {trace.urn}
+                </div>
+              )}
+            </div>
+          ) : (
+            <p className="px-4 py-2 text-xs text-amber-800 bg-amber-50 border-b border-amber-100">
+              No trace for this session — regenerate the report.
+            </p>
+          )}
+          <div className="shrink-0 px-4 py-2 border-b border-zinc-200 bg-white space-y-1">
+            <p className="text-[11px] text-zinc-500">
+              First column is <strong className="text-zinc-700">your local time</strong> (same idea as From/To). Grafana
+              stores UTC — e.g. 9:16 PM Dubai = <code className="text-zinc-700">17:16Z</code>.
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+            <label htmlFor="session-log-search" className="text-xs font-medium text-zinc-600 shrink-0">
+              Search
+            </label>
+            <input
+              id="session-log-search"
+              type="search"
+              value={sessionLogSearch}
+              onChange={(e) => setSessionLogSearch(e.target.value)}
+              placeholder="Filter (local or UTC time + message)…"
+              className="flex-1 min-w-[12rem] rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-zinc-400"
+              autoComplete="off"
+            />
+            {q !== "" && (
+              <span className="text-xs text-zinc-500 tabular-nums">
+                {filteredDisplaySlice.length} / {displaySlice.length} lines
+              </span>
+            )}
+            </div>
+          </div>
+          <div className="flex-1 min-h-0 p-3 flex flex-col">
+            <pre className="text-[11px] leading-relaxed text-zinc-900 flex-1 min-h-0 overflow-auto whitespace-pre-wrap break-all font-mono bg-white border border-zinc-300 rounded-lg p-3 shadow-inner">
+              {displaySlice.length > 0 ? (
+                filteredRows.length > 0 ? (
+                  filteredRows.map(({ e, idx }, i) => (
+                    <Fragment key={idx}>
+                      {i > 0 ? "\n" : null}
+                      <SessionLogAnsiLine value={`${formatLogTimeLocal(e.time)}\t${e.line}`} />
+                    </Fragment>
+                  ))
+                ) : (
+                  "No lines match your search."
+                )
+              ) : slice.length > 0 ? (
+                "All lines in this range were debug-level (hidden)."
+              ) : (
+                "No log lines in slice."
+              )}
+            </pre>
+          </div>
+          <div className="border-t border-zinc-200 px-4 py-2 shrink-0 flex justify-end">
+            <button
+              type="button"
+              className="text-xs rounded-lg border border-zinc-300 px-3 py-1.5 text-zinc-700 hover:bg-zinc-100"
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(logText);
+                } catch {
+                  /* ignore */
+                }
+              }}
+            >
+              Copy logs
+            </button>
+            <span className="text-[11px] text-zinc-500 ml-2">
+              TSV: local time, UTC ISO, line
+            </span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const browserTz =
+    typeof Intl !== "undefined" ? Intl.DateTimeFormat().resolvedOptions().timeZone : "";
+
   return (
     <div className="w-full space-y-6">
       <div>
@@ -1117,6 +1829,15 @@ export default function ReportClient() {
           />
         </div>
         <div className="sm:col-span-2 flex flex-col justify-end">
+          <p className="text-xs text-zinc-500 mb-2 leading-snug">
+            From/To use your computer&apos;s local timezone
+            {browserTz ? (
+              <>
+                : <code className="text-zinc-700">{browserTz}</code>
+              </>
+            ) : null}
+            . Loki returns UTC; session log shows local time in the first column.
+          </p>
           <label className="block text-sm font-medium text-zinc-700 mb-1">Quick range</label>
           <div className="flex gap-2 flex-wrap">
             {(["15m", "1h", "6h", "24h"] as const).map((v) => (
@@ -1165,14 +1886,36 @@ export default function ReportClient() {
         <p className="mt-1 text-xs text-zinc-500">Applied to identity verification and per-email (vfs-global-bot) only.</p>
       </div>
 
-      <button
-        type="button"
-        onClick={handleGenerate}
-        disabled={loading}
-        className="inline-flex items-center rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-800 disabled:opacity-50"
-      >
-        {loading ? (loadingProgress ?? "Generating…") : "Generate report"}
-      </button>
+      <div className="flex flex-wrap items-center gap-4">
+        <button
+          type="button"
+          onClick={handleGenerate}
+          disabled={loading}
+          className="inline-flex items-center rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-800 disabled:opacity-50"
+        >
+          {loading ? (loadingProgress ?? "Generating…") : "Generate report"}
+        </button>
+        <label className="flex items-center gap-2 text-sm text-zinc-700 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={metricsDebugEnabled}
+            onChange={(e) => setMetricsDebugEnabled(e.target.checked)}
+            className="h-4 w-4 rounded border-zinc-300 text-zinc-900 focus:ring-zinc-900"
+          />
+          Debug attempt attribution (verbose log)
+        </label>
+      </div>
+
+      {metricsDebugText.length > 0 && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50/40 p-3">
+          <div className="text-xs font-medium text-amber-900 mb-1">
+            Metrics debug trace (portal / face lines / session close / reconcile)
+          </div>
+          <pre className="text-[10px] leading-snug text-zinc-800 max-h-96 overflow-auto whitespace-pre-wrap break-all font-mono">
+            {metricsDebugText}
+          </pre>
+        </div>
+      )}
 
       {error && (
         <p className="text-sm text-red-600 bg-red-50 border border-red-100 rounded-md px-3 py-2">
@@ -1237,16 +1980,28 @@ export default function ReportClient() {
                   </span>
                 </li>
                 <li>
-                  <div className="text-xs text-zinc-500 mt-2 mb-1">Face attempts distribution (per identity)</div>
+                  <div className="text-xs text-zinc-500 mt-2 mb-1">
+                    Face attempts distribution — click a row, then a session for logs (portal → identity end)
+                  </div>
                   {reportMetrics.faceAttemptsDistribution.some((r) => r.identities > 0) ? (
                     <div className="space-y-0.5">
                       {reportMetrics.faceAttemptsDistribution
                         .filter((r) => r.identities > 0)
                         .map((r) => (
-                          <div key={r.attempts}>
+                          <button
+                            key={r.attempts}
+                            type="button"
+                            onClick={() =>
+                              setIdentityPopup({
+                                title: `Face · ${r.attempts} attempt${r.attempts === 1 ? "" : "s"} · ${r.identities} session${r.identities === 1 ? "" : "s"}`,
+                                sessions: r.sessions,
+                              })
+                            }
+                            className="block w-full text-left rounded-md px-2 py-1 -mx-2 text-sm text-zinc-800 hover:bg-zinc-100 focus:outline-none focus:ring-2 focus:ring-zinc-400"
+                          >
                             <span className="tabular-nums">{r.attempts}</span> attempts:{" "}
                             <span className="tabular-nums">{r.identities}</span> identities
-                          </div>
+                          </button>
                         ))}
                     </div>
                   ) : (
@@ -1278,33 +2033,73 @@ export default function ReportClient() {
                   </span>
                 </li>
                 <li>
-                  <div className="text-xs text-zinc-500 mt-2 mb-1">Passport attempts distribution (per identity)</div>
+                  <div className="text-xs text-zinc-500 mt-2 mb-1">
+                    Passport attempts distribution — click a row, then a session for logs (portal → identity end)
+                  </div>
                   {reportMetrics.passportAttemptsDistribution.some((r) => r.identities > 0) ? (
                     <div className="space-y-0.5">
                       {reportMetrics.passportAttemptsDistribution
                         .filter((r) => r.identities > 0)
                         .map((r) => (
-                          <div key={r.attempts}>
+                          <button
+                            key={r.attempts}
+                            type="button"
+                            onClick={() =>
+                              setIdentityPopup({
+                                title: `Passport · ${r.attempts} attempt${r.attempts === 1 ? "" : "s"} · ${r.identities} session${r.identities === 1 ? "" : "s"}`,
+                                sessions: r.sessions,
+                              })
+                            }
+                            className="block w-full text-left rounded-md px-2 py-1 -mx-2 text-sm text-zinc-800 hover:bg-zinc-100 focus:outline-none focus:ring-2 focus:ring-zinc-400"
+                          >
                             <span className="tabular-nums">{r.attempts}</span> attempts:{" "}
                             <span className="tabular-nums">{r.identities}</span> identities
-                          </div>
+                          </button>
                         ))}
                     </div>
                   ) : (
                     <div className="text-xs text-zinc-500">No passport attempt data in this range.</div>
                   )}
                 </li>
-                <li className="flex justify-between gap-4 text-xs text-zinc-600">
-                  <span>Attempts where passport verification took longer than face verification</span>
-                  <span className="font-medium tabular-nums text-zinc-800">
-                    {reportMetrics.passportSlowerThanFace}
-                  </span>
+                <li>
+                  <button
+                    type="button"
+                    disabled={reportMetrics.passportSlowerThanFace <= 0}
+                    onClick={() =>
+                      setIdentityPopup({
+                        title: `Passport slower than face · ${reportMetrics.passportSlowerThanFace} paired attempt${reportMetrics.passportSlowerThanFace === 1 ? "" : "s"}`,
+                        sessions: reportMetrics.passportSlowerThanFaceSessions,
+                        hint:
+                          "Each row is one paired attempt (same index: 1st face duration vs 1st passport duration in that identity session). Click a row for full session logs.",
+                      })
+                    }
+                    className="flex w-full justify-between gap-4 text-left text-xs text-zinc-600 rounded-md px-2 py-1.5 -mx-2 hover:bg-zinc-100 disabled:opacity-50 disabled:hover:bg-transparent focus:outline-none focus:ring-2 focus:ring-zinc-400"
+                  >
+                    <span>Attempts where passport verification took longer than face verification</span>
+                    <span className="font-medium tabular-nums text-zinc-800 shrink-0">
+                      {reportMetrics.passportSlowerThanFace}
+                    </span>
+                  </button>
                 </li>
-                <li className="flex justify-between gap-4 text-xs text-zinc-600">
-                  <span>Attempts where face verification took longer than passport verification</span>
-                  <span className="font-medium tabular-nums text-zinc-800">
-                    {reportMetrics.faceSlowerThanPassport}
-                  </span>
+                <li>
+                  <button
+                    type="button"
+                    disabled={reportMetrics.faceSlowerThanPassport <= 0}
+                    onClick={() =>
+                      setIdentityPopup({
+                        title: `Face slower than passport · ${reportMetrics.faceSlowerThanPassport} paired attempt${reportMetrics.faceSlowerThanPassport === 1 ? "" : "s"}`,
+                        sessions: reportMetrics.faceSlowerThanPassportSessions,
+                        hint:
+                          "Each row is one paired attempt (same index: 1st face duration vs 1st passport duration in that identity session). Click a row for full session logs.",
+                      })
+                    }
+                    className="flex w-full justify-between gap-4 text-left text-xs text-zinc-600 rounded-md px-2 py-1.5 -mx-2 hover:bg-zinc-100 disabled:opacity-50 disabled:hover:bg-transparent focus:outline-none focus:ring-2 focus:ring-zinc-400"
+                  >
+                    <span>Attempts where face verification took longer than passport verification</span>
+                    <span className="font-medium tabular-nums text-zinc-800 shrink-0">
+                      {reportMetrics.faceSlowerThanPassport}
+                    </span>
+                  </button>
                 </li>
               </ul>
             </section>
@@ -1368,6 +2163,73 @@ export default function ReportClient() {
           </div>
         </div>
       )}
+
+      {identityPopup && (
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/40"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="identity-popup-title"
+          onClick={() => setIdentityPopup(null)}
+        >
+          <div
+            className="max-h-[min(80vh,520px)] w-full max-w-lg overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-lg"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-2 border-b border-zinc-200 px-4 py-3">
+              <h2
+                id="identity-popup-title"
+                className="text-sm font-semibold text-zinc-900 pr-2"
+              >
+                {identityPopup.title}
+              </h2>
+              <button
+                type="button"
+                onClick={() => setIdentityPopup(null)}
+                className="shrink-0 rounded-lg px-2 py-1 text-sm text-zinc-600 hover:bg-zinc-100"
+              >
+                Close
+              </button>
+            </div>
+            <div className="max-h-[min(60vh,420px)] overflow-y-auto px-4 py-3">
+              <p className="text-xs text-zinc-500 mb-2">
+                {identityPopup.hint ??
+                  "Click a session to see stats and all vfs-global-bot lines from portal start through identity completed/failed (same sorted order as the report)."}
+              </p>
+              <ul className="space-y-2 text-sm text-zinc-800">
+                {identityPopup.sessions.map((s) => (
+                  <li
+                    key={`${s.sessionKey}-${s.attemptPairIndex ?? 0}-${s.displayLabel}`}
+                    className="border-b border-zinc-100 pb-2 last:border-0"
+                  >
+                    <button
+                      type="button"
+                      className="w-full text-left rounded-md px-2 py-1.5 -mx-2 hover:bg-zinc-100 focus:outline-none focus:ring-2 focus:ring-zinc-400"
+                      onClick={() => {
+                        setIdentityPopup(null);
+                        setSessionLogPopup(s.sessionKey);
+                      }}
+                    >
+                      <span className="break-all font-medium text-zinc-900">{s.displayLabel}</span>
+                      {s.faceSec != null && s.passportSec != null && (
+                        <span className="block text-xs text-zinc-600 tabular-nums mt-1">
+                          Face {fmt(s.faceSec)}s · Passport {fmt(s.passportSec)}s
+                          {s.attemptPairIndex != null && (
+                            <span className="text-zinc-500"> · paired attempt #{s.attemptPairIndex}</span>
+                          )}
+                        </span>
+                      )}
+                      <span className="block text-[10px] text-zinc-500 font-mono mt-0.5">{s.sessionKey}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {renderSessionLogModal()}
     </div>
   );
 }
