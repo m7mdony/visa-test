@@ -1886,25 +1886,7 @@ export default function ReportClient() {
         <p className="mt-1 text-xs text-zinc-500">Applied to identity verification and per-email (vfs-global-bot) only.</p>
       </div>
 
-      <div className="flex flex-wrap items-center gap-4">
-        <button
-          type="button"
-          onClick={handleGenerate}
-          disabled={loading}
-          className="inline-flex items-center rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-800 disabled:opacity-50"
-        >
-          {loading ? (loadingProgress ?? "Generating…") : "Generate report"}
-        </button>
-        <label className="flex items-center gap-2 text-sm text-zinc-700 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={metricsDebugEnabled}
-            onChange={(e) => setMetricsDebugEnabled(e.target.checked)}
-            className="h-4 w-4 rounded border-zinc-300 text-zinc-900 focus:ring-zinc-900"
-          />
-          Debug attempt attribution (verbose log)
-        </label>
-      </div>
+     
 
       {metricsDebugText.length > 0 && (
         <div className="rounded-lg border border-amber-200 bg-amber-50/40 p-3">
