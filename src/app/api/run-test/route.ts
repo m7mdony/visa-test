@@ -173,7 +173,6 @@ export async function POST(request: Request) {
       }
 
       const message = {
-        id: sessionData.sessionId,
         sessionId: sessionData.sessionId,
         region: sessionData.region,
         credentials: sessionData.credentials,

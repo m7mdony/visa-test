@@ -61,6 +61,18 @@ export default function RootLayout({
                 >
                   Report
                 </Link>
+                <Link
+                  href="/approved-videos"
+                  className="hover:text-zinc-950 transition-colors"
+                >
+                  Approved videos
+                </Link>
+                <Link
+                  href="/vfs-logs"
+                  className="hover:text-zinc-950 transition-colors"
+                >
+                  VFS logs
+                </Link>
               </nav>
             </div>
           </header>
