@@ -68,6 +68,12 @@ export default function RootLayout({
                   Approved videos
                 </Link>
                 <Link
+                  href="/session-videos"
+                  className="hover:text-zinc-950 transition-colors"
+                >
+                  Session videos
+                </Link>
+                <Link
                   href="/vfs-logs"
                   className="hover:text-zinc-950 transition-colors"
                 >

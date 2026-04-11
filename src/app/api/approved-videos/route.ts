@@ -46,6 +46,15 @@ type SolvingSnapshot = {
   videoLink: string | null;
 };
 
+type TaskPayloadIatRow = {
+  solvingTaskId: string;
+  sessionPrefix: string;
+  messageId: string | null;
+  actualLogTime: string;
+  iatTime: string | null;
+  invalidToken: boolean;
+};
+
 function getCookieHeader(setCookie: string[]): string {
   return setCookie
     .map((c) => c.split(";")[0].trim())
@@ -160,6 +169,40 @@ function extractFailureReasonKey(line: string): string | null {
   return text.length > FAILURE_REASON_MAX_LEN ? `${text.slice(0, FAILURE_REASON_MAX_LEN - 3)}...` : text;
 }
 
+/**
+ * Liveness / verify outcome rejected (not token/camera noise). Used for session video table 2.
+ * JSON fail lines only; excludes InvalidToken and a small technical set.
+ */
+function isNotAcceptedStyleFailure(line: string): boolean {
+  if (!line.includes("In-house identity verification attempt failed")) return false;
+  const key = extractFailureReasonKey(line);
+  if (!key || !key.startsWith("{livenessError:")) return false;
+  const m = key.match(/^\{livenessError:"([^"]*)",recognitionError:"([^"]*)"\}$/);
+  if (!m) return false;
+  const le = m[1] ?? "";
+  const re = m[2] ?? "";
+  if (le === "InvalidToken") return false;
+  const technical = new Set([
+    "CameraStartupFailure",
+    "UserCancelled",
+    "SERVER_ERROR",
+    "TIMEOUT",
+    "CONNECTION_TIMEOUT",
+    "RUNTIME_ERROR",
+    "FACE_NOT_FOUND",
+  ]);
+  if (le && technical.has(le)) return false;
+  if (re.length > 0) return true;
+  const livenessRejected = new Set([
+    "LiveVideoNotLive",
+    "CouldBeSpoof",
+    "ImageQualityInsufficient",
+    "Spoof",
+  ]);
+  if (le && livenessRejected.has(le)) return true;
+  return false;
+}
+
 /** First segment of TaskId UUID, e.g. bab9ebd2-8f79-... → bab9ebd2 */
 function taskIdToSessionPrefix(taskId: string): string {
   const first = taskId.split("-")[0]?.trim().toLowerCase() ?? "";
@@ -244,35 +287,48 @@ function deriveApplicantOutcome(email: string, eventsAll: EmailTimelineEvent[]):
 
   let outcome: ApplicantOutcome["outcome"] = "pending";
   let successOnTry: ApplicantOutcome["successOnTry"] = null;
-  let failsSinceSolving = 0;
+  /** Count of `In-house identity verification attempt failed` lines since last success (retries log a new Solving line; do not reset here). */
+  let inHouseFailCountSinceLastSuccess = 0;
 
   for (const e of events) {
     if (e.kind === "solving") {
       outcome = "pending";
       successOnTry = null;
-      failsSinceSolving = 0;
       continue;
     }
     if (e.kind === "fail") {
+      inHouseFailCountSinceLastSuccess += 1;
       const n = e.failN;
       const m = e.failM;
-      if (typeof n === "number" && Number.isFinite(n)) failsSinceSolving = n;
-      else failsSinceSolving += 1;
       if (n === 3 && m === 3) {
         outcome = "failed";
         successOnTry = null;
+        inHouseFailCountSinceLastSuccess = 0;
       }
       continue;
     }
     if (e.kind === "success") {
       outcome = "success";
-      const tryNum = Math.min(3, Math.max(1, failsSinceSolving + 1)) as 1 | 2 | 3;
+      const tryNum = Math.min(
+        3,
+        Math.max(1, inHouseFailCountSinceLastSuccess + 1)
+      ) as 1 | 2 | 3;
       successOnTry = tryNum;
-      failsSinceSolving = 0;
+      inHouseFailCountSinceLastSuccess = 0;
     }
   }
 
   return { email, outcome, successOnTry };
+}
+
+function lastSuccessTimeMs(eventsAll: EmailTimelineEvent[]): number | null {
+  const firstSolvingIdx = eventsAll.findIndex((e) => e.kind === "solving");
+  const events = firstSolvingIdx < 0 ? [] : eventsAll.slice(firstSolvingIdx);
+  let t: number | null = null;
+  for (const e of events) {
+    if (e.kind === "success") t = e.timeMs;
+  }
+  return t;
 }
 
 function pickRandomItems<T>(items: T[], count: number): T[] {
@@ -319,6 +375,101 @@ function pickSnapshotForFailure(
     else break;
   }
   return chosen;
+}
+
+function decodeJwtPayload(credentials: string): Record<string, unknown> | null {
+  const parts = credentials.split(".");
+  if (parts.length < 2) return null;
+  try {
+    const base64url = parts[1];
+    const base64 = base64url.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
+    const json = Buffer.from(padded, "base64").toString("utf8");
+    const parsed = JSON.parse(json) as Record<string, unknown>;
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function parsePayloadIatRowsByPrefix(
+  sessionPrefixes: Set<string>,
+  logs: LogEntry[]
+): Map<string, Omit<TaskPayloadIatRow, "solvingTaskId" | "invalidToken">[]> {
+  const byPrefix = new Map<string, Omit<TaskPayloadIatRow, "solvingTaskId" | "invalidToken">[]>();
+  for (const entry of logs) {
+    const line = entry.line;
+    if (!line.includes("[REDIS][PAYLOAD]")) continue;
+    const payloadMatch = line.match(/payload=(\{.+\})\s*$/);
+    if (!payloadMatch?.[1]) continue;
+    try {
+      const payload = JSON.parse(payloadMatch[1]) as Record<string, unknown>;
+      const credentials = typeof payload.credentials === "string" ? payload.credentials : "";
+      if (!credentials) continue;
+      const jwt = decodeJwtPayload(credentials);
+      const iatSecRaw = jwt?.iat;
+      const iatSec =
+        typeof iatSecRaw === "number" && Number.isFinite(iatSecRaw)
+          ? iatSecRaw
+          : typeof iatSecRaw === "string" && /^\d+$/.test(iatSecRaw)
+            ? parseInt(iatSecRaw, 10)
+            : NaN;
+      const iatTime = Number.isFinite(iatSec) ? new Date(iatSec * 1000).toISOString() : null;
+      const payloadSessionId =
+        typeof payload.sessionId === "string" && payload.sessionId.trim()
+          ? payload.sessionId.trim()
+          : typeof payload.id === "string" && payload.id.trim()
+            ? payload.id.trim()
+            : "";
+      if (!payloadSessionId) continue;
+      const sessionPrefix = taskIdToSessionPrefix(payloadSessionId);
+      if (!sessionPrefix || !sessionPrefixes.has(sessionPrefix)) continue;
+      const arr = byPrefix.get(sessionPrefix) ?? [];
+      arr.push({
+        sessionPrefix,
+        messageId: extractField(line, "message_id") ?? null,
+        actualLogTime: entry.time,
+        iatTime,
+      });
+      byPrefix.set(sessionPrefix, arr);
+    } catch {
+      continue;
+    }
+  }
+  for (const arr of byPrefix.values()) {
+    arr.sort((a, b) => a.actualLogTime.localeCompare(b.actualLogTime));
+  }
+  return byPrefix;
+}
+
+/** Trailing JSON on `[RESULT] FAILED: session … — {...}` lines */
+function parseAzureResultFailedPayload(line: string): Record<string, unknown> | null {
+  const brace = line.lastIndexOf("{");
+  if (brace < 0) return null;
+  try {
+    const j = JSON.parse(line.slice(brace)) as Record<string, unknown>;
+    return j && typeof j === "object" ? j : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Session prefixes (first UUID segment) that logged InvalidToken in azure-liveness-bot for this window */
+function buildInvalidTokenPrefixSet(logs: LogEntry[], relevantPrefixes: Set<string>): Set<string> {
+  const out = new Set<string>();
+  for (const entry of logs) {
+    const line = entry.line;
+    if (!line.includes("[RESULT] FAILED")) continue;
+    const payload = parseAzureResultFailedPayload(line);
+    if (!payload || String(payload.livenessError) !== "InvalidToken") continue;
+    const jobM = line.match(/\[JOB_ID:([a-f0-9-]+)\]/i);
+    const sessionM = line.match(/session\s+([a-f0-9-]+)/i);
+    const raw = (jobM?.[1] ?? sessionM?.[1] ?? "").trim();
+    if (!raw) continue;
+    const prefix = taskIdToSessionPrefix(raw);
+    if (prefix && relevantPrefixes.has(prefix)) out.add(prefix);
+  }
+  return out;
 }
 
 async function loginCookie(base: string): Promise<string> {
@@ -414,6 +565,7 @@ export async function POST(req: NextRequest) {
     to?: number | string;
     target?: string;
     solveKind?: string;
+    includeVideoSessionRows?: boolean;
   };
   try {
     body = await req.json();
@@ -456,7 +608,8 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Grafana login failed (no session cookie)" }, { status: 502 });
   }
 
-  const [solvingLogsAll, successLogs, failLogs, azureLivenessLogs] = await Promise.all([
+  const [solvingLogsAll, successLogs, failLogs, azureLivenessLogs, azurePayloadLogs, azureResultFailedLogs] =
+    await Promise.all([
     queryLogs({
       base,
       cookieHeader,
@@ -492,6 +645,24 @@ export async function POST(req: NextRequest) {
       target: AZURE_LIVENESS_BOT_APP,
       query: "Solving face verification for session",
       requestId: "approved_azure_liveness",
+    }),
+    queryLogs({
+      base,
+      cookieHeader,
+      from,
+      to,
+      target: AZURE_LIVENESS_BOT_APP,
+      query: "[REDIS][PAYLOAD]",
+      requestId: "approved_azure_payload",
+    }),
+    queryLogs({
+      base,
+      cookieHeader,
+      from,
+      to,
+      target: AZURE_LIVENESS_BOT_APP,
+      query: "[RESULT] FAILED",
+      requestId: "approved_azure_result_failed",
     }),
   ]);
 
@@ -593,6 +764,64 @@ export async function POST(req: NextRequest) {
     })
     .sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason));
 
+  const solvingTaskIds = [...new Set(solvingLogs.map((e) => extractField(e.line, "TaskId") ?? "").filter(Boolean))];
+  const solvingPrefixes = new Set(
+    solvingTaskIds.map((id) => taskIdToSessionPrefix(id)).filter((p) => p.length > 0)
+  );
+  const payloadRowsByPrefix = parsePayloadIatRowsByPrefix(solvingPrefixes, azurePayloadLogs);
+  const invalidTokenPrefixes = buildInvalidTokenPrefixSet(azureResultFailedLogs, solvingPrefixes);
+  const taskPayloadIatRows: TaskPayloadIatRow[] = [];
+  for (const taskId of solvingTaskIds) {
+    const prefix = taskIdToSessionPrefix(taskId);
+    if (!prefix) continue;
+    const matched = payloadRowsByPrefix.get(prefix) ?? [];
+    const invalidToken = invalidTokenPrefixes.has(prefix);
+    for (const row of matched) {
+      taskPayloadIatRows.push({ solvingTaskId: taskId, ...row, invalidToken });
+    }
+  }
+  taskPayloadIatRows.sort((a, b) => a.actualLogTime.localeCompare(b.actualLogTime));
+
+  type VideoSessionRow = { email: string; videoLink: string | null; passportNumber: string | null };
+  type VideoSessionNotAcceptedRow = VideoSessionRow & { failureReason: string };
+
+  let sessionVideoApprovedRows: VideoSessionRow[] | undefined;
+  let sessionVideoNotAcceptedRows: VideoSessionNotAcceptedRow[] | undefined;
+
+  if (body.includeVideoSessionRows === true) {
+    sessionVideoApprovedRows = [];
+    for (const o of applicantOutcomes) {
+      if (o.outcome !== "success") continue;
+      const successAt = lastSuccessTimeMs(timelinesByEmail.get(o.email) ?? []);
+      const snap =
+        successAt != null
+          ? pickSnapshotForFailure(solvingSnapshotsByEmail, o.email, successAt)
+          : null;
+      sessionVideoApprovedRows.push({
+        email: o.email,
+        videoLink: snap?.videoLink ?? null,
+        passportNumber: snap?.passportNumber ?? null,
+      });
+    }
+
+    sessionVideoNotAcceptedRows = [];
+    for (const entry of failLogs) {
+      if (!isNotAcceptedStyleFailure(entry.line)) continue;
+      const email = extractField(entry.line, "email")?.toLowerCase();
+      if (!email || !applicantEmails.has(email)) continue;
+      const failureTimeMs = Date.parse(entry.time);
+      const snap = Number.isFinite(failureTimeMs)
+        ? pickSnapshotForFailure(solvingSnapshotsByEmail, email, failureTimeMs)
+        : null;
+      sessionVideoNotAcceptedRows.push({
+        email,
+        videoLink: snap?.videoLink ?? null,
+        passportNumber: snap?.passportNumber ?? null,
+        failureReason: extractFailureReasonKey(entry.line) ?? "",
+      });
+    }
+  }
+
   return NextResponse.json({
     from,
     to,
@@ -618,9 +847,17 @@ export async function POST(req: NextRequest) {
       solvingExcludedNoTaskId: solvingNoTaskId,
       solvingExcludedNoAzureMatch: solvingNoAzureMatch,
       solvingExcludedWrongKind: solvingWrongKind,
+      azurePayloadLogLines: azurePayloadLogs.length,
+      azureResultFailedLogLines: azureResultFailedLogs.length,
+      taskPayloadRows: taskPayloadIatRows.length,
+      azureInvalidTokenJobCount: invalidTokenPrefixes.size,
     },
     applicantOutcomes,
     failureReasonBreakdown,
+    taskPayloadIatRows,
+    ...(sessionVideoApprovedRows != null && sessionVideoNotAcceptedRows != null
+      ? { sessionVideoApprovedRows, sessionVideoNotAcceptedRows }
+      : {}),
   });
 }
 

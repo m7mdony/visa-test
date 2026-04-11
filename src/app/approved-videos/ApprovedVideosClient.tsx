@@ -29,7 +29,19 @@ type ApiResponse = {
     solvingExcludedNoTaskId?: number;
     solvingExcludedNoAzureMatch?: number;
     solvingExcludedWrongKind?: number;
+    azurePayloadLogLines?: number;
+    azureResultFailedLogLines?: number;
+    taskPayloadRows?: number;
+    azureInvalidTokenJobCount?: number;
   };
+  taskPayloadIatRows?: Array<{
+    solvingTaskId: string;
+    sessionPrefix: string;
+    messageId: string | null;
+    actualLogTime: string;
+    iatTime: string | null;
+    invalidToken: boolean;
+  }>;
   applicantOutcomes?: Array<{
     email: string;
     outcome: "success" | "failed" | "pending";
@@ -75,6 +87,22 @@ function fmtTime(iso: string | null): string {
     second: "2-digit",
     hour12: false,
   }).format(d);
+}
+
+function fmtTimeMs(iso: string | null): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (!Number.isFinite(d.getTime())) return iso;
+  const base = new Intl.DateTimeFormat("en-GB", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(d);
+  return `${base}.${String(d.getMilliseconds()).padStart(3, "0")}`;
 }
 
 export default function ApprovedVideosClient() {
@@ -287,6 +315,12 @@ export default function ApprovedVideosClient() {
                 {data.totals.solvingExcludedNoAzureMatch ?? 0}, other job type {data.totals.solvingExcludedWrongKind ?? 0}
               </div>
             )}
+            <div className="mt-1 text-[11px] text-zinc-500">
+              Azure payload logs: {data.totals.azurePayloadLogLines ?? 0} · correlated rows{" "}
+              {data.totals.taskPayloadRows ?? 0} (via VFS solving TaskId prefix) ·{" "}
+              <code>[RESULT] FAILED</code> lines: {data.totals.azureResultFailedLogLines ?? 0} · InvalidToken jobs
+              (prefix match): {data.totals.azureInvalidTokenJobCount ?? 0}
+            </div>
           </div>
 
           <div className="grid gap-4 sm:grid-cols-3">
@@ -406,6 +440,49 @@ export default function ApprovedVideosClient() {
                             </div>
                           )}
                         </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {(data.taskPayloadIatRows ?? []).length > 0 && (
+            <div>
+              <h2 className="text-sm font-medium text-zinc-800 mb-2">
+                Azure payload token times (VFS TaskId prefix ↔ payload)
+              </h2>
+              <div className="overflow-x-auto rounded-lg border border-zinc-200 bg-white">
+                <table className="min-w-full text-xs">
+                  <thead className="bg-zinc-100 text-zinc-800">
+                    <tr>
+                      <th className="px-3 py-2 text-left font-semibold">VFS Task ID</th>
+                      <th className="px-3 py-2 text-left font-semibold">Prefix</th>
+                      <th className="px-3 py-2 text-left font-semibold">InvalidToken</th>
+                      <th className="px-3 py-2 text-left font-semibold">Message ID</th>
+                      <th className="px-3 py-2 text-left font-semibold">Actual log time</th>
+                      <th className="px-3 py-2 text-left font-semibold">Decoded credentials iat</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(data.taskPayloadIatRows ?? []).map((row, idx) => (
+                      <tr
+                        key={`${row.solvingTaskId}-${row.messageId ?? "na"}-${row.actualLogTime}-${idx}`}
+                        className="border-t border-zinc-100"
+                      >
+                        <td className="px-3 py-2 font-mono text-zinc-900">{row.solvingTaskId}</td>
+                        <td className="px-3 py-2 font-mono text-zinc-800">{row.sessionPrefix}</td>
+                        <td className="px-3 py-2 font-mono font-semibold whitespace-nowrap">
+                          {row.invalidToken ? (
+                            <span className="text-rose-700">Yes</span>
+                          ) : (
+                            <span className="text-zinc-500">No</span>
+                          )}
+                        </td>
+                        <td className="px-3 py-2 font-mono text-zinc-800">{row.messageId ?? "—"}</td>
+                        <td className="px-3 py-2 font-mono text-zinc-800">{fmtTimeMs(row.actualLogTime)}</td>
+                        <td className="px-3 py-2 font-mono text-zinc-800">{fmtTimeMs(row.iatTime)}</td>
                       </tr>
                     ))}
                   </tbody>
