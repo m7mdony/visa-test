@@ -130,9 +130,10 @@ export default function SessionVideosClient() {
       <div>
         <h1 className="text-2xl font-semibold text-zinc-900">Session video queues</h1>
         <p className="text-sm text-zinc-600 mt-1">
-          Same cohort as Approved videos: successful applicants vs attempts where Azure JSON indicates liveness / photo
-          not accepted (non-InvalidToken, excluding a small technical set). Each row can enqueue one job on Redis
-          stream <code className="text-xs">azure:identity-verification:stream:</code>
+          Same cohort as Approved videos: successful applicants vs vfs-global-bot failures whose message contains{" "}
+          <code className="text-xs">status not approved</code> (e.g.{" "}
+          <code className="text-xs">Identity verification failed (status not approved)</code>). Each row can enqueue one
+          job on Redis stream <code className="text-xs">azure:identity-verification:stream:</code>
           <span className="font-mono text-xs">…</span> using the ID field below (same as{" "}
           <code className="text-xs">test-session.js</code>).
         </p>
@@ -304,8 +305,8 @@ export default function SessionVideosClient() {
               Not accepted <span className="text-zinc-500 font-normal">({notAccepted.length})</span>
             </h2>
             <p className="text-xs text-zinc-500 mb-2">
-              JSON failure reasons: recognition error set, or liveness errors such as LiveVideoNotLive / CouldBeSpoof;
-              InvalidToken and common camera/timeout codes excluded.
+              Only <code className="text-[10px]">In-house identity verification attempt failed</code> lines that
+              include <code className="text-[10px]">status not approved</code> in the vfs-global-bot log text.
             </p>
             <div className="overflow-x-auto rounded-lg border border-zinc-200 bg-white">
               <table className="min-w-full text-xs">

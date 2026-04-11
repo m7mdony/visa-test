@@ -169,38 +169,10 @@ function extractFailureReasonKey(line: string): string | null {
   return text.length > FAILURE_REASON_MAX_LEN ? `${text.slice(0, FAILURE_REASON_MAX_LEN - 3)}...` : text;
 }
 
-/**
- * Liveness / verify outcome rejected (not token/camera noise). Used for session video table 2.
- * JSON fail lines only; excludes InvalidToken and a small technical set.
- */
+/** vfs-global-bot prose: contains `status not approved` (e.g. Identity verification failed (status not approved)). */
 function isNotAcceptedStyleFailure(line: string): boolean {
   if (!line.includes("In-house identity verification attempt failed")) return false;
-  const key = extractFailureReasonKey(line);
-  if (!key || !key.startsWith("{livenessError:")) return false;
-  const m = key.match(/^\{livenessError:"([^"]*)",recognitionError:"([^"]*)"\}$/);
-  if (!m) return false;
-  const le = m[1] ?? "";
-  const re = m[2] ?? "";
-  if (le === "InvalidToken") return false;
-  const technical = new Set([
-    "CameraStartupFailure",
-    "UserCancelled",
-    "SERVER_ERROR",
-    "TIMEOUT",
-    "CONNECTION_TIMEOUT",
-    "RUNTIME_ERROR",
-    "FACE_NOT_FOUND",
-  ]);
-  if (le && technical.has(le)) return false;
-  if (re.length > 0) return true;
-  const livenessRejected = new Set([
-    "LiveVideoNotLive",
-    "CouldBeSpoof",
-    "ImageQualityInsufficient",
-    "Spoof",
-  ]);
-  if (le && livenessRejected.has(le)) return true;
-  return false;
+  return /status\s+not\s+approved|status\s+not\s+approaved/i.test(line);
 }
 
 /** First segment of TaskId UUID, e.g. bab9ebd2-8f79-... → bab9ebd2 */
