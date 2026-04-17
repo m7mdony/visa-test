@@ -111,7 +111,7 @@ export async function POST(req: NextRequest) {
   const message = {
     sessionId: sessionData.sessionId,
     useRealToken: false,
-    firstTry: true,
+    firstTry: false,
     isVerificationJob: false,
     credentials: TEST_SESSION_CREDENTIALS,
     videoUrl,

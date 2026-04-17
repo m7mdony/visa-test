@@ -1,0 +1,6 @@
+/**
+ * Default Clerk FAPI bootstrap `Cookie` for `POST /v1/client/sign_ins` (anonymous `__client` + CF).
+ * Expires quickly — override with `VISAFLOW_CLERK_BOOTSTRAP_COOKIE` in `.env.local` when sign-in fails.
+ */
+export const CLERK_BOOTSTRAP_COOKIE_FALLBACK =
+  "__cf_bm=ytG3TFP7.JC1lc20lhAWbbJv7qXLAz1kmXeqegv7xG4-1775993105-1.0.1.1-0vSvexECLGsYv4qR6cFabE7j.9ASZk0svWsfTudoOIf_pSPXx9LD_yCkp64MxV0L_AA2S0rr_dQd97uuJ1UpbrnuXMOgrXSWwLpF8k3gedc; _cfuvid=QQg.gduNlyNWvqEcSp8WnbKtGyKgQJh8fs2bZIhra0c-1775993105044-0.0.1.1-604800000; __client=eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6ImNsaWVudF8zQ0Z0Tk1WV09kZTJlRmlDYXFOVjIwYUQ2SXgiLCJyb3RhdGluZ190b2tlbiI6Im4zMHpmOTFmaGYzbXowdWc4bTBoZTV5cHI4OWttcmhpNWphaXp2MHYifQ.GgjItYk46fA4s-IiOao5aHE_WliXEaSdkQS89P6tq9sj7GsG7y5rBU26nktgg94a89k6j_DjegzUPOhStAyAiScqrcqcW4cm4xbheiKeTGQudTs7ml5vXP2eK17WxtAg72TREzuDRYUtN649UOVE6WlHJhU4Gr4uzSluuVic7j7Rp2QDsm1Z4mWkfQFk05zilueldWcKVLlRHiZLAUHeWPB-Cujz0-mGPygqQX-8EVa97TjKIpZV1l1gpBQzGpvemnMtbd4G4xS9NcsoP6rt3GP3DrXoO0EGRFGAtRvHTCV-iwwBRc-PlQobVBwxohusT0tTkE5tIofLbEHP40bQXw; __client_uat=0; __client_uat_-IIyyVW9=0";

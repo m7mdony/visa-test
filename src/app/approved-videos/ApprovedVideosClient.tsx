@@ -15,7 +15,7 @@ type ApiResponse = {
     applicantCount: number;
     successCount: number;
     failureCount: number;
-    failureAttemptCount?: number;
+    terminalFailureLogCount?: number;
     pendingCount: number;
     solvedOnFirstTry: number;
     solvedOnSecondTry: number;
@@ -329,24 +329,23 @@ export default function ApprovedVideosClient() {
               <div className="mt-1 text-3xl font-semibold text-emerald-950">{data.totals.successCount}</div>
             </div>
             <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-5">
-              <div className="text-sm font-medium text-rose-900">Failed — terminal (3/3)</div>
+              <div className="text-sm font-medium text-rose-900">Failed — terminal</div>
               <div className="mt-1 text-3xl font-semibold text-rose-950">{data.totals.failureCount}</div>
-              <div className="mt-1 text-xs text-rose-800">Applicants who did not succeed after final attempt</div>
+              <div className="mt-1 text-xs text-rose-800">Applicants who did not succeed</div>
               <div className="mt-4 pt-3 border-t border-rose-200/80">
-                <div className="text-xs font-medium text-rose-900">Failed attempt logs</div>
+                <div className="text-xs font-medium text-rose-900">Terminal failure warning logs</div>
                 <div className="mt-1 text-2xl font-semibold text-rose-950">
-                  {data.totals.failureAttemptCount ?? "—"}
+                  {data.totals.terminalFailureLogCount ?? "—"}
                 </div>
                 <div className="mt-1 text-[11px] text-rose-800">
-                  Each <code className="text-[10px]">(1/3)</code>… line for cohort emails (includes retries before
-                  success)
+                  Count of warning lines: <code className="text-[10px]">In-house identity verification failed across 3 concurrent attempts</code>
                 </div>
               </div>
             </div>
             <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-5">
               <div className="text-sm font-medium text-amber-900">Unresolved</div>
               <div className="mt-1 text-3xl font-semibold text-amber-950">{data.totals.pendingCount}</div>
-              <div className="mt-1 text-xs text-amber-800">Started solve, no terminal success or (3/3) in window</div>
+              <div className="mt-1 text-xs text-amber-800">Started solve, no terminal success/failure in window</div>
               {unresolvedEmails.length > 0 && (
                 <div className="mt-4 pt-3 border-t border-amber-200/80">
                   <div className="text-xs font-medium text-amber-900">Session emails</div>
@@ -362,33 +361,10 @@ export default function ApprovedVideosClient() {
             </div>
           </div>
 
-          <div>
-            <h2 className="text-sm font-medium text-zinc-800 mb-2">Succeeded on which try</h2>
-            <div className="grid gap-4 sm:grid-cols-4">
-              <div className="rounded-xl border border-zinc-200 bg-white px-4 py-4">
-                <div className="text-xs font-medium text-zinc-600">1st try</div>
-                <div className="mt-1 text-2xl font-semibold text-zinc-900">{data.totals.solvedOnFirstTry}</div>
-              </div>
-              <div className="rounded-xl border border-zinc-200 bg-white px-4 py-4">
-                <div className="text-xs font-medium text-zinc-600">2nd try</div>
-                <div className="mt-1 text-2xl font-semibold text-zinc-900">{data.totals.solvedOnSecondTry}</div>
-              </div>
-              <div className="rounded-xl border border-zinc-200 bg-white px-4 py-4">
-                <div className="text-xs font-medium text-zinc-600">3rd try</div>
-                <div className="mt-1 text-2xl font-semibold text-zinc-900">{data.totals.solvedOnThirdTry}</div>
-              </div>
-              <div className="rounded-xl border border-zinc-200 bg-white px-4 py-4">
-                <div className="text-xs font-medium text-zinc-600">Hasn&apos;t solved</div>
-                <div className="mt-1 text-2xl font-semibold text-zinc-900">{data.totals.pendingCount}</div>
-                <div className="mt-1 text-[11px] text-zinc-500">Same as unresolved</div>
-              </div>
-            </div>
-          </div>
-
           {(data.failureReasonBreakdown ?? []).length > 0 && (
             <div>
               <h2 className="text-sm font-medium text-zinc-800 mb-2">
-                Failure reasons (each attempt log, cohort emails only)
+                Failure reasons (each individual error item, cohort emails only)
               </h2>
               <div className="overflow-x-auto rounded-lg border border-zinc-200 bg-white">
                 <table className="min-w-full text-xs">
@@ -448,48 +424,6 @@ export default function ApprovedVideosClient() {
             </div>
           )}
 
-          {(data.taskPayloadIatRows ?? []).length > 0 && (
-            <div>
-              <h2 className="text-sm font-medium text-zinc-800 mb-2">
-                Azure payload token times (VFS TaskId prefix ↔ payload)
-              </h2>
-              <div className="overflow-x-auto rounded-lg border border-zinc-200 bg-white">
-                <table className="min-w-full text-xs">
-                  <thead className="bg-zinc-100 text-zinc-800">
-                    <tr>
-                      <th className="px-3 py-2 text-left font-semibold">VFS Task ID</th>
-                      <th className="px-3 py-2 text-left font-semibold">Prefix</th>
-                      <th className="px-3 py-2 text-left font-semibold">InvalidToken</th>
-                      <th className="px-3 py-2 text-left font-semibold">Message ID</th>
-                      <th className="px-3 py-2 text-left font-semibold">Actual log time</th>
-                      <th className="px-3 py-2 text-left font-semibold">Decoded credentials iat</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {(data.taskPayloadIatRows ?? []).map((row, idx) => (
-                      <tr
-                        key={`${row.solvingTaskId}-${row.messageId ?? "na"}-${row.actualLogTime}-${idx}`}
-                        className="border-t border-zinc-100"
-                      >
-                        <td className="px-3 py-2 font-mono text-zinc-900">{row.solvingTaskId}</td>
-                        <td className="px-3 py-2 font-mono text-zinc-800">{row.sessionPrefix}</td>
-                        <td className="px-3 py-2 font-mono font-semibold whitespace-nowrap">
-                          {row.invalidToken ? (
-                            <span className="text-rose-700">Yes</span>
-                          ) : (
-                            <span className="text-zinc-500">No</span>
-                          )}
-                        </td>
-                        <td className="px-3 py-2 font-mono text-zinc-800">{row.messageId ?? "—"}</td>
-                        <td className="px-3 py-2 font-mono text-zinc-800">{fmtTimeMs(row.actualLogTime)}</td>
-                        <td className="px-3 py-2 font-mono text-zinc-800">{fmtTimeMs(row.iatTime)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
         </div>
       )}
     </div>
