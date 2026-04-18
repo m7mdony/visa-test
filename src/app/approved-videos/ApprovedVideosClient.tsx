@@ -15,7 +15,7 @@ type ApiResponse = {
     applicantCount: number;
     successCount: number;
     failureCount: number;
-    solverAttemptFailureCount?: number;
+    terminalFailureLogCount?: number;
     pendingCount: number;
     solvedOnFirstTry: number;
     solvedOnSecondTry: number;
@@ -24,6 +24,9 @@ type ApiResponse = {
     solvingLogLinesRaw?: number;
     successLogLines: number;
     failLogLines: number;
+    identityVerificationLogLines?: number;
+    identityOutcomeLogLines?: number;
+    solverLogLines?: number;
     azureLivenessLogLines?: number;
     azureSessionPrefixesMapped?: number;
     solvingExcludedNoTaskId?: number;
@@ -33,8 +36,6 @@ type ApiResponse = {
     azureResultFailedLogLines?: number;
     taskPayloadRows?: number;
     azureInvalidTokenJobCount?: number;
-    azureJobTypeFilterSkipped?: boolean;
-    applicantCohortFromIdentityLogsOnly?: boolean;
   };
   taskPayloadIatRows?: Array<{
     solvingTaskId: string;
@@ -48,6 +49,7 @@ type ApiResponse = {
     email: string;
     outcome: "success" | "failed" | "pending";
     successOnTry: 1 | 2 | 3 | null;
+    solverFailureCount?: number;
   }>;
   failureReasonBreakdown?: Array<{
     reason: string;
@@ -179,11 +181,10 @@ export default function ApprovedVideosClient() {
           <code className="text-xs">vfs-global-bot</code>, filtered by job type using the TaskId prefix and{" "}
           <code className="text-xs">azure-liveness-bot</code> lines{" "}
           <code className="text-xs">Solving face verification for session … (passport: …)</code> (
-          <code className="text-xs">passport: VERIFICATION</code> = verification; anything else = drop). Outcomes use{" "}
-          <code className="text-xs">In-house identity verification completed</code> /{" "}
-          <code className="text-xs">In-house identity verification failed</code> (plus legacy lines), merged in time order
-          per email. Solver error counts use <code className="text-xs">In-house solver attempt failed</code> for failed
-          applicants only.
+          <code className="text-xs">passport: VERIFICATION</code> = verification; anything else = drop). Final outcomes
+          use <code className="text-xs">In-house identity verification completed</code> /{" "}
+          <code className="text-xs">failed</code> (plus legacy lines). Solver stats use{" "}
+          <code className="text-xs">In-house solver attempt failed</code> per email.
         </p>
       </div>
 
@@ -301,8 +302,10 @@ export default function ApprovedVideosClient() {
             <div className="mt-1 text-xs text-zinc-500">
               Applicants: <span className="font-medium text-zinc-700">{data.totals.applicantCount}</span> · VFS solving
               lines (included / raw): {data.totals.solvingLogLines} /{" "}
-              {data.totals.solvingLogLinesRaw ?? "—"} · success / fail lines: {data.totals.successLogLines} /{" "}
-              {data.totals.failLogLines}
+              {data.totals.solvingLogLinesRaw ?? "—"} · identity query / outcome lines:{" "}
+              {data.totals.identityVerificationLogLines ?? "—"} / {data.totals.identityOutcomeLogLines ?? "—"} ·
+              success / fail lines: {data.totals.successLogLines} / {data.totals.failLogLines} · solver lines:{" "}
+              {data.totals.solverLogLines ?? "—"}
               {data.totals.azureLivenessLogLines != null ? (
                 <>
                   {" "}
@@ -318,23 +321,6 @@ export default function ApprovedVideosClient() {
               <div className="mt-1 text-[11px] text-zinc-500">
                 Excluded VFS solving lines: no TaskId {data.totals.solvingExcludedNoTaskId ?? 0}, no Azure match{" "}
                 {data.totals.solvingExcludedNoAzureMatch ?? 0}, other job type {data.totals.solvingExcludedWrongKind ?? 0}
-              </div>
-            )}
-            {(data.totals.azureJobTypeFilterSkipped || data.totals.applicantCohortFromIdentityLogsOnly) && (
-              <div className="mt-1 text-[11px] text-amber-800 bg-amber-50 border border-amber-100 rounded px-2 py-1.5">
-                {data.totals.azureJobTypeFilterSkipped ? (
-                  <span>
-                    Azure had no <code className="text-[10px]">Solving face verification for session</code> lines in this
-                    window — drop vs verification filter was skipped; all VFS solving lines with TaskId are included.
-                  </span>
-                ) : null}
-                {data.totals.azureJobTypeFilterSkipped && data.totals.applicantCohortFromIdentityLogsOnly ? " " : null}
-                {data.totals.applicantCohortFromIdentityLogsOnly ? (
-                  <span>
-                    No <code className="text-[10px]">Solving in-house identity verification</code> lines in range —
-                    applicant emails were taken from identity success/fail logs only.
-                  </span>
-                ) : null}
               </div>
             )}
             <div className="mt-1 text-[11px] text-zinc-500">
@@ -357,12 +343,11 @@ export default function ApprovedVideosClient() {
               <div className="mt-4 pt-3 border-t border-rose-200/80">
                 <div className="text-xs font-medium text-rose-900">In-house solver attempt failures</div>
                 <div className="mt-1 text-2xl font-semibold text-rose-950">
-                  {data.totals.solverAttemptFailureCount ?? "—"}
+                  {data.totals.terminalFailureLogCount ?? "—"}
                 </div>
                 <div className="mt-1 text-[11px] text-rose-800">
-                  Count of <code className="text-[10px]">In-house solver attempt failed</code> lines for emails in this
-                  cohort with a terminal identity failure (up to three videos per applicant; each failed video counts
-                  once).
+                  Total <code className="text-[10px]">In-house solver attempt failed</code> lines for applicants in the
+                  failed cohort (same window).
                 </div>
               </div>
             </div>
@@ -388,8 +373,7 @@ export default function ApprovedVideosClient() {
           {(data.failureReasonBreakdown ?? []).length > 0 && (
             <div>
               <h2 className="text-sm font-medium text-zinc-800 mb-2">
-                Solver errors (normalized <code className="text-[11px]">Error=</code> from in-house solver failures,
-                failed applicants only)
+                Solver errors (failed applicants, <code className="text-[10px]">Error=</code> from in-house solver)
               </h2>
               <div className="overflow-x-auto rounded-lg border border-zinc-200 bg-white">
                 <table className="min-w-full text-xs">

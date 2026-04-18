@@ -26,8 +26,6 @@ type EmailTimelineEvent = {
   kind: "solving" | "success" | "fail";
   failN?: number;
   failM?: number;
-  /** When false, in-house attempt failed but session may continue (legacy 1/3, 2/3). */
-  failTerminal?: boolean;
   submitN?: number;
   submitM?: number;
 };
@@ -36,6 +34,8 @@ type ApplicantOutcome = {
   email: string;
   outcome: "success" | "failed" | "pending";
   successOnTry: 1 | 2 | 3 | null;
+  /** Count of `In-house solver attempt failed` lines for this email (identity-failed cohort). */
+  solverFailureCount?: number;
 };
 
 type FailureReasonSample = {
@@ -134,18 +134,6 @@ function extractField(line: string, key: string): string | undefined {
   return m?.[1];
 }
 
-function dedupeLogEntries(entries: LogEntry[]): LogEntry[] {
-  const seen = new Set<string>();
-  const out: LogEntry[] = [];
-  for (const e of entries) {
-    const k = `${e.time}\0${e.line}`;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    out.push(e);
-  }
-  return out.sort((a, b) => a.time.localeCompare(b.time));
-}
-
 const FAILURE_REASON_MAX_LEN = 500;
 
 function normalizeFailureReasonKey(raw: string): string {
@@ -191,26 +179,6 @@ function normalizeFailureReasonKey(raw: string): string {
     : rawNorm;
 }
 
-/** Normalized `Error=` text from `In-house solver attempt failed` lines (for breakdown + counts). */
-function extractInHouseSolverErrorKey(line: string): string | null {
-  if (!line.includes("In-house solver attempt failed")) return null;
-  const m = line.match(/\bError\s*=\s*([\s\S]+?)\]\s+email=/i);
-  let raw: string | undefined;
-  if (m?.[1]) {
-    raw = m[1].trim();
-  } else {
-    const m2 = line.match(/\bError\s*=\s*(.+)$/i);
-    if (m2?.[1]) {
-      raw = m2[1].trim();
-      const emailAt = raw.search(/\s+email=/i);
-      if (emailAt >= 0) raw = raw.slice(0, emailAt).trim();
-      if (raw.endsWith("]")) raw = raw.slice(0, -1).trim();
-    }
-  }
-  if (!raw) return "(no error text)";
-  return normalizeFailureReasonKey(raw);
-}
-
 /** Returns one or more normalized failure reason keys (concurrent warning => multiple entries). */
 function extractFailureReasonKeys(line: string): string[] {
   if (line.includes("In-house identity verification attempt failed")) {
@@ -234,11 +202,8 @@ function extractFailureReasonKeys(line: string): string[] {
 }
 
 function extractFailureReasonKey(line: string): string | null {
-  if (
-    line.includes("In-house identity verification failed") &&
-    /identity\s+verification\s+not\s+approved\s+after\s+in-house\s+solves/i.test(line)
-  ) {
-    return "status not approaved";
+  if (isNewInHouseIdentityTerminalFailure(line)) {
+    return "Identity verification not approved after in-house solves";
   }
   const keys = extractFailureReasonKeys(line);
   const raw = keys[0] ?? null;
@@ -257,6 +222,77 @@ function extractFailureReasonKey(line: string): string | null {
   return raw.length > FAILURE_REASON_MAX_LEN ? `${raw.slice(0, FAILURE_REASON_MAX_LEN - 3)}...` : raw;
 }
 
+function isInHouseSolverAttemptFailed(line: string): boolean {
+  return /in-house solver attempt failed/i.test(line);
+}
+
+function isInHouseSolverAttemptSucceeded(line: string): boolean {
+  return /in-house solver attempt succeeded/i.test(line);
+}
+
+/** Per email, ordered unique VideoLink values from solver success lines (cohort-filtered). */
+function buildSolverSucceededVideosByEmail(
+  solverLogs: LogEntry[],
+  applicantEmails: Set<string>
+): Map<string, string[]> {
+  const sorted = [...solverLogs].sort((a, b) => a.time.localeCompare(b.time));
+  const byEmail = new Map<string, string[]>();
+  const seenPerEmail = new Map<string, Set<string>>();
+  for (const e of sorted) {
+    if (!isInHouseSolverAttemptSucceeded(e.line)) continue;
+    const email = extractField(e.line, "email")?.toLowerCase();
+    const video = extractField(e.line, "VideoLink");
+    if (!email || !video || !applicantEmails.has(email)) continue;
+    let seen = seenPerEmail.get(email);
+    if (!seen) {
+      seen = new Set();
+      seenPerEmail.set(email, seen);
+    }
+    if (seen.has(video)) continue;
+    seen.add(video);
+    const arr = byEmail.get(email) ?? [];
+    arr.push(video);
+    byEmail.set(email, arr);
+  }
+  return byEmail;
+}
+
+function buildPassportByEmailFromVfsLogs(logs: LogEntry[]): Map<string, string | null> {
+  const sorted = [...logs].sort((a, b) => a.time.localeCompare(b.time));
+  const m = new Map<string, string | null>();
+  for (const e of sorted) {
+    const email = extractField(e.line, "email")?.toLowerCase();
+    if (!email) continue;
+    const p = extractField(e.line, "PassportNumber");
+    if (p) m.set(email, p);
+  }
+  return m;
+}
+
+function lastFailureReasonForEmail(failLogs: LogEntry[], email: string): string {
+  let best = "";
+  let bestMs = -Infinity;
+  for (const e of failLogs) {
+    if (!isNotAcceptedStyleFailure(e.line)) continue;
+    const em = extractField(e.line, "email")?.toLowerCase();
+    if (em !== email) continue;
+    const t = Date.parse(e.time);
+    if (!Number.isFinite(t)) continue;
+    if (t >= bestMs) {
+      bestMs = t;
+      best = extractFailureReasonKey(e.line) ?? "";
+    }
+  }
+  return best;
+}
+
+/** Error text from `In-house solver attempt failed … Error=… email=` */
+function extractSolverAttemptError(line: string): string | null {
+  const m = line.match(/Error=(.+?)\s+email=/i);
+  const raw = m?.[1]?.trim();
+  return raw && raw.length > 0 ? raw : null;
+}
+
 function isConcurrentAttemptsWarnFailure(line: string): boolean {
   const lower = line.toLowerCase();
   const requiredPrefix =
@@ -272,14 +308,22 @@ function isConcurrentAttemptsWarnFailure(line: string): boolean {
   return true;
 }
 
+/** New log shape: terminal failure in one line (e.g. not approved after in-house solves). */
+function isNewInHouseIdentityTerminalFailure(line: string): boolean {
+  if (!/in-house identity verification failed/i.test(line)) return false;
+  if (/in-house identity verification attempt failed/i.test(line)) return false;
+  if (isConcurrentAttemptsWarnFailure(line)) return false;
+  if (/failed to activate in-house identity verification token/i.test(line)) return false;
+  return /not approved after in-house solves/i.test(line);
+}
+
+function isInHouseIdentityCompletedLine(line: string): boolean {
+  return /in-house identity verification completed\b/i.test(line);
+}
+
 /** vfs-global-bot prose: contains `status not approved` (e.g. Identity verification failed (status not approved)). */
 function isNotAcceptedStyleFailure(line: string): boolean {
-  if (
-    line.includes("In-house identity verification failed") &&
-    /identity\s+verification\s+not\s+approved\s+after\s+in-house\s+solves/i.test(line)
-  ) {
-    return true;
-  }
+  if (isNewInHouseIdentityTerminalFailure(line)) return true;
   if (
     line.includes("In-house identity verification attempt failed") &&
     /status\s+not\s+approved|status\s+not\s+approaved/i.test(line)
@@ -324,23 +368,36 @@ function buildSessionSolveKindMap(azureLogs: LogEntry[]): Map<string, SolveKind>
   return map;
 }
 
+function parseSuccessfulSolvesFraction(line: string): { n?: number; m?: number } {
+  const m = line.match(/SuccessfulSolves\s*=\s*(\d+)\s*\/\s*(\d+)/i);
+  const n = m?.[1] ? parseInt(m[1], 10) : NaN;
+  const mm = m?.[2] ? parseInt(m[2], 10) : NaN;
+  return {
+    n: Number.isFinite(n) ? n : undefined,
+    m: Number.isFinite(mm) ? mm : undefined,
+  };
+}
+
 function classifyVfsVerificationLine(
   line: string
 ):
   | { kind: "solving" }
   | { kind: "success"; submitN?: number; submitM?: number }
-  | { kind: "fail"; failN?: number; failM?: number; failTerminal?: boolean }
+  | { kind: "fail"; failN?: number; failM?: number }
   | null {
   if (line.includes("Solving in-house identity verification")) return { kind: "solving" };
-  if (line.includes("In-house identity verification completed")) {
-    const m = line.match(/SuccessfulSolves\s*=\s*(\d+)\s*\/\s*(\d+)/i);
+  if (isInHouseIdentityCompletedLine(line)) {
+    const m = line.match(/SubmitAttempt\s*=\s*(\d+)\s*\/\s*(\d+)/i);
     const submitN = m?.[1] ? parseInt(m[1], 10) : NaN;
     const submitM = m?.[2] ? parseInt(m[2], 10) : NaN;
-    return {
-      kind: "success",
-      submitN: Number.isFinite(submitN) ? submitN : undefined,
-      submitM: Number.isFinite(submitM) ? submitM : undefined,
-    };
+    if (Number.isFinite(submitN) && Number.isFinite(submitM)) {
+      return { kind: "success", submitN, submitM };
+    }
+    const ss = parseSuccessfulSolvesFraction(line);
+    if (ss.n != null && ss.m != null && ss.m > 0) {
+      return { kind: "success", submitN: ss.n, submitM: ss.m };
+    }
+    return { kind: "success" };
   }
   if (line.includes("Identity verification completed successfully")) {
     const m = line.match(/SubmitAttempt\s*=\s*(\d+)\s*\/\s*(\d+)/i);
@@ -352,35 +409,20 @@ function classifyVfsVerificationLine(
       submitM: Number.isFinite(submitM) ? submitM : undefined,
     };
   }
-  if (
-    line.includes("In-house identity verification failed") &&
-    /identity\s+verification\s+not\s+approved\s+after\s+in-house\s+solves/i.test(line)
-  ) {
-    const m = line.match(/Attempt\s*=\s*(\d+)\s*\/\s*(\d+)/i);
+  if (isNewInHouseIdentityTerminalFailure(line)) {
+    return { kind: "fail", failN: 1, failM: 1 };
+  }
+  if (isConcurrentAttemptsWarnFailure(line)) {
+    return { kind: "fail", failN: 3, failM: 3 };
+  }
+  if (line.includes("In-house identity verification attempt failed")) {
+    const m = line.match(/attempt failed\s*\((\d+)\/(\d+)\)/i);
     const failN = m?.[1] ? parseInt(m[1], 10) : NaN;
     const failM = m?.[2] ? parseInt(m[2], 10) : NaN;
     return {
       kind: "fail",
       failN: Number.isFinite(failN) ? failN : undefined,
       failM: Number.isFinite(failM) ? failM : undefined,
-      failTerminal: true,
-    };
-  }
-  if (isConcurrentAttemptsWarnFailure(line)) {
-    return { kind: "fail", failN: 3, failM: 3, failTerminal: true };
-  }
-  if (line.includes("In-house identity verification attempt failed")) {
-    const m = line.match(/attempt failed\s*\((\d+)\/(\d+)\)/i);
-    const failN = m?.[1] ? parseInt(m[1], 10) : NaN;
-    const failM = m?.[2] ? parseInt(m[2], 10) : NaN;
-    const nOk = Number.isFinite(failN) ? failN : undefined;
-    const mOk = Number.isFinite(failM) ? failM : undefined;
-    const terminal = nOk === 3 && mOk === 3;
-    return {
-      kind: "fail",
-      failN: nOk,
-      failM: mOk,
-      failTerminal: terminal,
     };
   }
   return null;
@@ -395,13 +437,7 @@ function logEntryToEmailTimeline(e: LogEntry): EmailTimelineEvent | null {
   if (!email) return null;
   const base = { timeMs, email: email.toLowerCase(), kind: cls.kind } as const;
   if (cls.kind === "fail") {
-    return {
-      ...base,
-      kind: "fail",
-      failN: cls.failN,
-      failM: cls.failM,
-      failTerminal: cls.failTerminal,
-    };
+    return { ...base, kind: "fail", failN: cls.failN, failM: cls.failM };
   }
   if (cls.kind === "success") {
     return { ...base, kind: "success", submitN: cls.submitN, submitM: cls.submitM };
@@ -428,7 +464,7 @@ function mergeEmailTimelines(logStreams: LogEntry[][]): Map<string, EmailTimelin
 
 function deriveApplicantOutcome(email: string, eventsAll: EmailTimelineEvent[]): ApplicantOutcome {
   const firstSolvingIdx = eventsAll.findIndex((e) => e.kind === "solving");
-  const events = firstSolvingIdx < 0 ? eventsAll : eventsAll.slice(firstSolvingIdx);
+  const events = firstSolvingIdx < 0 ? [] : eventsAll.slice(firstSolvingIdx);
 
   let outcome: ApplicantOutcome["outcome"] = "pending";
   let successOnTry: ApplicantOutcome["successOnTry"] = null;
@@ -443,7 +479,11 @@ function deriveApplicantOutcome(email: string, eventsAll: EmailTimelineEvent[]):
     }
     if (e.kind === "fail") {
       inHouseFailCountSinceLastSuccess += 1;
-      if (e.failTerminal) {
+      const n = e.failN;
+      const m = e.failM;
+      const terminal =
+        (n === 3 && m === 3) || (n === 1 && m === 1);
+      if (terminal) {
         outcome = "failed";
         successOnTry = null;
         inHouseFailCountSinceLastSuccess = 0;
@@ -462,16 +502,6 @@ function deriveApplicantOutcome(email: string, eventsAll: EmailTimelineEvent[]):
   }
 
   return { email, outcome, successOnTry };
-}
-
-function lastSuccessTimeMs(eventsAll: EmailTimelineEvent[]): number | null {
-  const firstSolvingIdx = eventsAll.findIndex((e) => e.kind === "solving");
-  const events = firstSolvingIdx < 0 ? eventsAll : eventsAll.slice(firstSolvingIdx);
-  let t: number | null = null;
-  for (const e of events) {
-    if (e.kind === "success") t = e.timeMs;
-  }
-  return t;
 }
 
 function pickRandomItems<T>(items: T[], count: number): T[] {
@@ -753,12 +783,9 @@ export async function POST(req: NextRequest) {
 
   const [
     solvingLogsAll,
-    successLogsInHouse,
-    successLogsLegacy,
-    failLogsInHouse,
-    failAttemptLogs,
-    failConcurrentRawLogs,
-    solverFailLogsAll,
+    identityAllLogs,
+    legacySuccessLogs,
+    solverLogsAll,
     azureLivenessLogs,
     azurePayloadLogs,
     azureResultFailedLogs,
@@ -779,8 +806,8 @@ export async function POST(req: NextRequest) {
       from,
       to,
       target: VFS_BOT_APP,
-      query: "In-house identity verification completed",
-      requestId: "approved_vfs_success_inhouse",
+      query: "In-house identity",
+      requestId: "approved_vfs_identity",
     }),
     queryLogs({
       base,
@@ -789,7 +816,7 @@ export async function POST(req: NextRequest) {
       to,
       target: VFS_BOT_APP,
       query: "Identity verification completed successfully",
-      requestId: "approved_vfs_success_legacy",
+      requestId: "approved_vfs_success",
     }),
     queryLogs({
       base,
@@ -797,35 +824,8 @@ export async function POST(req: NextRequest) {
       from,
       to,
       target: VFS_BOT_APP,
-      query: "In-house identity verification failed",
-      requestId: "approved_vfs_fail_inhouse",
-    }),
-    queryLogs({
-      base,
-      cookieHeader,
-      from,
-      to,
-      target: VFS_BOT_APP,
-      query: "In-house identity verification attempt failed",
-      requestId: "approved_vfs_fail",
-    }),
-    queryLogs({
-      base,
-      cookieHeader,
-      from,
-      to,
-      target: VFS_BOT_APP,
-      query: "In-house identity verification failed across 3 concurrent attempts",
-      requestId: "approved_vfs_fail_concurrent",
-    }),
-    queryLogs({
-      base,
-      cookieHeader,
-      from,
-      to,
-      target: VFS_BOT_APP,
-      query: "In-house solver attempt failed",
-      requestId: "approved_vfs_solver_fail",
+      query: "In-house solver",
+      requestId: "approved_vfs_solver",
     }),
     queryLogs({
       base,
@@ -856,15 +856,22 @@ export async function POST(req: NextRequest) {
     }),
   ]);
 
-  const failConcurrentWarnLogs = failConcurrentRawLogs.filter((entry) =>
-    isConcurrentAttemptsWarnFailure(entry.line)
+  const identityOutcomeLogs = identityAllLogs.filter(
+    (entry) => !entry.line.includes("Solving in-house identity verification")
   );
-  const successLogs = dedupeLogEntries([...successLogsInHouse, ...successLogsLegacy]);
-  const failLogs = dedupeLogEntries([...failLogsInHouse, ...failAttemptLogs, ...failConcurrentWarnLogs]);
+  const identitySuccessLogs = identityOutcomeLogs.filter((entry) =>
+    isInHouseIdentityCompletedLine(entry.line)
+  );
+  const successLogs = [...legacySuccessLogs, ...identitySuccessLogs].sort((a, b) =>
+    a.time.localeCompare(b.time)
+  );
+  const identityFailLogs = identityOutcomeLogs.filter((entry) => {
+    const c = classifyVfsVerificationLine(entry.line);
+    return c?.kind === "fail";
+  });
+  const failLogs = identityFailLogs;
 
   const sessionSolveKind = buildSessionSolveKindMap(azureLivenessLogs);
-  /** No Azure “Solving face verification…” in window → cannot classify drop vs verification; include all VFS solving lines with TaskId. */
-  const azureJobTypeFilterSkipped = sessionSolveKind.size === 0;
 
   let solvingNoTaskId = 0;
   let solvingNoAzureMatch = 0;
@@ -880,7 +887,6 @@ export async function POST(req: NextRequest) {
       solvingNoTaskId += 1;
       return false;
     }
-    if (azureJobTypeFilterSkipped) return true;
     const mapped = sessionSolveKind.get(prefix);
     if (mapped == null) {
       solvingNoAzureMatch += 1;
@@ -899,18 +905,23 @@ export async function POST(req: NextRequest) {
     const ev = logEntryToEmailTimeline(entry);
     if (ev?.kind === "solving") applicantEmails.add(ev.email);
   }
-  let applicantCohortFromIdentityLogsOnly = false;
-  if (applicantEmails.size === 0) {
-    applicantCohortFromIdentityLogsOnly = true;
-    for (const entry of [...successLogs, ...failLogs]) {
-      const email = extractField(entry.line, "email")?.toLowerCase();
-      if (email) applicantEmails.add(email);
-    }
+
+  const solverFailCountByEmail = new Map<string, number>();
+  for (const entry of solverLogsAll) {
+    if (!isInHouseSolverAttemptFailed(entry.line)) continue;
+    const email = extractField(entry.line, "email")?.toLowerCase();
+    if (!email || !applicantEmails.has(email)) continue;
+    solverFailCountByEmail.set(email, (solverFailCountByEmail.get(email) ?? 0) + 1);
   }
 
   const applicantOutcomes: ApplicantOutcome[] = [...applicantEmails]
     .sort()
-    .map((email) => deriveApplicantOutcome(email, timelinesByEmail.get(email) ?? []));
+    .map((email) => deriveApplicantOutcome(email, timelinesByEmail.get(email) ?? []))
+    .map((o) =>
+      o.outcome === "failed"
+        ? { ...o, solverFailureCount: solverFailCountByEmail.get(o.email) ?? 0 }
+        : o
+    );
 
   let successCount = 0;
   let failureCount = 0;
@@ -929,27 +940,32 @@ export async function POST(req: NextRequest) {
     else pendingCount += 1;
   }
 
-  const failedApplicantEmails = new Set(
+  const failedEmailSet = new Set(
     applicantOutcomes.filter((o) => o.outcome === "failed").map((o) => o.email)
   );
-  let solverAttemptFailureCount = 0;
+  let terminalFailureLogCount = 0;
+  for (const o of applicantOutcomes) {
+    if (o.outcome === "failed") terminalFailureLogCount += o.solverFailureCount ?? 0;
+  }
+
   const failureReasonCounts = new Map<string, number>();
   const failureReasonSamples = new Map<string, FailureReasonSample[]>();
   const solvingSnapshotsByEmail = buildSolvingSnapshotsByEmail(solvingLogs);
-  for (const entry of solverFailLogsAll) {
+  for (const entry of solverLogsAll) {
+    if (!isInHouseSolverAttemptFailed(entry.line)) continue;
     const email = extractField(entry.line, "email")?.toLowerCase();
-    if (!email || !applicantEmails.has(email) || !failedApplicantEmails.has(email)) continue;
-    if (!entry.line.includes("In-house solver attempt failed")) continue;
-    solverAttemptFailureCount += 1;
-    const reasonKey = extractInHouseSolverErrorKey(entry.line) ?? "(no error text)";
+    if (!email || !failedEmailSet.has(email)) continue;
+    const errRaw = extractSolverAttemptError(entry.line);
+    const reasonKey = errRaw ? normalizeFailureReasonKey(errRaw) : "(no Error= field)";
     const failureTimeMs = Date.parse(entry.time);
     const solvingSnap = Number.isFinite(failureTimeMs)
       ? pickSnapshotForFailure(solvingSnapshotsByEmail, email, failureTimeMs)
       : null;
-    const videoFromLine = extractField(entry.line, "VideoLink") ?? null;
+    const passportFromLine = extractField(entry.line, "PassportNumber");
+    const videoFromLine = extractField(entry.line, "VideoLink");
     const sample: FailureReasonSample = {
       email,
-      passportNumber: solvingSnap?.passportNumber ?? null,
+      passportNumber: passportFromLine ?? solvingSnap?.passportNumber ?? null,
       videoLink: videoFromLine ?? solvingSnap?.videoLink ?? null,
     };
     failureReasonCounts.set(reasonKey, (failureReasonCounts.get(reasonKey) ?? 0) + 1);
@@ -992,42 +1008,42 @@ export async function POST(req: NextRequest) {
   }
   taskPayloadIatRows.sort((a, b) => a.actualLogTime.localeCompare(b.actualLogTime));
 
-  type VideoSessionRow = { email: string; videoLink: string | null; passportNumber: string | null };
+  type VideoSessionRow = { email: string; videoLinks: string[]; passportNumber: string | null };
   type VideoSessionNotAcceptedRow = VideoSessionRow & { failureReason: string };
 
   let sessionVideoApprovedRows: VideoSessionRow[] | undefined;
   let sessionVideoNotAcceptedRows: VideoSessionNotAcceptedRow[] | undefined;
 
   if (body.includeVideoSessionRows === true) {
+    const passportByEmail = buildPassportByEmailFromVfsLogs([
+      ...identityOutcomeLogs,
+      ...legacySuccessLogs,
+      ...failLogs,
+    ]);
+    const solverOkVideosByEmail = buildSolverSucceededVideosByEmail(solverLogsAll, applicantEmails);
+
     sessionVideoApprovedRows = [];
     for (const o of applicantOutcomes) {
       if (o.outcome !== "success") continue;
-      const successAt = lastSuccessTimeMs(timelinesByEmail.get(o.email) ?? []);
-      const snap =
-        successAt != null
-          ? pickSnapshotForFailure(solvingSnapshotsByEmail, o.email, successAt)
-          : null;
+      const videoLinks = solverOkVideosByEmail.get(o.email) ?? [];
+      if (videoLinks.length === 0) continue;
       sessionVideoApprovedRows.push({
         email: o.email,
-        videoLink: snap?.videoLink ?? null,
-        passportNumber: snap?.passportNumber ?? null,
+        videoLinks,
+        passportNumber: passportByEmail.get(o.email) ?? null,
       });
     }
 
     sessionVideoNotAcceptedRows = [];
-    for (const entry of failLogs) {
-      if (!isNotAcceptedStyleFailure(entry.line)) continue;
-      const email = extractField(entry.line, "email")?.toLowerCase();
-      if (!email || !applicantEmails.has(email)) continue;
-      const failureTimeMs = Date.parse(entry.time);
-      const snap = Number.isFinite(failureTimeMs)
-        ? pickSnapshotForFailure(solvingSnapshotsByEmail, email, failureTimeMs)
-        : null;
+    for (const o of applicantOutcomes) {
+      if (o.outcome !== "failed") continue;
+      const videoLinks = solverOkVideosByEmail.get(o.email) ?? [];
+      if (videoLinks.length === 0) continue;
       sessionVideoNotAcceptedRows.push({
-        email,
-        videoLink: snap?.videoLink ?? null,
-        passportNumber: snap?.passportNumber ?? null,
-        failureReason: extractFailureReasonKey(entry.line) ?? "",
+        email: o.email,
+        videoLinks,
+        passportNumber: passportByEmail.get(o.email) ?? null,
+        failureReason: lastFailureReasonForEmail(failLogs, o.email),
       });
     }
   }
@@ -1043,9 +1059,7 @@ export async function POST(req: NextRequest) {
       applicantCount: applicantEmails.size,
       successCount,
       failureCount,
-      solverAttemptFailureCount,
-      azureJobTypeFilterSkipped,
-      applicantCohortFromIdentityLogsOnly,
+      terminalFailureLogCount,
       pendingCount,
       solvedOnFirstTry,
       solvedOnSecondTry,
@@ -1054,6 +1068,9 @@ export async function POST(req: NextRequest) {
       solvingLogLinesRaw: solvingLogsAll.length,
       successLogLines: successLogs.length,
       failLogLines: failLogs.length,
+      identityVerificationLogLines: identityAllLogs.length,
+      identityOutcomeLogLines: identityOutcomeLogs.length,
+      solverLogLines: solverLogsAll.length,
       azureLivenessLogLines: azureLivenessLogs.length,
       azureSessionPrefixesMapped: sessionSolveKind.size,
       solvingExcludedNoTaskId: solvingNoTaskId,

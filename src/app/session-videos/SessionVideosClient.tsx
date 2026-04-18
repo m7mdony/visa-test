@@ -13,7 +13,7 @@ const SS_OTP_SIA = "ui-test-clerk-sign-in-attempt-id";
 
 type SolveKindUi = "drop" | "verification";
 
-type VideoRow = { email: string; videoLink: string | null; passportNumber: string | null };
+type VideoRow = { email: string; videoLinks: string[]; passportNumber: string | null };
 type NotAcceptedRow = VideoRow & { failureReason: string };
 
 type ApiResponse = {
@@ -419,7 +419,7 @@ export default function SessionVideosClient() {
     }
   }
 
-  /** One button per row — many rows can share the same `videoLink`, so never key only by URL. */
+  /** Discriminator must be unique per Run control (row index + video index + URL). */
   function runRowKey(scope: "ap" | "na", rowDiscriminator: string, videoUrl: string | null): string {
     return `${scope}:${rowDiscriminator}|${videoUrl ?? ""}|${streamKeySuffix.trim()}`;
   }
@@ -460,10 +460,12 @@ export default function SessionVideosClient() {
       <div>
         <h1 className="text-2xl font-semibold text-zinc-900">Session video queues</h1>
         <p className="text-sm text-zinc-600 mt-1">
-          Same cohort as Approved videos: successful applicants vs vfs-global-bot failures whose message contains{" "}
-          <code className="text-xs">status not approved</code> (e.g.{" "}
-          <code className="text-xs">Identity verification failed (status not approved)</code>). Each row can enqueue one
-          job on Redis stream <code className="text-xs">azure:identity-verification:stream:</code>
+          Cohort from Grafana <code className="text-xs">In-house identity</code> outcomes and{" "}
+          <code className="text-xs">In-house solver</code> lines (via Approved videos API). Each table row is one applicant
+          solve: all <code className="text-xs">VideoLink</code> values from{" "}
+          <code className="text-xs">In-house solver attempt succeeded</code> for that email (failed identity rows still
+          only include solver-succeeded videos). Use <span className="font-medium">Run 1/n</span> per video to enqueue on
+          Redis stream <code className="text-xs">azure:identity-verification:stream:</code>
           <span className="font-mono text-xs">…</span> using the ID field below (same as{" "}
           <code className="text-xs">test-session.js</code>).
         </p>
@@ -793,10 +795,10 @@ export default function SessionVideosClient() {
               <table className="min-w-full text-xs">
                 <thead className="bg-zinc-100 text-zinc-800">
                   <tr>
-                    <th className="px-3 py-2 text-left font-semibold">Video</th>
+                    <th className="px-3 py-2 text-left font-semibold">Videos (solver succeeded)</th>
                     <th className="px-3 py-2 text-left font-semibold">Passport</th>
                     <th className="px-3 py-2 text-left font-semibold min-w-[200px]">Dashboard passport images</th>
-                    <th className="px-3 py-2 text-left font-semibold w-32">Run test-session</th>
+                    <th className="px-3 py-2 text-left font-semibold w-36">Run test-session</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -807,20 +809,26 @@ export default function SessionVideosClient() {
                       </td>
                     </tr>
                   ) : (
-                    approved.map((row) => (
-                      <tr key={row.email} className="border-t border-zinc-100 align-top">
+                    approved.map((row, idx) => (
+                      <tr key={`${row.email}|${idx}`} className="border-t border-zinc-100 align-top">
                         <td className="px-3 py-2">
-                          {row.videoLink ? (
-                            <a
-                              href={row.videoLink}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="text-blue-700 underline break-all font-mono"
-                            >
-                              {row.videoLink}
-                            </a>
-                          ) : (
+                          {row.videoLinks.length === 0 ? (
                             <span className="text-zinc-400">—</span>
+                          ) : (
+                            <ol className="list-decimal pl-4 space-y-2">
+                              {row.videoLinks.map((url, vidx) => (
+                                <li key={`${url}|${vidx}`} className="break-all font-mono">
+                                  <a
+                                    href={url}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="text-blue-700 underline"
+                                  >
+                                    {url}
+                                  </a>
+                                </li>
+                              ))}
+                            </ol>
                           )}
                         </td>
                         <td className="px-3 py-2 font-mono text-zinc-900">{row.passportNumber ?? "—"}</td>
@@ -830,19 +838,25 @@ export default function SessionVideosClient() {
                             entry={dashEntryFor(row.passportNumber)}
                           />
                         </td>
-                        <td className="px-3 py-2 relative z-10 bg-white whitespace-nowrap">
-                          <button
-                            type="button"
-                            disabled={
-                              !row.videoLink ||
-                              !streamKeySuffix.trim() ||
-                              runKey === runRowKey("ap", row.email, row.videoLink)
-                            }
-                            onClick={() => row.videoLink && runTestSession(row.videoLink, "ap", row.email)}
-                            className="rounded-md border border-zinc-300 bg-white px-2 py-1 text-[11px] font-medium text-zinc-800 hover:bg-zinc-50 disabled:opacity-40"
-                          >
-                            {runKey === runRowKey("ap", row.email, row.videoLink) ? "Running…" : "Run"}
-                          </button>
+                        <td className="px-3 py-2 relative z-10 bg-white">
+                          <div className="flex flex-col gap-1.5">
+                            {row.videoLinks.map((url, vidx) => (
+                              <button
+                                key={`run-ap-${url}|${vidx}`}
+                                type="button"
+                                disabled={
+                                  !streamKeySuffix.trim() ||
+                                  runKey === runRowKey("ap", `${row.email}|${idx}|${vidx}`, url)
+                                }
+                                onClick={() => runTestSession(url, "ap", `${row.email}|${idx}|${vidx}`)}
+                                className="rounded-md border border-zinc-300 bg-white px-2 py-1 text-[11px] font-medium text-zinc-800 hover:bg-zinc-50 disabled:opacity-40 whitespace-nowrap"
+                              >
+                                {runKey === runRowKey("ap", `${row.email}|${idx}|${vidx}`, url)
+                                  ? "Running…"
+                                  : `Run ${vidx + 1}/${row.videoLinks.length}`}
+                              </button>
+                            ))}
+                          </div>
                         </td>
                       </tr>
                     ))
@@ -857,18 +871,19 @@ export default function SessionVideosClient() {
               Not accepted <span className="text-zinc-500 font-normal">({notAccepted.length})</span>
             </h2>
             <p className="text-xs text-zinc-500 mb-2">
-              Only <code className="text-[10px]">In-house identity verification attempt failed</code> lines that
-              include <code className="text-[10px]">status not approved</code> in the vfs-global-bot log text.
+              Identity outcome: <code className="text-[10px]">In-house identity verification failed</code> (not approved
+              after in-house solves) or legacy <code className="text-[10px]">status not approved</code> lines. Videos are
+              only solver-succeeded links, same as the approved table.
             </p>
             <div className="overflow-x-auto rounded-lg border border-zinc-200 bg-white">
               <table className="min-w-full text-xs">
                 <thead className="bg-zinc-100 text-zinc-800">
                   <tr>
-                    <th className="px-3 py-2 text-left font-semibold">Video</th>
+                    <th className="px-3 py-2 text-left font-semibold">Videos (solver succeeded)</th>
                     <th className="px-3 py-2 text-left font-semibold">Passport</th>
                     <th className="px-3 py-2 text-left font-semibold min-w-[200px]">Dashboard passport images</th>
                     <th className="px-3 py-2 text-left font-semibold">Reason</th>
-                    <th className="px-3 py-2 text-left font-semibold w-32">Run test-session</th>
+                    <th className="px-3 py-2 text-left font-semibold w-36">Run test-session</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -880,22 +895,25 @@ export default function SessionVideosClient() {
                     </tr>
                   ) : (
                     notAccepted.map((row, idx) => (
-                      <tr
-                        key={`${row.email}-${row.failureReason}-${idx}`}
-                        className="border-t border-zinc-100 align-top"
-                      >
+                      <tr key={`${row.email}|${idx}`} className="border-t border-zinc-100 align-top">
                         <td className="px-3 py-2">
-                          {row.videoLink ? (
-                            <a
-                              href={row.videoLink}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="text-blue-700 underline break-all font-mono"
-                            >
-                              {row.videoLink}
-                            </a>
-                          ) : (
+                          {row.videoLinks.length === 0 ? (
                             <span className="text-zinc-400">—</span>
+                          ) : (
+                            <ol className="list-decimal pl-4 space-y-2">
+                              {row.videoLinks.map((url, vidx) => (
+                                <li key={`${url}|${vidx}`} className="break-all font-mono">
+                                  <a
+                                    href={url}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="text-blue-700 underline"
+                                  >
+                                    {url}
+                                  </a>
+                                </li>
+                              ))}
+                            </ol>
                           )}
                         </td>
                         <td className="px-3 py-2 font-mono text-zinc-900">{row.passportNumber ?? "—"}</td>
@@ -906,19 +924,25 @@ export default function SessionVideosClient() {
                           />
                         </td>
                         <td className="px-3 py-2 font-mono text-zinc-700 break-all max-w-md">{row.failureReason}</td>
-                        <td className="px-3 py-2 relative z-10 bg-white whitespace-nowrap">
-                          <button
-                            type="button"
-                            disabled={
-                              !row.videoLink ||
-                              !streamKeySuffix.trim() ||
-                              runKey === runRowKey("na", String(idx), row.videoLink)
-                            }
-                            onClick={() => row.videoLink && runTestSession(row.videoLink, "na", String(idx))}
-                            className="rounded-md border border-zinc-300 bg-white px-2 py-1 text-[11px] font-medium text-zinc-800 hover:bg-zinc-50 disabled:opacity-40"
-                          >
-                            {runKey === runRowKey("na", String(idx), row.videoLink) ? "Running…" : "Run"}
-                          </button>
+                        <td className="px-3 py-2 relative z-10 bg-white">
+                          <div className="flex flex-col gap-1.5">
+                            {row.videoLinks.map((url, vidx) => (
+                              <button
+                                key={`run-na-${url}|${vidx}`}
+                                type="button"
+                                disabled={
+                                  !streamKeySuffix.trim() ||
+                                  runKey === runRowKey("na", `${idx}|${vidx}`, url)
+                                }
+                                onClick={() => runTestSession(url, "na", `${idx}|${vidx}`)}
+                                className="rounded-md border border-zinc-300 bg-white px-2 py-1 text-[11px] font-medium text-zinc-800 hover:bg-zinc-50 disabled:opacity-40 whitespace-nowrap"
+                              >
+                                {runKey === runRowKey("na", `${idx}|${vidx}`, url)
+                                  ? "Running…"
+                                  : `Run ${vidx + 1}/${row.videoLinks.length}`}
+                              </button>
+                            ))}
+                          </div>
                         </td>
                       </tr>
                     ))
