@@ -3,12 +3,15 @@
 import { useState } from "react";
 
 type SolveKindUi = "drop" | "verification";
+type DeploymentEnvUi = "prod" | "staging";
 
 type ApiResponse = {
   from: number;
   to: number;
   target: string;
   solveKind?: SolveKindUi;
+  deploymentEnv?: DeploymentEnvUi;
+  vfsLokiNamespace?: string | null;
   vfsCorrelationApp?: string;
   azureCorrelationApp?: string;
   totals: {
@@ -116,6 +119,7 @@ export default function ApprovedVideosClient() {
   const [fromStr, setFromStr] = useState(() => toDatetimeLocal(defaultFrom));
   const [toStr, setToStr] = useState(() => toDatetimeLocal(defaultTo));
   const [target, setTarget] = useState("vfs-global-bot");
+  const [deploymentEnv, setDeploymentEnv] = useState<DeploymentEnvUi>("prod");
   const [solveKind, setSolveKind] = useState<SolveKindUi>("drop");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -156,6 +160,7 @@ export default function ApprovedVideosClient() {
           to: toMs,
           target: target.trim() || "vfs-global-bot",
           solveKind,
+          deploymentEnv,
         }),
       });
       const json = (await res.json().catch(() => ({}))) as Partial<ApiResponse> & { error?: string };
@@ -179,37 +184,65 @@ export default function ApprovedVideosClient() {
         <p className="text-sm text-zinc-600 mt-1">
           Applicants come from <code className="text-xs">Solving in-house identity verification</code> in{" "}
           <code className="text-xs">vfs-global-bot</code>, filtered by job type using the TaskId prefix and{" "}
-          <code className="text-xs">azure-liveness-bot</code> lines{" "}
+          <code className="text-xs">azure-liveness-bot</code> (production) or{" "}
+          <code className="text-xs">azure-liveness-automation-staging</code> (staging) lines{" "}
           <code className="text-xs">Solving face verification for session … (passport: …)</code> (
-          <code className="text-xs">passport: VERIFICATION</code> = verification; anything else = drop). Final outcomes
+          <code className="text-xs">passport: VERIFICATION</code> = verification; anything else = drop). Staging VFS
+          logs use Loki <code className="text-xs">namespace=&quot;staging&quot;</code>. Final outcomes
           use <code className="text-xs">In-house identity verification completed</code> /{" "}
           <code className="text-xs">failed</code> (plus legacy lines). Solver stats use{" "}
           <code className="text-xs">In-house solver attempt failed</code> per email.
         </p>
       </div>
 
-      <div className="rounded-lg border border-zinc-200 bg-white px-4 py-3">
-        <span className="block text-sm font-medium text-zinc-700 mb-2">Report job type</span>
-        <div className="flex gap-2 flex-wrap" role="group" aria-label="Solve kind">
-          {(
-            [
-              { id: "drop" as const, label: "Drop solves" },
-              { id: "verification" as const, label: "Verification solves" },
-            ] as const
-          ).map((opt) => (
-            <button
-              key={opt.id}
-              type="button"
-              onClick={() => setSolveKind(opt.id)}
-              className={`rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors ${
-                solveKind === opt.id
-                  ? "border-zinc-900 bg-zinc-900 text-white"
-                  : "border-zinc-300 text-zinc-700 hover:bg-zinc-50"
-              }`}
-            >
-              {opt.label}
-            </button>
-          ))}
+      <div className="rounded-lg border border-zinc-200 bg-white px-4 py-3 space-y-4">
+        <div>
+          <span className="block text-sm font-medium text-zinc-700 mb-2">Environment</span>
+          <div className="flex gap-2 flex-wrap" role="group" aria-label="Deployment environment">
+            {(
+              [
+                { id: "prod" as const, label: "Production" },
+                { id: "staging" as const, label: "Staging" },
+              ] as const
+            ).map((opt) => (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => setDeploymentEnv(opt.id)}
+                className={`rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors ${
+                  deploymentEnv === opt.id
+                    ? "border-zinc-900 bg-zinc-900 text-white"
+                    : "border-zinc-300 text-zinc-700 hover:bg-zinc-50"
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div>
+          <span className="block text-sm font-medium text-zinc-700 mb-2">Report job type</span>
+          <div className="flex gap-2 flex-wrap" role="group" aria-label="Solve kind">
+            {(
+              [
+                { id: "drop" as const, label: "Drop solves" },
+                { id: "verification" as const, label: "Verification solves" },
+              ] as const
+            ).map((opt) => (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => setSolveKind(opt.id)}
+                className={`rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors ${
+                  solveKind === opt.id
+                    ? "border-zinc-900 bg-zinc-900 text-white"
+                    : "border-zinc-300 text-zinc-700 hover:bg-zinc-50"
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
@@ -283,11 +316,22 @@ export default function ApprovedVideosClient() {
               {data.vfsCorrelationApp ? (
                 <>
                   {" "}
-                  · correlation <code>{data.vfsCorrelationApp}</code>
+                  · VFS app <code>{data.vfsCorrelationApp}</code>
+                  {data.vfsLokiNamespace ? (
+                    <>
+                      {" "}
+                      · Loki <code>namespace={data.vfsLokiNamespace}</code>
+                    </>
+                  ) : null}
                 </>
               ) : null}
             </div>
             <div className="mt-1 text-xs text-zinc-500">
+              Environment:{" "}
+              <span className="font-medium text-zinc-700">
+                {data.deploymentEnv === "staging" ? "Staging" : "Production"}
+              </span>
+              {" · "}
               Report:{" "}
               <span className="font-medium text-zinc-700">
                 {data.solveKind === "verification" ? "Verification solves" : "Drop solves"}
