@@ -1,6 +1,22 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import DeniedPassportsByPassportSection from "@/components/DeniedPassportsByPassportSection";
+import type { DeniedPassportRow } from "@/lib/deniedPassports";
+import { computeDeniedRecoveryByEmail, type DeniedEmailRecovery } from "@/lib/deniedRecovery";
+import { collectEmailsFromReportData, collectPassportsFromReportData } from "@/lib/reportEvents";
+import { computeFilteredTopStats } from "@/lib/reportRouteFilter";
+import {
+  eventMatchesRouteFilter,
+  indexPassportRoutes,
+  isRouteFilterActive,
+  type PassportRouteInfo,
+  type RouteFilterSelection,
+} from "@/lib/visaflowDashboardClients";
+
+const SS_BEARER_JWT = "ui-test-visaflow-dashboard-bearer-jwt";
+const SS_CLERK_REFRESH_SESSION_ID = "ui-test-visaflow-clerk-refresh-session-id";
+const SS_OTP_COOKIE_JAR = "ui-test-clerk-otp-cookie-jar";
 
 type SolveKindUi = "drop" | "verification";
 type DeploymentEnvUi = "prod" | "staging";
@@ -15,6 +31,14 @@ type ApiResponse = {
   vfsCorrelationApp?: string;
   azureCorrelationApp?: string;
   totals: {
+    approvedVideoCount?: number;
+    deniedVideoCount?: number;
+    approvedApplicantCount?: number;
+    deniedApplicantCount?: number;
+    erroredVideoAttemptCount?: number;
+    idnfyStatusRawLogLines?: number;
+    idnfyStatusResponseLogLines?: number;
+    inHouseVerificationPassedAvgMs?: number | null;
     applicantCount: number;
     successCount: number;
     failureCount: number;
@@ -63,6 +87,45 @@ type ApiResponse = {
       videoLink: string | null;
     }>;
   }>;
+  deniedPassportRows?: DeniedPassportRow[];
+  deniedPassportErrors?: string[];
+  deniedRecoveryByEmail?: Record<string, DeniedEmailRecovery>;
+  reportEvents?: {
+    statusVideos: Array<{
+      status: "APPROVED" | "DENIED";
+      email: string;
+      passportNumber: string | null;
+      at: string;
+    }>;
+    inHousePassed: Array<{ email: string; passportNumber: string | null; at: string }>;
+    deniedApplicants: Array<{ email: string; passportNumber: string | null; at: string }>;
+    erroredAttempts: Array<{
+      email: string;
+      passportNumber: string | null;
+      reason: string;
+      at: string;
+    }>;
+  };
+};
+
+type RouteFilterOptions = {
+  fromCountries: string[];
+  toCountries: string[];
+  subVisaCategories: string[];
+};
+
+type RouteCombination = {
+  id: string;
+  fromCountry: string;
+  toCountry: string;
+  subVisaCategoryName: string;
+  label: string;
+};
+
+const EMPTY_ROUTE_FILTER: RouteFilterSelection = {
+  fromCountry: "",
+  toCountry: "",
+  subVisaCategoryName: "",
 };
 
 const INTERVAL_MS: Record<string, number> = {
@@ -124,6 +187,163 @@ export default function ApprovedVideosClient() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [data, setData] = useState<ApiResponse | null>(null);
+  const [routeFilter, setRouteFilter] = useState<RouteFilterSelection>(EMPTY_ROUTE_FILTER);
+  const [passportRoutes, setPassportRoutes] = useState<PassportRouteInfo[]>([]);
+  const [emailToRoute, setEmailToRoute] = useState<Map<string, PassportRouteInfo>>(new Map());
+  const [routeFilterOptions, setRouteFilterOptions] = useState<RouteFilterOptions | null>(null);
+  const [routeCombinations, setRouteCombinations] = useState<RouteCombination[]>([]);
+  const [routesLoading, setRoutesLoading] = useState(false);
+  const [routesError, setRoutesError] = useState<string | null>(null);
+  const [dashboardJwtSaved, setDashboardJwtSaved] = useState(false);
+
+  const refreshJwtFlag = useCallback(() => {
+    try {
+      setDashboardJwtSaved(Boolean(sessionStorage.getItem(SS_BEARER_JWT)?.trim()));
+    } catch {
+      setDashboardJwtSaved(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshJwtFlag();
+    const onJwt = () => refreshJwtFlag();
+    window.addEventListener("visaflow-jwt-updated", onJwt);
+    window.addEventListener("focus", onJwt);
+    return () => {
+      window.removeEventListener("visaflow-jwt-updated", onJwt);
+      window.removeEventListener("focus", onJwt);
+    };
+  }, [refreshJwtFlag]);
+
+  const fetchPassportRoutes = useCallback(async (report: ApiResponse) => {
+    let bearerFromStorage = "";
+    let refreshSid = "";
+    let refreshJar = "";
+    try {
+      bearerFromStorage = sessionStorage.getItem(SS_BEARER_JWT)?.trim() ?? "";
+      refreshSid = sessionStorage.getItem(SS_CLERK_REFRESH_SESSION_ID)?.trim() ?? "";
+      refreshJar = sessionStorage.getItem(SS_OTP_COOKIE_JAR)?.trim() ?? "";
+    } catch {
+      /* */
+    }
+    if (!bearerFromStorage || bearerFromStorage.split(".").length < 2) {
+      setPassportRoutes([]);
+      setRouteFilterOptions(null);
+      setRoutesError(null);
+      return;
+    }
+    const passportNumbers = collectPassportsFromReportData(report);
+    const emails = collectEmailsFromReportData(report);
+    setRoutesLoading(true);
+    setRoutesError(null);
+    try {
+      const res = await fetch("/api/dashboard-passport-routes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          passportNumbers,
+          emails,
+          bearerJwt: bearerFromStorage,
+          ...(refreshSid.startsWith("sess_") ? { clerkSessionId: refreshSid } : {}),
+          ...(refreshJar ? { clerkCookie: refreshJar } : {}),
+        }),
+      });
+      const json = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        routes?: PassportRouteInfo[];
+        filterOptions?: RouteFilterOptions;
+        routeCombinations?: RouteCombination[];
+        emailToRoute?: Record<string, PassportRouteInfo>;
+        refreshedBearerJwt?: string;
+      };
+      if (!res.ok) {
+        setRoutesError(json.error ?? `HTTP ${res.status}`);
+        setPassportRoutes([]);
+        setEmailToRoute(new Map());
+        setRouteFilterOptions(null);
+        setRouteCombinations([]);
+        return;
+      }
+      const nextJwt = typeof json.refreshedBearerJwt === "string" ? json.refreshedBearerJwt.trim() : "";
+      if (nextJwt && nextJwt.split(".").length >= 2) {
+        try {
+          sessionStorage.setItem(SS_BEARER_JWT, nextJwt);
+        } catch {
+          /* */
+        }
+      }
+      setPassportRoutes(json.routes ?? []);
+      setRouteFilterOptions(json.filterOptions ?? null);
+      setRouteCombinations(json.routeCombinations ?? []);
+      const em = new Map<string, PassportRouteInfo>();
+      for (const [k, v] of Object.entries(json.emailToRoute ?? {})) {
+        if (v && typeof v === "object") em.set(k.toLowerCase(), v);
+      }
+      setEmailToRoute(em);
+    } catch (e: unknown) {
+      setRoutesError(e instanceof Error ? e.message : "Route lookup failed");
+      setPassportRoutes([]);
+      setEmailToRoute(new Map());
+      setRouteFilterOptions(null);
+      setRouteCombinations([]);
+    } finally {
+      setRoutesLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!data || !dashboardJwtSaved) {
+      if (!data) {
+        setPassportRoutes([]);
+        setEmailToRoute(new Map());
+        setRouteFilterOptions(null);
+        setRouteCombinations([]);
+        setRoutesError(null);
+      }
+      return;
+    }
+    void fetchPassportRoutes(data);
+  }, [data, dashboardJwtSaved, fetchPassportRoutes]);
+
+  useEffect(() => {
+    if (!data) setRouteFilter(EMPTY_ROUTE_FILTER);
+  }, [data]);
+
+  const filtered = useMemo(() => {
+    if (!data) return null;
+    const baseDenied = data.deniedPassportRows ?? [];
+    if (!isRouteFilterActive(routeFilter) || !data.reportEvents) {
+      return {
+        approvedVideoCount: data.totals.approvedVideoCount ?? 0,
+        deniedVideoCount: data.totals.deniedVideoCount ?? 0,
+        approvedApplicantCount: data.totals.approvedApplicantCount ?? 0,
+        deniedApplicantCount: data.totals.deniedApplicantCount ?? 0,
+        erroredVideoAttemptCount: data.totals.erroredVideoAttemptCount ?? 0,
+        failureReasonBreakdown: data.failureReasonBreakdown ?? [],
+        deniedPassportRows: baseDenied,
+      };
+    }
+    return computeFilteredTopStats(data.reportEvents, passportRoutes, emailToRoute, routeFilter, baseDenied);
+  }, [data, routeFilter, passportRoutes, emailToRoute]);
+
+  const deniedRecoveryByEmail = useMemo((): Record<string, DeniedEmailRecovery> => {
+    if (!data?.reportEvents) return data?.deniedRecoveryByEmail ?? {};
+    const { statusVideos, inHousePassed } = data.reportEvents;
+    if (!isRouteFilterActive(routeFilter)) {
+      return data.deniedRecoveryByEmail ?? computeDeniedRecoveryByEmail(statusVideos, inHousePassed);
+    }
+    const routesByKey = indexPassportRoutes(passportRoutes);
+    const sv = statusVideos.filter((e) =>
+      eventMatchesRouteFilter(e.email, e.passportNumber, routesByKey, emailToRoute, routeFilter)
+    );
+    const ih = inHousePassed.filter((e) =>
+      eventMatchesRouteFilter(e.email, e.passportNumber, routesByKey, emailToRoute, routeFilter)
+    );
+    return computeDeniedRecoveryByEmail(sv, ih);
+  }, [data, routeFilter, passportRoutes, emailToRoute]);
+
+  const routeFilterActive = isRouteFilterActive(routeFilter);
+
   const unresolvedEmails =
     data?.applicantOutcomes
       ?.filter((o) => o.outcome === "pending")
@@ -142,6 +362,12 @@ export default function ApprovedVideosClient() {
     setError(null);
     setLoading(true);
     setData(null);
+    setRouteFilter(EMPTY_ROUTE_FILTER);
+    setPassportRoutes([]);
+    setEmailToRoute(new Map());
+    setRouteFilterOptions(null);
+    setRouteCombinations([]);
+    setRoutesError(null);
 
     const fromMs = new Date(fromStr).getTime();
     const toMs = new Date(toStr).getTime();
@@ -182,16 +408,13 @@ export default function ApprovedVideosClient() {
       <div>
         <h1 className="text-2xl font-semibold text-zinc-900">In-house verification outcomes</h1>
         <p className="text-sm text-zinc-600 mt-1">
-          Applicants come from <code className="text-xs">Solving in-house identity verification</code> in{" "}
-          <code className="text-xs">vfs-global-bot</code>, filtered by job type using the TaskId prefix and{" "}
-          <code className="text-xs">azure-liveness-bot</code> (production) or{" "}
-          <code className="text-xs">azure-liveness-automation-staging</code> (staging) lines{" "}
-          <code className="text-xs">Solving face verification for session … (passport: …)</code> (
-          <code className="text-xs">passport: VERIFICATION</code> = verification; anything else = drop). Staging VFS
-          logs use Loki <code className="text-xs">namespace=&quot;staging&quot;</code>. Final outcomes
-          use <code className="text-xs">In-house identity verification completed</code> /{" "}
-          <code className="text-xs">failed</code> (plus legacy lines). Solver stats use{" "}
-          <code className="text-xs">In-house solver attempt failed</code> per email.
+          Top cards count raw VFS lines in the window: videos from{" "}
+          <code className="text-xs">appointment/idnfystatus</code> response lines (
+          <code className="text-xs">APPROVED</code> / <code className="text-xs">DENIED</code>
+          ), applicants from <code className="text-xs">In-house verification passed</code> and{" "}
+          <code className="text-xs">/idnfystatus never returned APPROVED</code>. Errored video attempts:{" "}
+          <code className="text-xs">Attempt … failed (</code>. Cohort outcomes below still filter by activation + Azure job
+          type (drop vs verification).
         </p>
       </div>
 
@@ -368,6 +591,11 @@ export default function ApprovedVideosClient() {
               </div>
             )}
             <div className="mt-1 text-[11px] text-zinc-500">
+              idnfystatus Loki lines (raw / matched response): {data.totals.idnfyStatusRawLogLines ?? "—"} /{" "}
+              {data.totals.idnfyStatusResponseLogLines ?? "—"} · errored attempt lines:{" "}
+              {data.totals.erroredVideoAttemptCount ?? "—"}
+            </div>
+            <div className="mt-1 text-[11px] text-zinc-500">
               Azure payload logs: {data.totals.azurePayloadLogLines ?? 0} · correlated rows{" "}
               {data.totals.taskPayloadRows ?? 0} (via VFS solving TaskId prefix) ·{" "}
               <code>[RESULT] FAILED</code> lines: {data.totals.azureResultFailedLogLines ?? 0} · InvalidToken jobs
@@ -375,49 +603,213 @@ export default function ApprovedVideosClient() {
             </div>
           </div>
 
-          <div className="grid gap-4 sm:grid-cols-3">
+          <div className="rounded-lg border border-blue-200 bg-blue-50/60 px-4 py-3 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-sm font-medium text-zinc-800">Filter stats by dashboard route</p>
+              {routeFilterActive ? (
+                <span className="text-xs font-medium text-blue-900">Filtered</span>
+              ) : (
+                <span className="text-xs text-zinc-600">All routes (no filter)</span>
+              )}
+            </div>
+            {!dashboardJwtSaved ? (
+              <p className="text-xs text-zinc-600">
+                Sign in with dashboard OTP in the DENIED passports section below to load routes and enable filtering.
+              </p>
+            ) : routesLoading ? (
+              <p className="text-xs text-zinc-600">Loading passport routes from dashboard…</p>
+            ) : routesError ? (
+              <p className="text-xs text-red-700">{routesError}</p>
+            ) : routeFilterOptions ? (
+              <p className="text-xs text-zinc-500">
+                {passportRoutes.length} route(s) in this report on dashboard · pick one combined route or use separate
+                dropdowns (empty = all)
+              </p>
+            ) : null}
+            {routeFilterActive && filtered?.routeFilterCoverage ? (
+              <p className="text-xs text-amber-900 bg-amber-50 border border-amber-100 rounded px-2 py-1">
+                Approved videos in filter: {filtered.routeFilterCoverage.approvedVideosMatched} of{" "}
+                {filtered.routeFilterCoverage.approvedVideosTotal}
+                {filtered.routeFilterCoverage.unmatchedOnDashboard > 0
+                  ? ` (${filtered.routeFilterCoverage.unmatchedOnDashboard} have no dashboard route — excluded)`
+                  : null}
+              </p>
+            ) : null}
+            {routeCombinations.length > 0 ? (
+              <div>
+                <label className="block text-xs font-medium text-zinc-700 mb-1">Route (from → to · category)</label>
+                <select
+                  value={
+                    routeFilter.fromCountry || routeFilter.toCountry || routeFilter.subVisaCategoryName
+                      ? `${routeFilter.fromCountry}|${routeFilter.toCountry}|${routeFilter.subVisaCategoryName}`
+                      : ""
+                  }
+                  onChange={(e) => {
+                    const id = e.target.value;
+                    if (!id) {
+                      setRouteFilter(EMPTY_ROUTE_FILTER);
+                      return;
+                    }
+                    const combo = routeCombinations.find((c) => c.id === id);
+                    if (!combo) return;
+                    setRouteFilter({
+                      fromCountry: combo.fromCountry,
+                      toCountry: combo.toCountry,
+                      subVisaCategoryName: combo.subVisaCategoryName,
+                    });
+                  }}
+                  className="w-full rounded-lg border border-zinc-300 px-2 py-2 text-sm bg-white"
+                >
+                  <option value="">All routes</option>
+                  {routeCombinations.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : null}
+            <div className="grid gap-3 sm:grid-cols-3">
+              <div>
+                <label className="block text-xs font-medium text-zinc-700 mb-1">From country</label>
+                <select
+                  value={routeFilter.fromCountry}
+                  onChange={(e) => setRouteFilter((f) => ({ ...f, fromCountry: e.target.value }))}
+                  disabled={!routeFilterOptions}
+                  className="w-full rounded-lg border border-zinc-300 px-2 py-2 text-sm bg-white disabled:opacity-50"
+                >
+                  <option value="">All</option>
+                  {(routeFilterOptions?.fromCountries ?? []).map((c) => (
+                    <option key={c} value={c}>
+                      {c.toUpperCase()}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-zinc-700 mb-1">To country</label>
+                <select
+                  value={routeFilter.toCountry}
+                  onChange={(e) => setRouteFilter((f) => ({ ...f, toCountry: e.target.value }))}
+                  disabled={!routeFilterOptions}
+                  className="w-full rounded-lg border border-zinc-300 px-2 py-2 text-sm bg-white disabled:opacity-50"
+                >
+                  <option value="">All</option>
+                  {(routeFilterOptions?.toCountries ?? []).map((c) => (
+                    <option key={c} value={c}>
+                      {c.toUpperCase()}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-zinc-700 mb-1">Sub visa category</label>
+                <select
+                  value={routeFilter.subVisaCategoryName}
+                  onChange={(e) => setRouteFilter((f) => ({ ...f, subVisaCategoryName: e.target.value }))}
+                  disabled={!routeFilterOptions}
+                  className="w-full rounded-lg border border-zinc-300 px-2 py-2 text-sm bg-white disabled:opacity-50"
+                >
+                  <option value="">All</option>
+                  {(routeFilterOptions?.subVisaCategories ?? []).map((s) => (
+                    <option key={s} value={s}>
+                      {s}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            {routeFilterActive ? (
+              <button
+                type="button"
+                onClick={() => setRouteFilter(EMPTY_ROUTE_FILTER)}
+                className="text-xs text-blue-800 underline"
+              >
+                Clear route filter
+              </button>
+            ) : null}
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
             <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-5">
-              <div className="text-sm font-medium text-emerald-900">Success</div>
-              <div className="mt-1 text-3xl font-semibold text-emerald-950">{data.totals.successCount}</div>
+              <div className="text-sm font-medium text-emerald-900">Approved videos</div>
+              <div className="mt-1 text-3xl font-semibold text-emerald-950">
+                {filtered?.approvedVideoCount ?? 0}
+              </div>
+              <div className="mt-1 text-xs text-emerald-800">
+                <code className="text-[10px]">idnfystatus</code> · <code className="text-[10px]">status:APPROVED</code>
+              </div>
+            </div>
+            <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-5">
+              <div className="text-sm font-medium text-emerald-900">Approved applicants</div>
+              <div className="mt-1 text-3xl font-semibold text-emerald-950">
+                {filtered?.approvedApplicantCount ?? 0}
+              </div>
+              <div className="mt-1 text-xs text-emerald-800">
+                <code className="text-[10px]">In-house verification passed</code>
+              </div>
             </div>
             <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-5">
-              <div className="text-sm font-medium text-rose-900">Failed — terminal</div>
-              <div className="mt-1 text-3xl font-semibold text-rose-950">{data.totals.failureCount}</div>
-              <div className="mt-1 text-xs text-rose-800">Applicants who did not succeed</div>
+              <div className="text-sm font-medium text-rose-900">Denied videos</div>
+              <div className="mt-1 text-3xl font-semibold text-rose-950">{filtered?.deniedVideoCount ?? 0}</div>
+              <div className="mt-1 text-xs text-rose-800">
+                <code className="text-[10px]">idnfystatus</code> · <code className="text-[10px]">status:DENIED</code>
+              </div>
+            </div>
+            <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-5">
+              <div className="text-sm font-medium text-rose-900">Denied applicants</div>
+              <div className="mt-1 text-3xl font-semibold text-rose-950">
+                {filtered?.deniedApplicantCount ?? 0}
+              </div>
+              <div className="mt-1 text-xs text-rose-800">
+                <code className="text-[10px]">/idnfystatus never returned APPROVED</code>
+              </div>
               <div className="mt-4 pt-3 border-t border-rose-200/80">
-                <div className="text-xs font-medium text-rose-900">In-house solver attempt failures</div>
+                <div className="text-xs font-medium text-rose-900">Errored video attempts</div>
                 <div className="mt-1 text-2xl font-semibold text-rose-950">
-                  {data.totals.terminalFailureLogCount ?? "—"}
+                  {filtered?.erroredVideoAttemptCount ?? 0}
                 </div>
                 <div className="mt-1 text-[11px] text-rose-800">
-                  Total <code className="text-[10px]">In-house solver attempt failed</code> lines for applicants in the
-                  failed cohort (same window).
+                  <code className="text-[10px]">Attempt … failed (</code> in window
                 </div>
               </div>
             </div>
-            <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-5">
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-3">
+            <div className="rounded-xl border border-zinc-200 bg-white px-4 py-4">
+              <div className="text-sm font-medium text-zinc-800">Cohort success</div>
+              <div className="mt-1 text-2xl font-semibold text-zinc-950">{data.totals.successCount}</div>
+              <div className="mt-1 text-xs text-zinc-600">Activation sessions with terminal pass</div>
+            </div>
+            <div className="rounded-xl border border-zinc-200 bg-white px-4 py-4">
+              <div className="text-sm font-medium text-zinc-800">Cohort failed</div>
+              <div className="mt-1 text-2xl font-semibold text-zinc-950">{data.totals.failureCount}</div>
+              <div className="mt-1 text-xs text-zinc-600">
+                Solver attempt failures (failed cohort): {data.totals.terminalFailureLogCount ?? "—"}
+              </div>
+            </div>
+            <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-4">
               <div className="text-sm font-medium text-amber-900">Unresolved</div>
-              <div className="mt-1 text-3xl font-semibold text-amber-950">{data.totals.pendingCount}</div>
-              <div className="mt-1 text-xs text-amber-800">Started solve, no terminal success/failure in window</div>
+              <div className="mt-1 text-2xl font-semibold text-amber-950">{data.totals.pendingCount}</div>
+              <div className="mt-1 text-xs text-amber-800">No terminal outcome in window</div>
               {unresolvedEmails.length > 0 && (
-                <div className="mt-4 pt-3 border-t border-amber-200/80">
-                  <div className="text-xs font-medium text-amber-900">Session emails</div>
-                  <div className="mt-2 max-h-36 overflow-auto rounded border border-amber-200 bg-amber-100/40 px-2 py-1.5">
-                    {unresolvedEmails.map((email) => (
-                      <div key={email} className="font-mono text-[11px] text-amber-900 break-all">
-                        {email}
-                      </div>
-                    ))}
-                  </div>
+                <div className="mt-3 max-h-24 overflow-auto rounded border border-amber-200 bg-amber-100/40 px-2 py-1">
+                  {unresolvedEmails.map((email) => (
+                    <div key={email} className="font-mono text-[10px] text-amber-900 break-all">
+                      {email}
+                    </div>
+                  ))}
                 </div>
               )}
             </div>
           </div>
 
-          {(data.failureReasonBreakdown ?? []).length > 0 && (
+          {(filtered?.failureReasonBreakdown ?? []).length > 0 && (
             <div>
               <h2 className="text-sm font-medium text-zinc-800 mb-2">
-                Solver errors (failed applicants, <code className="text-[10px]">Error=</code> from in-house solver)
+                Errored video attempts by reason (<code className="text-[10px]">Attempt … failed</code> in window — same
+                total as card above)
               </h2>
               <div className="overflow-x-auto rounded-lg border border-zinc-200 bg-white">
                 <table className="min-w-full text-xs">
@@ -429,7 +821,7 @@ export default function ApprovedVideosClient() {
                     </tr>
                   </thead>
                   <tbody>
-                    {(data.failureReasonBreakdown ?? []).map((row) => (
+                    {(filtered?.failureReasonBreakdown ?? []).map((row) => (
                       <tr key={row.reason} className="border-t border-zinc-100 align-top">
                         <td className="px-3 py-2 font-mono font-semibold text-zinc-900 whitespace-nowrap w-16">
                           {row.count}
@@ -476,6 +868,14 @@ export default function ApprovedVideosClient() {
               </div>
             </div>
           )}
+
+          {(filtered?.deniedVideoCount ?? 0) > 0 || (filtered?.deniedPassportRows?.length ?? 0) > 0 ? (
+            <DeniedPassportsByPassportSection
+              rows={filtered?.deniedPassportRows ?? []}
+              passportResolveErrors={data.deniedPassportErrors}
+              recoveryByEmail={deniedRecoveryByEmail}
+            />
+          ) : null}
 
         </div>
       )}

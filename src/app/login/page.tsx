@@ -5,7 +5,7 @@ type LoginPageProps = {
 };
 
 export default function LoginPage({ searchParams }: LoginPageProps) {
-  const from = searchParams?.from || "/generate";
+  const from = searchParams?.from || "/logs";
   return <LoginForm from={from} />;
 }
 

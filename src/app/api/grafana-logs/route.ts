@@ -117,7 +117,8 @@ export async function POST(req: NextRequest) {
   const useProvidedCookie = typeof body.cookie === "string" && body.cookie.trim().length > 0;
 
   const query = typeof body.query === "string" ? body.query : "";
-  const target = typeof body.target === "string" ? body.target.trim() || "liveness-bot" : "liveness-bot";
+  const target =
+    typeof body.target === "string" ? body.target.trim() || "azure-liveness-bot" : "azure-liveness-bot";
   const additionalFilter = typeof body.additionalFilter === "string" ? body.additionalFilter.trim() : "";
 
   function parseTime(v: number | string | undefined): number | null {

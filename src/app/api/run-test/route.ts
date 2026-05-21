@@ -92,6 +92,7 @@ export async function POST(request: Request) {
   const sessionApiUrl: string | undefined =
     body.sessionApiUrl || process.env.SESSION_API_URL;
   const streamSuffix: string | undefined = body.streamSuffix;
+  const streamKeyOverride: string | undefined = typeof body.streamKey === "string" && body.streamKey.trim() ? body.streamKey.trim() : undefined;
   const videoUrls: string[] = body.videoUrls || [];
   const repetitions: number = body.repetitions || 1;
   const isFirstVerification: boolean = !!body.isFirstVerification;
@@ -110,9 +111,9 @@ export async function POST(request: Request) {
       { status: 400 },
     );
   }
-  if (!streamSuffix) {
+  if (!streamSuffix && !streamKeyOverride) {
     return NextResponse.json(
-      { error: "Stream key suffix is required" },
+      { error: "Stream key suffix or streamKey is required" },
       { status: 400 },
     );
   }
@@ -125,7 +126,7 @@ export async function POST(request: Request) {
 
   const streamKeyPrefix =
     process.env.STREAM_KEY_PREFIX ?? "vfs:identity-verification:stream:";
-  const streamKey = `${streamKeyPrefix}${streamSuffix}`;
+  const streamKey = streamKeyOverride ?? `${streamKeyPrefix}${streamSuffix}`;
 
   const expandedVideoUrls = Array.from({ length: repetitions }, () => videoUrls)
     .flat()
@@ -175,7 +176,11 @@ export async function POST(request: Request) {
       const message = {
         sessionId: sessionData.sessionId,
         region: sessionData.region,
-        credentials: sessionData.credentials,
+        useRealToken: false,
+        firstTry: false,
+        isVerificationJob: true,
+        isTesting: false,
+        credentials: "eyJhbGciOiJFUzI1NiIsImtpZCI6ImtleTEiLCJ0eXAiOiJKV1QifQ.eyJyZWdpb24iOiJlYXN0dXMiLCJzdWJzY3JpcHRpb24taWQiOiI3YTI1NjEwZGVhZjk0M2U2YmZlMmVlNjQyN2I3MDFlYiIsInByb2R1Y3QtaWQiOiJGYWNlLlMwIiwiYWxsb3dlZC1wYXRocyI6Ilt7XCJwYXRoXCI6XCJmYWNlL3YxLjIvc2Vzc2lvbi9zdGFydFwiLFwibWV0aG9kXCI6XCJQT1NUXCIsXCJxdW90YVwiOjEsXCJjYWxsUmF0ZVJlbmV3YWxQZXJpb2RcIjo2MCxcImNhbGxSYXRlTGltaXRcIjoxfSx7XCJwYXRoXCI6XCJmYWNlL3YxLjIvc2Vzc2lvbi9hdHRlbXB0L2VuZFwiLFwibWV0aG9kXCI6XCJQT1NUXCIsXCJxdW90YVwiOjMsXCJjYWxsUmF0ZVJlbmV3YWxQZXJpb2RcIjo1LFwiY2FsbFJhdGVMaW1pdFwiOjF9LHtcInBhdGhcIjpcImZhY2UvdjEuMi9kZXRlY3RMaXZlbmVzc1dpdGhWZXJpZnkvc2luZ2xlTW9kYWxcIixcIm1ldGhvZFwiOlwicG9zdFwiLFwicXVvdGFcIjozLFwiY2FsbFJhdGVSZW5ld2FsUGVyaW9kXCI6NSxcImNhbGxSYXRlTGltaXRcIjoxfV0iLCJhenVyZS1yZXNvdXJjZS1pZCI6Ii9zdWJzY3JpcHRpb25zLzU3ZGU1M2Q3LTViN2YtNDQwNi1iODY5LTU1ZTJhZDgzMWY5Mi9yZXNvdXJjZUdyb3Vwcy92ZnMtaWRwL3Byb3ZpZGVycy9NaWNyb3NvZnQuQ29nbml0aXZlU2VydmljZXMvYWNjb3VudHMvdmZzLWxpdmVuZXNzLTAxIiwic2lkIjoiOGNhYjA5MTQtOGZkNy00MGEwLTk3NDUtN2YyYzA4OTQyYmRkIiwiZmFjZSI6IntcImVuZHBvaW50XCI6XCJodHRwczovL3Zmcy1saXZlbmVzcy0wMS5jb2duaXRpdmVzZXJ2aWNlcy5henVyZS5jb21cIixcInNlc3Npb25UeXBlXCI6XCJMaXZlbmVzc1dpdGhWZXJpZnlcIixcImNsaWVudENsYWltc1wiOntcInZlcmlmeUltYWdlUHJvdmlkZWRcIjp0cnVlLFwibGl2ZW5lc3NPcGVyYXRpb25Nb2RlXCI6XCJQYXNzaXZlQWN0aXZlXCIsXCJkY2ljXCI6ZmFsc2UsXCJjc2ZjXCI6XCIxOzEwOzIwMjUwOFwifX0iLCJhdWQiOiJ1cm46bXMuZmFjZVNlc3Npb25Ub2tlbiIsImV4cCI6MTc3NjA3NzU3MiwiaWF0IjoxNzc2MDc3MjcyLCJpc3MiOiJ1cm46bXMuY29nbml0aXZlc2VydmljZXMifQ.QLAe6oj7580ztAE7po1kADqU72ydL5PNQSFIPNvbYhVm8TdOcAwq05apAV7XzZExwh9XwEInKw-1NkZ5l_uCdg",
         videoUrl,
         passportNumber: generateRandomPassportNumber(),
         isFirstVerification,

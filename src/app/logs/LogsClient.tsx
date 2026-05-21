@@ -13,7 +13,7 @@ type LivenessJobMetrics = {
   websocketDisconnect?: number;
 };
 
-const SOLVER_OPTIONS = ["liveness-bot", "aws-liveness-automation-staging"] as const;
+const SOLVER_OPTIONS = ["azure-liveness-bot", "azure-liveness-automation-staging"] as const;
 
 const INTERVAL_MS: Record<string, number> = {
   "15m": 15 * 60 * 1000,
@@ -169,7 +169,7 @@ export default function LogsClient() {
   const defaultTo = new Date(now);
   const [fromStr, setFromStr] = useState(() => toDatetimeLocal(defaultFrom));
   const [toStr, setToStr] = useState(() => toDatetimeLocal(defaultTo));
-  const [solverTarget, setSolverTarget] = useState<(typeof SOLVER_OPTIONS)[number]>("liveness-bot");
+  const [solverTarget, setSolverTarget] = useState<(typeof SOLVER_OPTIONS)[number]>("azure-liveness-bot");
   const [additionalFilter, setAdditionalFilter] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -320,9 +320,9 @@ export default function LogsClient() {
             value={solverTarget}
             onChange={(e) =>
               setSolverTarget(
-                e.target.value === "aws-liveness-automation-staging"
-                  ? "aws-liveness-automation-staging"
-                  : "liveness-bot"
+                e.target.value === "azure-liveness-automation-staging"
+                  ? "azure-liveness-automation-staging"
+                  : "azure-liveness-bot"
               )
             }
             className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900"

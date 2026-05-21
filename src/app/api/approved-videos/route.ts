@@ -1,5 +1,32 @@
 import { NextRequest, NextResponse } from "next/server";
 import { cookies } from "next/headers";
+import {
+  buildLokiLineFilterExpr,
+  IDNFY_STATUS_LOKI_FILTER,
+  IDNFY_STATUS_RESPONSE_LOKI_FILTER,
+  fetchLokiQueryWithRetry,
+  LOKI_MAX_LINES_PER_QUERY,
+  LOKI_QUERY_BATCH_SIZE,
+  isErroredVideoAttemptLine,
+  runInBatches,
+  isIdnfyStatusApprovedLine,
+  isIdnfyStatusDeniedLine,
+  isIdnfyStatusResponseLine,
+  parseIdnfyStatusFromLine,
+  parseLogsFromResponse,
+} from "@/lib/grafanaLoki";
+import { buildDeniedPassportRows, type DeniedPassportRow } from "@/lib/deniedPassports";
+import { computeDeniedRecoveryByEmail } from "@/lib/deniedRecovery";
+import { lookupPassportsByEmailBatch } from "@/lib/enrichPassportsByEmail";
+import {
+  buildEmailToPassportMap,
+  extractEmailFromIdnfyOrVfsLine,
+  mergeEmailToPassportMap,
+  resolvePassportForLog,
+  type EmailStatEvent,
+  type ErroredAttemptEvent,
+  type StatusVideoEvent,
+} from "@/lib/reportEvents";
 
 const GRAFANA_URL = process.env.GRAFANA_URL ?? "";
 const GRAFANA_USER = process.env.GRAFANA_USER ?? "admin";
@@ -16,6 +43,7 @@ type LogEntry = { time: string; line: string };
 
 /** vfs-global-bot correlation (in-house verification logs) */
 const VFS_BOT_APP = "vfs-global-bot";
+const ERRORED_ATTEMPT_LOKI_FILTER = "Attempt";
 const AZURE_LIVENESS_BOT_APP_PROD = "azure-liveness-bot";
 /** Staging Azure worker app label in Loki (per ops/grafana). */
 const AZURE_LIVENESS_BOT_APP_STAGING = "azure-liveness-automation-staging";
@@ -71,68 +99,6 @@ function getCookieHeader(setCookie: string[]): string {
     .map((c) => c.split(";")[0].trim())
     .filter(Boolean)
     .join("; ");
-}
-
-function parseLogsFromResponse(body: unknown): LogEntry[] {
-  const logs: LogEntry[] = [];
-  const o = body as Record<string, unknown>;
-
-  const results = o?.results as Record<string, { frames?: Array<{ data?: { values?: unknown[] } }> }> | undefined;
-  if (results && typeof results === "object") {
-    for (const refId of Object.keys(results)) {
-      const frames = results[refId]?.frames;
-      if (!Array.isArray(frames)) continue;
-      for (const frame of frames) {
-        const values = frame?.data?.values;
-        if (!Array.isArray(values) || values.length < 2) continue;
-        const schema = (frame as { schema?: { fields?: Array<{ name?: string }> } })?.schema;
-        let timeIdx = 0;
-        let lineIdx = 1;
-        if ((schema?.fields?.length ?? 0) >= 2) {
-          const names = (schema?.fields ?? []).map((f) => (f?.name ?? "").toLowerCase());
-          const tIdx = names.indexOf("time");
-          const lIdx = names.findIndex((n) => n === "line" || n === "value");
-          if (tIdx >= 0) timeIdx = tIdx;
-          if (lIdx >= 0) lineIdx = lIdx;
-        }
-        const times = values[timeIdx] as (number | string)[];
-        const lines = values[lineIdx] as string[];
-        if (!Array.isArray(times) || !Array.isArray(lines)) continue;
-        for (let i = 0; i < Math.min(times.length, lines.length); i++) {
-          const t = times[i];
-          let ts: number =
-            typeof t === "number" && Number.isFinite(t)
-              ? t
-              : typeof t === "string" && /^\d+$/.test(t)
-                ? parseInt(t, 10)
-                : typeof t === "string"
-                  ? Date.parse(t)
-                  : Number(t);
-          if (!Number.isFinite(ts)) continue;
-          if (ts > 1e15) ts = Math.floor(ts / 1e6);
-          const d = new Date(ts);
-          if (!Number.isFinite(d.getTime())) continue;
-          logs.push({ time: d.toISOString(), line: String(lines[i] ?? "") });
-        }
-      }
-    }
-  }
-
-  const data = o?.data as { result?: Array<{ values?: [string, string][] }> } | undefined;
-  if (data?.result && Array.isArray(data.result) && logs.length === 0) {
-    for (const stream of data.result) {
-      const values = stream?.values;
-      if (!Array.isArray(values)) continue;
-      for (const [ns, line] of values) {
-        const ts = parseInt(String(ns).slice(0, 13), 10);
-        const d = new Date(ts);
-        if (!Number.isFinite(d.getTime())) continue;
-        logs.push({ time: d.toISOString(), line: String(line ?? "") });
-      }
-    }
-  }
-
-  return logs.sort((a, b) => a.time.localeCompare(b.time));
 }
 
 function dedupeLogEntries(entries: LogEntry[]): LogEntry[] {
@@ -201,6 +167,9 @@ function normalizeFailureReasonKey(raw: string): string {
 
 /** Returns one or more normalized failure reason keys (concurrent warning => multiple entries). */
 function extractFailureReasonKeys(line: string): string[] {
+  if (isIdnfyStatusNeverFailure(line)) {
+    return ["/idnfystatus never"];
+  }
   if (/Attempt\s+\d+\/\d+\s*:\s*failed/i.test(line)) {
     const dash = line.match(/Attempt\s+\d+\/\d+\s*:\s*failed\s*\([^)]*\)\s*-\s*(.+)$/i);
     const payload = dash?.[1]?.trim();
@@ -228,6 +197,9 @@ function extractFailureReasonKeys(line: string): string[] {
 }
 
 function extractFailureReasonKey(line: string): string | null {
+  if (isIdnfyStatusNeverFailure(line)) {
+    return "/idnfystatus never";
+  }
   if (isNewInHouseIdentityTerminalFailure(line)) {
     const inner = line.match(/in-house verification failed\s*(\[[^\]]+\])/i);
     if (inner?.[1]) {
@@ -509,6 +481,11 @@ function isConcurrentAttemptsWarnFailure(line: string): boolean {
   return true;
 }
 
+/** New terminal-fail shape as one phrase: `/idnfystatus never` */
+function isIdnfyStatusNeverFailure(line: string): boolean {
+  return /\/idnfystatus\s+never\b/i.test(line);
+}
+
 /** New log shape: terminal failure in one line (e.g. not approved after in-house solves). */
 function isNewInHouseIdentityTerminalFailure(line: string): boolean {
   if (!/in-house identity verification failed/i.test(line)) return false;
@@ -526,16 +503,21 @@ function isNewInHouseIdentityTerminalFailure(line: string): boolean {
   return false;
 }
 
-function isInHouseIdentityCompletedLine(line: string): boolean {
-  return /in-house identity verification completed\b/i.test(line);
-}
-
 function isInHouseVerificationPassedLine(line: string): boolean {
   return /in-house verification passed\b/i.test(line);
 }
 
+/** e.g. `In-house verification passed [solves=1/2, 13524ms]` */
+function parseInHouseVerificationPassedMs(line: string): number | null {
+  const m = line.match(/in-house verification passed\s*\[[^\]]*,\s*(\d+)\s*ms\]/i);
+  if (!m?.[1]) return null;
+  const n = parseInt(m[1], 10);
+  return Number.isFinite(n) ? n : null;
+}
+
 /** vfs-global-bot prose: contains `status not approved` (e.g. Identity verification failed (status not approved)). */
 function isNotAcceptedStyleFailure(line: string): boolean {
+  if (isIdnfyStatusNeverFailure(line)) return true;
   if (isNewInHouseIdentityTerminalFailure(line)) return true;
   if (
     line.includes("In-house identity verification attempt failed") &&
@@ -652,16 +634,6 @@ function buildSessionSolveKindMap(azureLogs: LogEntry[]): Map<string, SolveKind>
   return map;
 }
 
-function parseSuccessfulSolvesFraction(line: string): { n?: number; m?: number } {
-  const m = line.match(/SuccessfulSolves\s*=\s*(\d+)\s*\/\s*(\d+)/i);
-  const n = m?.[1] ? parseInt(m[1], 10) : NaN;
-  const mm = m?.[2] ? parseInt(m[2], 10) : NaN;
-  return {
-    n: Number.isFinite(n) ? n : undefined,
-    m: Number.isFinite(mm) ? mm : undefined,
-  };
-}
-
 function classifyVfsVerificationLine(
   line: string
 ):
@@ -671,16 +643,6 @@ function classifyVfsVerificationLine(
   | null {
   if (/Activated in-house identity verification token/i.test(line) && /\[ReferenceNumber:/i.test(line)) {
     return { kind: "solving" };
-  }
-  const attemptPass = line.match(/\bAttempt\s+(\d+)\s*\/\s*(\d+)\s*:\s*passed\b/i);
-  if (attemptPass) {
-    const submitN = parseInt(attemptPass[1], 10);
-    const submitM = parseInt(attemptPass[2], 10);
-    return {
-      kind: "success",
-      submitN: Number.isFinite(submitN) ? submitN : undefined,
-      submitM: Number.isFinite(submitM) ? submitM : undefined,
-    };
   }
   const attemptFail = line.match(/\bAttempt\s+(\d+)\s*\/\s*(\d+)\s*:\s*failed\b/i);
   if (attemptFail) {
@@ -703,30 +665,10 @@ function classifyVfsVerificationLine(
     }
     return { kind: "success" };
   }
-  if (isInHouseIdentityCompletedLine(line)) {
-    const m = line.match(/SubmitAttempt\s*=\s*(\d+)\s*\/\s*(\d+)/i);
-    const submitN = m?.[1] ? parseInt(m[1], 10) : NaN;
-    const submitM = m?.[2] ? parseInt(m[2], 10) : NaN;
-    if (Number.isFinite(submitN) && Number.isFinite(submitM)) {
-      return { kind: "success", submitN, submitM };
-    }
-    const ss = parseSuccessfulSolvesFraction(line);
-    if (ss.n != null && ss.m != null && ss.m > 0) {
-      return { kind: "success", submitN: ss.n, submitM: ss.m };
-    }
-    return { kind: "success" };
-  }
-  if (line.includes("Identity verification completed successfully")) {
-    const m = line.match(/SubmitAttempt\s*=\s*(\d+)\s*\/\s*(\d+)/i);
-    const submitN = m?.[1] ? parseInt(m[1], 10) : NaN;
-    const submitM = m?.[2] ? parseInt(m[2], 10) : NaN;
-    return {
-      kind: "success",
-      submitN: Number.isFinite(submitN) ? submitN : undefined,
-      submitM: Number.isFinite(submitM) ? submitM : undefined,
-    };
-  }
   if (isNewInHouseIdentityTerminalFailure(line)) {
+    return { kind: "fail", failN: 1, failM: 1 };
+  }
+  if (isIdnfyStatusNeverFailure(line)) {
     return { kind: "fail", failN: 1, failM: 1 };
   }
   if (isConcurrentAttemptsWarnFailure(line)) {
@@ -1017,6 +959,99 @@ function lokiLabelValue(v: string): string {
   return v.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
+const LOKI_DEBUG_REQUEST_IDS = new Set([
+  "approved_vfs_idnfystatus_all",
+  "approved_vfs_idnfystatus_response",
+  "approved_vfs_idnfystatus_never",
+  "approved_vfs_inhouse_ver",
+  "approved_vfs_attempt",
+]);
+
+function logLokiQueryResult(
+  requestId: string,
+  expr: string,
+  httpStatus: number,
+  raw: unknown,
+  logs: LogEntry[]
+): void {
+  if (!LOKI_DEBUG_REQUEST_IDS.has(requestId)) return;
+  console.log(`\n[approved-videos][loki] ${requestId}`);
+  console.log(`  expr: ${expr}`);
+  console.log(`  http: ${httpStatus}`);
+  console.log(`  parsed lines: ${logs.length}`);
+  if (httpStatus !== 200) {
+    const errSnippet = JSON.stringify(raw).slice(0, 800);
+    console.log(`  error body: ${errSnippet}`);
+  }
+  if (logs.length === 0) {
+    const o = raw as Record<string, unknown>;
+    console.log(`  raw top-level keys: ${Object.keys(o).join(", ") || "(empty)"}`);
+    const results = o?.results as Record<string, { frames?: unknown[] }> | undefined;
+    if (results) {
+      for (const refId of Object.keys(results)) {
+        const frames = results[refId]?.frames;
+        console.log(`  results.${refId}.frames: ${Array.isArray(frames) ? frames.length : "n/a"}`);
+        if (Array.isArray(frames) && frames[0]) {
+          const f0 = frames[0] as { data?: { values?: unknown[] }; schema?: { fields?: Array<{ name?: string }> } };
+          const vals = f0?.data?.values;
+          const fields = f0?.schema?.fields?.map((x) => x?.name).join(", ");
+          console.log(`  frame[0] fields: ${fields ?? "n/a"}`);
+          if (Array.isArray(vals)) {
+            console.log(`  frame[0] value columns: ${vals.length}, row counts: ${vals.map((c) => (Array.isArray(c) ? c.length : 0)).join(", ")}`);
+          }
+        }
+      }
+    }
+    return;
+  }
+  const sampleN = Math.min(8, logs.length);
+  for (let i = 0; i < sampleN; i++) {
+    const line = logs[i].line;
+    const preview = line.length > 700 ? `${line.slice(0, 700)}…` : line;
+    console.log(`  [${i}] ${logs[i].time}`);
+    console.log(`      ${preview}`);
+  }
+  if (logs.length > sampleN) {
+    console.log(`  … +${logs.length - sampleN} more`);
+  }
+}
+
+function logIdnfyParseDebug(
+  idnfyStatusResponseLogs: LogEntry[],
+  idnfyStatusResponseStrictLogs: LogEntry[],
+  merged: LogEntry[],
+  responseLines: LogEntry[],
+  approvedVideoCount: number,
+  deniedVideoCount: number
+): void {
+  console.log("\n[approved-videos][idnfystatus] parse summary");
+  console.log(`  query all: ${idnfyStatusResponseLogs.length}`);
+  console.log(`  query +Response: ${idnfyStatusResponseStrictLogs.length}`);
+  console.log(`  merged deduped: ${merged.length}`);
+  console.log(`  matched response: ${responseLines.length}`);
+  console.log(`  approved videos: ${approvedVideoCount}`);
+  console.log(`  denied videos: ${deniedVideoCount}`);
+
+  const rejected = merged.filter((e) => !isIdnfyStatusResponseLine(e.line));
+  if (rejected.length > 0) {
+    console.log(`  rejected as non-response (${rejected.length}), first 5:`);
+    for (let i = 0; i < Math.min(5, rejected.length); i++) {
+      const line = rejected[i].line;
+      const preview = line.length > 500 ? `${line.slice(0, 500)}…` : line;
+      console.log(`    [${i}] status=${parseIdnfyStatusFromLine(line) ?? "—"} | ${preview}`);
+    }
+  }
+
+  if (responseLines.length > 0) {
+    console.log("  matched response samples (first 3):");
+    for (let i = 0; i < Math.min(3, responseLines.length); i++) {
+      const line = responseLines[i].line;
+      const preview = line.length > 500 ? `${line.slice(0, 500)}…` : line;
+      console.log(`    [${i}] status=${parseIdnfyStatusFromLine(line) ?? "—"} | ${preview}`);
+    }
+  }
+}
+
 async function queryLogs(params: {
   base: string;
   cookieHeader: string;
@@ -1025,10 +1060,23 @@ async function queryLogs(params: {
   app: string;
   /** When set, stream selector is `{namespace, app}` (staging VFS etc.). */
   lokiNamespace?: string | null;
-  query: string;
+  /** One or more Loki line filters (`|=`), applied in order. */
+  query: string | string[];
   requestId?: string;
+  maxLines?: number;
 }): Promise<LogEntry[]> {
-  const { base, cookieHeader, from, to, app, lokiNamespace, query, requestId = "approved_videos_1" } = params;
+  const {
+    base,
+    cookieHeader,
+    from,
+    to,
+    app,
+    lokiNamespace,
+    query,
+    requestId = "approved_videos_1",
+    maxLines = LOKI_MAX_LINES_PER_QUERY,
+  } = params;
+  const cappedMaxLines = Math.min(maxLines, LOKI_MAX_LINES_PER_QUERY);
   const headers: Record<string, string> = {
     "User-Agent": "Mozilla/5.0 (compatible; Approved-Videos-UI/1.0)",
     "Accept": "application/json",
@@ -1046,14 +1094,15 @@ async function queryLogs(params: {
     lokiNamespace && lokiNamespace.trim().length > 0
       ? `{namespace="${lokiLabelValue(lokiNamespace.trim())}", app="${appEsc}"}`
       : `{app="${appEsc}"}`;
-  const expr = `${selector} |= \`${query.replace(/`/g, "\\`")}\``;
+  const expr = buildLokiLineFilterExpr(selector, query);
   const queryBody = {
     queries: [
       {
         expr,
         queryType: "range",
         refId: "logs",
-        maxLines: 5000,
+        maxLines: cappedMaxLines,
+        direction: "backward",
         datasource: { type: "loki", uid: LOKI_DATASOURCE_UID },
         datasourceId: 1,
         intervalMs: to - from,
@@ -1062,15 +1111,14 @@ async function queryLogs(params: {
     from: String(from),
     to: String(to),
   };
-  const res = await fetch(`${base}/api/ds/query?ds_type=loki&requestId=${encodeURIComponent(requestId)}`, {
-    method: "POST",
+  const { httpStatus, raw, logs } = await fetchLokiQueryWithRetry({
+    url: `${base}/api/ds/query?ds_type=loki&requestId=${encodeURIComponent(requestId)}`,
     headers,
-    body: JSON.stringify(queryBody),
-    // @ts-expect-error Node fetch may accept this for self-signed
-    rejectUnauthorized: false,
+    body: queryBody,
+    requestId,
   });
-  const raw = await res.json().catch(() => ({}));
-  return parseLogsFromResponse(raw);
+  logLokiQueryResult(requestId, expr, httpStatus, raw, logs);
+  return logs;
 }
 
 export async function POST(req: NextRequest) {
@@ -1139,11 +1187,158 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Grafana login failed (no session cookie)" }, { status: 502 });
   }
 
+  const lokiQueryTasks = [
+    () =>
+      queryLogs({
+        base,
+        cookieHeader,
+        from,
+        to,
+        app: target,
+        lokiNamespace: vfsLokiNamespace,
+        query: "Activated in-house identity verification token",
+        requestId: "approved_vfs_activation",
+      }),
+    () =>
+      queryLogs({
+        base,
+        cookieHeader,
+        from,
+        to,
+        app: target,
+        lokiNamespace: vfsLokiNamespace,
+        query: "In-house identity",
+        requestId: "approved_vfs_identity_misc",
+      }),
+    () =>
+      queryLogs({
+        base,
+        cookieHeader,
+        from,
+        to,
+        app: target,
+        lokiNamespace: vfsLokiNamespace,
+        query: "In-house identity verification failed",
+        requestId: "approved_vfs_identity_failed",
+      }),
+    () =>
+      queryLogs({
+        base,
+        cookieHeader,
+        from,
+        to,
+        app: target,
+        lokiNamespace: vfsLokiNamespace,
+        query: "/idnfystatus never",
+        requestId: "approved_vfs_idnfystatus_never",
+      }),
+    () =>
+      queryLogs({
+        base,
+        cookieHeader,
+        from,
+        to,
+        app: target,
+        lokiNamespace: vfsLokiNamespace,
+        query: IDNFY_STATUS_LOKI_FILTER,
+        requestId: "approved_vfs_idnfystatus_all",
+        maxLines: LOKI_MAX_LINES_PER_QUERY,
+      }),
+    () =>
+      queryLogs({
+        base,
+        cookieHeader,
+        from,
+        to,
+        app: target,
+        lokiNamespace: vfsLokiNamespace,
+        query: IDNFY_STATUS_RESPONSE_LOKI_FILTER,
+        requestId: "approved_vfs_idnfystatus_response",
+        maxLines: LOKI_MAX_LINES_PER_QUERY,
+      }),
+    () =>
+      queryLogs({
+        base,
+        cookieHeader,
+        from,
+        to,
+        app: target,
+        lokiNamespace: vfsLokiNamespace,
+        query: "In-house solver",
+        requestId: "approved_vfs_solver",
+      }),
+    () =>
+      queryLogs({
+        base,
+        cookieHeader,
+        from,
+        to,
+        app: target,
+        lokiNamespace: vfsLokiNamespace,
+        query: "In-house ver",
+        requestId: "approved_vfs_inhouse_ver",
+      }),
+    () =>
+      queryLogs({
+        base,
+        cookieHeader,
+        from,
+        to,
+        app: target,
+        lokiNamespace: vfsLokiNamespace,
+        query: ERRORED_ATTEMPT_LOKI_FILTER,
+        requestId: "approved_vfs_attempt",
+        maxLines: LOKI_MAX_LINES_PER_QUERY,
+      }),
+    () =>
+      queryLogs({
+        base,
+        cookieHeader,
+        from,
+        to,
+        app: azureLivenessApp,
+        query: "Solving face verification for session",
+        requestId: "approved_azure_liveness",
+      }),
+    () =>
+      queryLogs({
+        base,
+        cookieHeader,
+        from,
+        to,
+        app: azureLivenessApp,
+        query: "[REDIS][PAYLOAD]",
+        requestId: "approved_azure_payload",
+      }),
+    () =>
+      queryLogs({
+        base,
+        cookieHeader,
+        from,
+        to,
+        app: azureLivenessApp,
+        query: "[RESULT] FAILED",
+        requestId: "approved_azure_result_failed",
+      }),
+    () =>
+      queryLogs({
+        base,
+        cookieHeader,
+        from,
+        to,
+        app: azureLivenessApp,
+        query: "Uploaded",
+        requestId: "approved_azure_recording",
+      }),
+  ];
+
   const [
     activationLogs,
     identityMiscLogs,
     identityFailTerminalLogs,
-    legacySuccessLogs,
+    idnfyStatusLogs,
+    idnfyStatusResponseLogs,
+    idnfyStatusResponseStrictLogs,
     solverLogsAll,
     verificationPassedLogs,
     vfsAttemptLogs,
@@ -1151,132 +1346,75 @@ export async function POST(req: NextRequest) {
     azurePayloadLogs,
     azureResultFailedLogs,
     azureRecordingLogs,
-  ] =
-    await Promise.all([
-    queryLogs({
-      base,
-      cookieHeader,
-      from,
-      to,
-      app: target,
-      lokiNamespace: vfsLokiNamespace,
-      query: "Activated in-house identity verification token",
-      requestId: "approved_vfs_activation",
-    }),
-    queryLogs({
-      base,
-      cookieHeader,
-      from,
-      to,
-      app: target,
-      lokiNamespace: vfsLokiNamespace,
-      query: "In-house identity",
-      requestId: "approved_vfs_identity_misc",
-    }),
-    queryLogs({
-      base,
-      cookieHeader,
-      from,
-      to,
-      app: target,
-      lokiNamespace: vfsLokiNamespace,
-      query: "In-house identity verification failed",
-      requestId: "approved_vfs_identity_failed",
-    }),
-    queryLogs({
-      base,
-      cookieHeader,
-      from,
-      to,
-      app: target,
-      lokiNamespace: vfsLokiNamespace,
-      query: "Identity verification completed successfully",
-      requestId: "approved_vfs_success",
-    }),
-    queryLogs({
-      base,
-      cookieHeader,
-      from,
-      to,
-      app: target,
-      lokiNamespace: vfsLokiNamespace,
-      query: "In-house solver",
-      requestId: "approved_vfs_solver",
-    }),
-    queryLogs({
-      base,
-      cookieHeader,
-      from,
-      to,
-      app: target,
-      lokiNamespace: vfsLokiNamespace,
-      query: "In-house verification passed",
-      requestId: "approved_vfs_verification_passed",
-    }),
-    queryLogs({
-      base,
-      cookieHeader,
-      from,
-      to,
-      app: target,
-      lokiNamespace: vfsLokiNamespace,
-      query: "Attempt",
-      requestId: "approved_vfs_attempt",
-    }),
-    queryLogs({
-      base,
-      cookieHeader,
-      from,
-      to,
-      app: azureLivenessApp,
-      query: "Solving face verification for session",
-      requestId: "approved_azure_liveness",
-    }),
-    queryLogs({
-      base,
-      cookieHeader,
-      from,
-      to,
-      app: azureLivenessApp,
-      query: "[REDIS][PAYLOAD]",
-      requestId: "approved_azure_payload",
-    }),
-    queryLogs({
-      base,
-      cookieHeader,
-      from,
-      to,
-      app: azureLivenessApp,
-      query: "[RESULT] FAILED",
-      requestId: "approved_azure_result_failed",
-    }),
-    queryLogs({
-      base,
-      cookieHeader,
-      from,
-      to,
-      app: azureLivenessApp,
-      query: "Uploaded",
-      requestId: "approved_azure_recording",
-    }),
+  ] = await runInBatches(lokiQueryTasks, LOKI_QUERY_BATCH_SIZE);
+
+  const idnfyStatusMergedRaw = dedupeLogEntries([
+    ...idnfyStatusResponseLogs,
+    ...idnfyStatusResponseStrictLogs,
   ]);
+  const idnfyStatusRawLogLines = idnfyStatusMergedRaw.length;
+  const idnfyStatusResponseDeduped = idnfyStatusMergedRaw.filter((e) =>
+    isIdnfyStatusResponseLine(e.line)
+  );
+  let approvedVideoCount = 0;
+  let deniedVideoCount = 0;
+  for (const entry of idnfyStatusResponseDeduped) {
+    if (isIdnfyStatusApprovedLine(entry.line)) approvedVideoCount += 1;
+    else if (isIdnfyStatusDeniedLine(entry.line)) deniedVideoCount += 1;
+  }
+  const idnfyStatusResponseLogLines = idnfyStatusResponseDeduped.length;
+  logIdnfyParseDebug(
+    idnfyStatusResponseLogs,
+    idnfyStatusResponseStrictLogs,
+    idnfyStatusMergedRaw,
+    idnfyStatusResponseDeduped,
+    approvedVideoCount,
+    deniedVideoCount
+  );
+
+  const inHouseVerificationPassedLogs = dedupeLogEntries(
+    verificationPassedLogs.filter((entry) => isInHouseVerificationPassedLine(entry.line))
+  );
+  const approvedApplicantCount = inHouseVerificationPassedLogs.length;
+  const inHousePassedMs: number[] = [];
+  for (const entry of inHouseVerificationPassedLogs) {
+    const ms = parseInHouseVerificationPassedMs(entry.line);
+    if (ms != null) inHousePassedMs.push(ms);
+  }
+  const inHouseVerificationPassedAvgMs =
+    inHousePassedMs.length > 0
+      ? Math.round(inHousePassedMs.reduce((a, b) => a + b, 0) / inHousePassedMs.length)
+      : null;
+
+  const deniedApplicantLogs = dedupeLogEntries(
+    idnfyStatusLogs.filter((entry) => isIdnfyStatusNeverFailure(entry.line))
+  );
+  const deniedApplicantCount = deniedApplicantLogs.length;
+
+  const erroredVideoAttemptLogs = dedupeLogEntries(
+    vfsAttemptLogs.filter((entry) => isErroredVideoAttemptLine(entry.line))
+  );
+
+  console.log("\n[approved-videos] window", {
+    from: new Date(from).toISOString(),
+    to: new Date(to).toISOString(),
+    target,
+    deploymentEnv,
+    vfsLokiNamespace,
+  });
 
   const identityOutcomeLogs = dedupeLogEntries([
     ...identityMiscLogs.filter(
       (entry) => !entry.line.includes("Solving in-house identity verification")
     ),
     ...identityFailTerminalLogs,
+    ...idnfyStatusLogs.filter((entry) => isIdnfyStatusNeverFailure(entry.line)),
   ]);
   const identitySuccessLogs = dedupeLogEntries([
-    ...identityOutcomeLogs.filter(
-      (entry) =>
-        isInHouseIdentityCompletedLine(entry.line) || isInHouseVerificationPassedLine(entry.line)
-    ),
+    ...identityOutcomeLogs.filter((entry) => isInHouseVerificationPassedLine(entry.line)),
     ...verificationPassedLogs.filter((entry) => isInHouseVerificationPassedLine(entry.line)),
   ]);
-  const successLogs = [...legacySuccessLogs, ...identitySuccessLogs].sort((a, b) =>
-    a.time.localeCompare(b.time)
-  );
+  const successLogs = [...identitySuccessLogs].sort((a, b) => a.time.localeCompare(b.time));
 
   const vfsAttemptFiltered = vfsAttemptLogs.filter((e) =>
     /Attempt\s+\d+\/\d+\s*:\s*(passed|failed)/i.test(e.line)
@@ -1378,9 +1516,6 @@ export async function POST(req: NextRequest) {
     else pendingCount += 1;
   }
 
-  const failedEmailSet = new Set(
-    applicantOutcomes.filter((o) => o.outcome === "failed").map((o) => o.email)
-  );
   let terminalFailureLogCount = 0;
   for (const o of applicantOutcomes) {
     if (o.outcome === "failed") terminalFailureLogCount += o.solverFailureCount ?? 0;
@@ -1389,23 +1524,16 @@ export async function POST(req: NextRequest) {
   const failureReasonCounts = new Map<string, number>();
   const failureReasonSamples = new Map<string, FailureReasonSample[]>();
   const solvingSnapshotsByEmail = buildSolvingSnapshotsByEmail(sessionAnchorLogs);
-  for (const entry of vfsSolverAndAttemptLogs) {
-    if (!isInHouseSolverAttemptFailed(entry.line)) continue;
+  for (const entry of erroredVideoAttemptLogs) {
     const email = extractField(entry.line, "email")?.toLowerCase();
     const urn = extractUrn(entry.line);
     const ref = urn ? urnToRef.get(urn) : undefined;
-    if (ref) {
-      if (!failedSessionRefSet.has(ref)) continue;
-    } else if (!email || !failedEmailSet.has(email)) {
-      continue;
-    }
     const resolvedEmail =
       email ??
       (ref ? applicantOutcomes.find((o) => o.referenceNumber === ref)?.email : undefined) ??
-      "";
-    if (!resolvedEmail) continue;
+      "(unknown)";
     const errRaw = extractSolverAttemptError(entry.line);
-    const reasonKey = errRaw ? normalizeFailureReasonKey(errRaw) : "(no Error= field)";
+    const reasonKey = errRaw ? normalizeFailureReasonKey(errRaw) : "(no error message)";
     const failureTimeMs = Date.parse(entry.time);
     const solvingSnap = Number.isFinite(failureTimeMs)
       ? pickSnapshotForFailure(solvingSnapshotsByEmail, resolvedEmail, failureTimeMs)
@@ -1439,6 +1567,12 @@ export async function POST(req: NextRequest) {
       };
     })
     .sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason));
+
+  const erroredVideoAttemptCount = failureReasonBreakdown.reduce((sum, row) => sum + row.count, 0);
+  console.log("\n[approved-videos][attempt] errored summary");
+  console.log(`  attempt query lines: ${vfsAttemptLogs.length}`);
+  console.log(`  errored log lines: ${erroredVideoAttemptLogs.length}`);
+  console.log(`  breakdown total (card): ${erroredVideoAttemptCount}`);
 
   const solvingTaskIds = [
     ...new Set(
@@ -1480,7 +1614,7 @@ export async function POST(req: NextRequest) {
   if (body.includeVideoSessionRows === true) {
     const passportByEmail = buildPassportByEmailFromVfsLogs([
       ...identityOutcomeLogs,
-      ...legacySuccessLogs,
+      ...identitySuccessLogs,
       ...failLogs,
     ]);
 
@@ -1565,6 +1699,164 @@ export async function POST(req: NextRequest) {
     }
   }
 
+  const deniedStatusLogs = idnfyStatusMergedRaw.filter((e) => isIdnfyStatusDeniedLine(e.line));
+  let deniedPassportErrors: string[] = [];
+  const { rows: deniedPassportRows, errors: deniedLookupErrors } = await buildDeniedPassportRows({
+    base,
+    cookieHeader,
+    from,
+    to,
+    app: target,
+    lokiNamespace: vfsLokiNamespace,
+    deniedLogs: deniedStatusLogs,
+  });
+  deniedPassportErrors = [...deniedLookupErrors];
+
+  const vfsPassportByEmail = buildPassportByEmailFromVfsLogs(
+    dedupeLogEntries([
+      ...activationLogs,
+      ...inHouseVerificationPassedLogs,
+      ...verificationPassedLogs,
+      ...solverLogsAll,
+      ...vfsAttemptLogs,
+      ...idnfyStatusMergedRaw,
+      ...identityOutcomeLogs,
+      ...successLogs,
+      ...failLogs,
+    ])
+  );
+  const vfsPassportMap = new Map<string, string>();
+  for (const [email, passport] of vfsPassportByEmail) {
+    if (passport) vfsPassportMap.set(email, passport);
+  }
+
+  let emailToPassport = mergeEmailToPassportMap(
+    buildEmailToPassportMap(
+      deniedPassportRows.map((r) => ({ email: r.email, passportNumber: r.passportNumber }))
+    ),
+    vfsPassportMap
+  );
+
+  const emailsNeedingPassport = new Set<string>();
+  const queueEmailIfNoPassport = (line: string, email: string) => {
+    if (!email?.includes("@")) return;
+    if (resolvePassportForLog(line, email, emailToPassport)) return;
+    emailsNeedingPassport.add(email.toLowerCase());
+  };
+  for (const entry of idnfyStatusResponseDeduped) {
+    const email =
+      extractField(entry.line, "email")?.toLowerCase() ??
+      extractEmailFromIdnfyOrVfsLine(entry.line) ??
+      "";
+    queueEmailIfNoPassport(entry.line, email);
+  }
+  for (const entry of inHouseVerificationPassedLogs) {
+    const email =
+      extractField(entry.line, "email")?.toLowerCase() ??
+      extractEmailFromIdnfyOrVfsLine(entry.line) ??
+      "";
+    queueEmailIfNoPassport(entry.line, email);
+  }
+  for (const entry of deniedApplicantLogs) {
+    const email =
+      extractField(entry.line, "email")?.toLowerCase() ??
+      extractEmailFromIdnfyOrVfsLine(entry.line) ??
+      "";
+    queueEmailIfNoPassport(entry.line, email);
+  }
+
+  if (emailsNeedingPassport.size > 0) {
+    const { passportByEmail, errors: enrichErrors } = await lookupPassportsByEmailBatch({
+      base,
+      cookieHeader,
+      from,
+      to,
+      app: target,
+      lokiNamespace: vfsLokiNamespace,
+      emails: [...emailsNeedingPassport],
+      maxEmails: 120,
+    });
+    if (enrichErrors.length > 0) {
+      deniedPassportErrors.push(...enrichErrors.slice(0, 5).map((e) => `passport enrich: ${e}`));
+    }
+    const lokiEnrichMap = new Map<string, string>();
+    for (const [email, passport] of passportByEmail) {
+      if (passport) lokiEnrichMap.set(email, passport);
+    }
+    emailToPassport = mergeEmailToPassportMap(emailToPassport, lokiEnrichMap);
+  }
+
+  const statusVideos: StatusVideoEvent[] = [];
+  for (const entry of idnfyStatusResponseDeduped) {
+    const status = parseIdnfyStatusFromLine(entry.line);
+    if (status !== "APPROVED" && status !== "DENIED") continue;
+    const email =
+      extractField(entry.line, "email")?.toLowerCase() ??
+      extractEmailFromIdnfyOrVfsLine(entry.line) ??
+      "";
+    statusVideos.push({
+      status,
+      email,
+      passportNumber: resolvePassportForLog(entry.line, email || null, emailToPassport),
+      at: entry.time,
+    });
+  }
+
+  const inHousePassed: EmailStatEvent[] = inHouseVerificationPassedLogs.map((entry) => {
+    const email =
+      extractField(entry.line, "email")?.toLowerCase() ??
+      extractEmailFromIdnfyOrVfsLine(entry.line) ??
+      "";
+    return {
+      email,
+      passportNumber: resolvePassportForLog(entry.line, email || null, emailToPassport),
+      at: entry.time,
+    };
+  });
+
+  const deniedApplicants: EmailStatEvent[] = deniedApplicantLogs.map((entry) => {
+    const email =
+      extractField(entry.line, "email")?.toLowerCase() ??
+      extractEmailFromIdnfyOrVfsLine(entry.line) ??
+      "";
+    return {
+      email,
+      passportNumber: resolvePassportForLog(entry.line, email || null, emailToPassport),
+      at: entry.time,
+    };
+  });
+
+  const erroredAttempts: ErroredAttemptEvent[] = [];
+  for (const entry of erroredVideoAttemptLogs) {
+    const emailRaw = extractField(entry.line, "email")?.toLowerCase();
+    const urn = extractUrn(entry.line);
+    const ref = urn ? urnToRef.get(urn) : undefined;
+    const email =
+      emailRaw ??
+      (ref ? applicantOutcomes.find((o) => o.referenceNumber === ref)?.email : undefined) ??
+      "";
+    const errRaw = extractSolverAttemptError(entry.line);
+    const reason = errRaw ? normalizeFailureReasonKey(errRaw) : "(no error message)";
+    const failureTimeMs = Date.parse(entry.time);
+    const solvingSnap = Number.isFinite(failureTimeMs)
+      ? pickSnapshotForFailure(solvingSnapshotsByEmail, email || "(unknown)", failureTimeMs)
+      : null;
+    const passportFromLine =
+      extractField(entry.line, "PassportNumber") ?? extractField(entry.line, "passport");
+    const resolvedEmail = email || "(unknown)";
+    erroredAttempts.push({
+      email: resolvedEmail,
+      passportNumber:
+        passportFromLine ??
+        solvingSnap?.passportNumber ??
+        (resolvedEmail.includes("@")
+          ? resolvePassportForLog(entry.line, resolvedEmail, emailToPassport)
+          : null),
+      reason,
+      at: entry.time,
+    });
+  }
+
   return NextResponse.json({
     from,
     to,
@@ -1574,7 +1866,24 @@ export async function POST(req: NextRequest) {
     vfsLokiNamespace,
     vfsCorrelationApp: target,
     azureCorrelationApp: azureLivenessApp,
+    deniedPassportRows,
+    deniedPassportErrors: deniedPassportErrors.length > 0 ? deniedPassportErrors : undefined,
+    deniedRecoveryByEmail: computeDeniedRecoveryByEmail(statusVideos, inHousePassed),
+    reportEvents: {
+      statusVideos,
+      inHousePassed,
+      deniedApplicants,
+      erroredAttempts,
+    },
     totals: {
+      approvedVideoCount,
+      deniedVideoCount,
+      idnfyStatusRawLogLines,
+      idnfyStatusResponseLogLines,
+      approvedApplicantCount,
+      deniedApplicantCount,
+      erroredVideoAttemptCount,
+      inHouseVerificationPassedAvgMs,
       applicantCount: applicantOutcomes.length,
       successCount,
       failureCount,

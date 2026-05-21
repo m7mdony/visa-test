@@ -7,7 +7,7 @@ type LoginFormProps = {
   from?: string;
 };
 
-export default function LoginForm({ from = "/generate" }: LoginFormProps) {
+export default function LoginForm({ from = "/logs" }: LoginFormProps) {
   const router = useRouter();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");

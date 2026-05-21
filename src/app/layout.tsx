@@ -38,28 +38,10 @@ export default function RootLayout({
               </div>
               <nav className="flex items-center gap-4 text-sm text-zinc-600">
                 <Link
-                  href="/generate"
-                  className="hover:text-zinc-950 transition-colors"
-                >
-                  Generate link
-                </Link>
-                <Link
-                  href="/test"
-                  className="hover:text-zinc-950 transition-colors"
-                >
-                  Testing
-                </Link>
-                <Link
                   href="/logs"
                   className="hover:text-zinc-950 transition-colors"
                 >
                   Logs
-                </Link>
-                <Link
-                  href="/report"
-                  className="hover:text-zinc-950 transition-colors"
-                >
-                  Report
                 </Link>
                 <Link
                   href="/approved-videos"
@@ -74,10 +56,34 @@ export default function RootLayout({
                   Session videos
                 </Link>
                 <Link
+                  href="/clients-missing-videos"
+                  className="hover:text-zinc-950 transition-colors"
+                >
+                  Missing videos
+                </Link>
+                <Link
                   href="/vfs-logs"
                   className="hover:text-zinc-950 transition-colors"
                 >
                   VFS logs
+                </Link>
+                <Link
+                  href="/unexpected-server-errors"
+                  className="hover:text-zinc-950 transition-colors"
+                >
+                  Unexpected errors
+                </Link>
+                <Link
+                  href="/passport-number-extractor"
+                  className="hover:text-zinc-950 transition-colors"
+                >
+                  Passport extractor
+                </Link>
+                <Link
+                  href="/processing-applicant-videos"
+                  className="hover:text-zinc-950 transition-colors"
+                >
+                  Processing videos
                 </Link>
               </nav>
             </div>

@@ -1,0 +1,495 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import type { DeniedPassportRow } from "@/lib/deniedPassports";
+import type { DeniedEmailRecovery } from "@/lib/deniedRecovery";
+
+const SS_BEARER_JWT = "ui-test-visaflow-dashboard-bearer-jwt";
+const SS_CLERK_REFRESH_SESSION_ID = "ui-test-visaflow-clerk-refresh-session-id";
+const SS_OTP_COOKIE_JAR = "ui-test-clerk-otp-cookie-jar";
+const SS_OTP_SIA = "ui-test-clerk-sign-in-attempt-id";
+
+type DashboardPassportEntry = {
+  applicantId: string | null;
+  applicant?: { firstName?: string; lastName?: string; status?: string };
+  passportImages: Array<{ id: string; url: string }>;
+  videos?: string[];
+  error?: string;
+};
+
+export type PassportGroupRow = {
+  passportNumber: string | null;
+  deniedCount: number;
+  latestDeniedAt: string;
+  emails: string[];
+  urns: string[];
+};
+
+function fmtTime(iso: string): string {
+  const d = new Date(iso);
+  if (!Number.isFinite(d.getTime())) return iso;
+  return d.toLocaleString();
+}
+
+function EmailRecoveryLine({ email, recovery }: { email: string; recovery?: DeniedEmailRecovery }) {
+  const r = recovery;
+  return (
+    <li className="space-y-0.5">
+      <span className="font-mono break-all">{email}</span>
+      {r ? (
+        <div className="text-[10px] pl-0">
+          {r.recoveredAfterLatestDenied ? (
+            <span className="text-emerald-800">
+              Recovered — in-house pass
+              {r.recoveredAt ? ` · ${fmtTime(r.recoveredAt)}` : ""}
+              {r.deniedEventCount > 1
+                ? ` (${r.deniedEventsRecovered}/${r.deniedEventCount} DENIED→pass)`
+                : null}
+            </span>
+          ) : (
+            <span className="text-rose-800">
+              Not recovered — no in-house pass after DENIED
+              {r.deniedEventCount > 1 ? ` (${r.deniedEventCount} DENIED)` : null}
+            </span>
+          )}
+        </div>
+      ) : (
+        <div className="text-[10px] text-zinc-500">No DENIED idnfystatus in window for this email</div>
+      )}
+    </li>
+  );
+}
+
+function VideosCell({ entry }: { entry?: DashboardPassportEntry }) {
+  if (!entry || entry.error) return <span className="text-zinc-400 text-xs">—</span>;
+  const videos = entry.videos ?? [];
+  if (videos.length === 0) {
+    return <span className="text-zinc-500 text-[10px]">No videos on dashboard</span>;
+  }
+  return (
+    <div className="space-y-2 max-w-[300px]">
+      <ul className="space-y-1">
+        {videos.map((url, i) => (
+          <li key={`${url}-${i}`}>
+            <a
+              href={url}
+              target="_blank"
+              rel="noreferrer"
+              className="text-blue-700 underline break-all text-[10px] font-mono"
+            >
+              {videos.length > 1 ? `Video ${i + 1}` : "Open video"}
+            </a>
+          </li>
+        ))}
+      </ul>
+      <video
+        src={videos[0]}
+        controls
+        preload="metadata"
+        className="max-h-28 max-w-full rounded border border-zinc-200 bg-black"
+      />
+    </div>
+  );
+}
+
+function PassportCell({
+  passportNumber,
+  entry,
+}: {
+  passportNumber: string | null;
+  entry?: DashboardPassportEntry;
+}) {
+  if (!passportNumber?.trim()) return <span className="text-amber-700 text-xs">No passport in logs</span>;
+  if (!entry) return <span className="text-zinc-400 text-xs">—</span>;
+  if (entry.error) {
+    return <span className="text-red-600 text-[10px] break-words max-w-[180px] inline-block">{entry.error}</span>;
+  }
+  if (!entry.passportImages.length) {
+    return <span className="text-zinc-500 text-[10px]">No images on dashboard</span>;
+  }
+  const im = entry.passportImages[0];
+  const name =
+    entry.applicant &&
+    [entry.applicant.firstName, entry.applicant.lastName].filter(Boolean).join(" ").trim();
+  return (
+    <div className="space-y-1 max-w-[200px]">
+      {name ? <p className="text-[10px] text-zinc-600 font-medium break-words">{name}</p> : null}
+      <a href={im.url} target="_blank" rel="noreferrer" className="inline-block">
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={im.url}
+          alt="Passport"
+          className="h-20 max-w-[140px] object-cover rounded border border-zinc-200 bg-zinc-50"
+          loading="lazy"
+          referrerPolicy="no-referrer"
+        />
+      </a>
+    </div>
+  );
+}
+
+export function groupDeniedRowsByPassport(rows: DeniedPassportRow[]): PassportGroupRow[] {
+  type Acc = { emails: Set<string>; timesMs: number[]; urns: Set<string> };
+  const map = new Map<string, Acc>();
+
+  for (const r of rows) {
+    const bucketKey = r.passportNumber?.trim() ? r.passportNumber.trim() : "__no_passport__";
+    let acc = map.get(bucketKey);
+    if (!acc) {
+      acc = { emails: new Set(), timesMs: [], urns: new Set() };
+      map.set(bucketKey, acc);
+    }
+    acc.emails.add(r.email);
+    const t = Date.parse(r.deniedAt);
+    acc.timesMs.push(Number.isFinite(t) ? t : 0);
+    const urn = (r.aurn ?? r.urn)?.trim();
+    if (urn) acc.urns.add(urn);
+  }
+
+  const out: PassportGroupRow[] = [];
+  for (const [bucketKey, acc] of map) {
+    const passportNumber = bucketKey === "__no_passport__" ? null : bucketKey;
+    const times = acc.timesMs.filter((x) => x > 0);
+    const latestMs = times.length ? Math.max(...times) : 0;
+    const deniedCount = rows.filter((r) =>
+      passportNumber ? r.passportNumber?.trim() === passportNumber : !r.passportNumber?.trim()
+    ).length;
+    out.push({
+      passportNumber,
+      deniedCount,
+      latestDeniedAt: latestMs ? new Date(latestMs).toISOString() : "",
+      emails: [...acc.emails].sort(),
+      urns: [...acc.urns].sort(),
+    });
+  }
+
+  out.sort((a, b) => {
+    if (b.deniedCount !== a.deniedCount) return b.deniedCount - a.deniedCount;
+    if (!a.passportNumber && !b.passportNumber) return 0;
+    if (!a.passportNumber) return 1;
+    if (!b.passportNumber) return -1;
+    return a.passportNumber.localeCompare(b.passportNumber);
+  });
+  return out;
+}
+
+type Props = {
+  rows: DeniedPassportRow[];
+  passportResolveErrors?: string[];
+  recoveryByEmail?: Record<string, DeniedEmailRecovery>;
+};
+
+export default function DeniedPassportsByPassportSection({
+  rows,
+  passportResolveErrors,
+  recoveryByEmail = {},
+}: Props) {
+  const [dashByPassport, setDashByPassport] = useState<Record<string, DashboardPassportEntry>>({});
+  const [dashError, setDashError] = useState<string | null>(null);
+  const [dashboardJwtSaved, setDashboardJwtSaved] = useState(false);
+  const [otpEmail, setOtpEmail] = useState("");
+  const [otpCookieJar, setOtpCookieJar] = useState("");
+  const [otpSignInAttemptId, setOtpSignInAttemptId] = useState("");
+  const [otpCode, setOtpCode] = useState("");
+  const [otpLoading, setOtpLoading] = useState(false);
+  const [otpError, setOtpError] = useState<string | null>(null);
+
+  const groupedByPassport = useMemo(() => groupDeniedRowsByPassport(rows), [rows]);
+  const passportNums = [
+    ...new Set(rows.map((r) => r.passportNumber?.trim()).filter((p): p is string => Boolean(p))),
+  ];
+
+  useEffect(() => {
+    try {
+      setDashboardJwtSaved(Boolean(sessionStorage.getItem(SS_BEARER_JWT)?.trim()));
+      const jar = sessionStorage.getItem(SS_OTP_COOKIE_JAR);
+      const sia = sessionStorage.getItem(SS_OTP_SIA);
+      if (jar) setOtpCookieJar(jar);
+      if (sia) setOtpSignInAttemptId(sia);
+    } catch {
+      /* */
+    }
+  }, []);
+
+  function parseOtpJsonResponse(text: string): Record<string, unknown> {
+    try {
+      return JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      return { error: text.slice(0, 800) || "Empty or invalid JSON" };
+    }
+  }
+
+  async function sendClerkOtp() {
+    setOtpError(null);
+    const email = otpEmail.trim();
+    if (!email.includes("@")) {
+      setOtpError("Enter a valid email.");
+      return;
+    }
+    setOtpLoading(true);
+    try {
+      const res = await fetch("/api/clerk-email-signin/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+      const otpData = parseOtpJsonResponse(await res.text());
+      if (!res.ok) {
+        setOtpError(typeof otpData.error === "string" ? otpData.error : `HTTP ${res.status}`);
+        return;
+      }
+      const signInAttemptId = typeof otpData.signInAttemptId === "string" ? otpData.signInAttemptId : "";
+      const cookieJar = typeof otpData.cookieJar === "string" ? otpData.cookieJar : "";
+      if (!signInAttemptId || !cookieJar) {
+        setOtpError("Missing signInAttemptId or cookieJar");
+        return;
+      }
+      setOtpSignInAttemptId(signInAttemptId);
+      setOtpCookieJar(cookieJar);
+      sessionStorage.setItem(SS_OTP_SIA, signInAttemptId);
+      sessionStorage.setItem(SS_OTP_COOKIE_JAR, cookieJar);
+    } catch (e: unknown) {
+      setOtpError(e instanceof Error ? e.message : "Request failed");
+    } finally {
+      setOtpLoading(false);
+    }
+  }
+
+  async function verifyClerkOtp() {
+    setOtpError(null);
+    const sia = otpSignInAttemptId.trim();
+    const jar = otpCookieJar.trim();
+    const code = otpCode.trim().replace(/\s+/g, "");
+    if (!sia.startsWith("sia_")) {
+      setOtpError("Send the email code first.");
+      return;
+    }
+    if (!/^\d{6}$/.test(code)) {
+      setOtpError("Enter the 6-digit code.");
+      return;
+    }
+    setOtpLoading(true);
+    try {
+      const res = await fetch("/api/clerk-email-signin/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ signInAttemptId: sia, code, cookieJar: jar }),
+      });
+      const otpData = parseOtpJsonResponse(await res.text());
+      if (!res.ok) {
+        setOtpError(typeof otpData.error === "string" ? otpData.error : `HTTP ${res.status}`);
+        return;
+      }
+      const jwt = typeof otpData.jwt === "string" ? otpData.jwt.trim() : "";
+      if (!jwt) {
+        setOtpError("No JWT in response");
+        return;
+      }
+      sessionStorage.setItem(SS_BEARER_JWT, jwt);
+      const sid = typeof otpData.sessionId === "string" ? otpData.sessionId.trim() : "";
+      if (sid.startsWith("sess_")) sessionStorage.setItem(SS_CLERK_REFRESH_SESSION_ID, sid);
+      setDashboardJwtSaved(true);
+      setOtpCode("");
+      try {
+        window.dispatchEvent(new Event("visaflow-jwt-updated"));
+      } catch {
+        /* */
+      }
+    } catch (e: unknown) {
+      setOtpError(e instanceof Error ? e.message : "Request failed");
+    } finally {
+      setOtpLoading(false);
+    }
+  }
+
+  async function fetchDashboardImages(passportNumbers: string[]) {
+    if (passportNumbers.length === 0) {
+      setDashError("No passport numbers to load.");
+      return;
+    }
+    setDashError(null);
+    let bearerFromStorage = "";
+    let refreshSid = "";
+    let refreshJar = "";
+    try {
+      bearerFromStorage = sessionStorage.getItem(SS_BEARER_JWT)?.trim() ?? "";
+      refreshSid = sessionStorage.getItem(SS_CLERK_REFRESH_SESSION_ID)?.trim() ?? "";
+      refreshJar = sessionStorage.getItem(SS_OTP_COOKIE_JAR)?.trim() ?? "";
+    } catch {
+      /* */
+    }
+    if (!bearerFromStorage || bearerFromStorage.split(".").length < 2) {
+      setDashError("Sign in with dashboard OTP first.");
+      return;
+    }
+    const res = await fetch("/api/dashboard-passport-images", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        passportNumbers,
+        bearerJwt: bearerFromStorage,
+        ...(refreshSid.startsWith("sess_") ? { clerkSessionId: refreshSid } : {}),
+        ...(refreshJar ? { clerkCookie: refreshJar } : {}),
+      }),
+    });
+    const json = (await res.json().catch(() => ({}))) as {
+      error?: string;
+      byPassport?: Record<string, DashboardPassportEntry>;
+      refreshedBearerJwt?: string;
+    };
+    if (!res.ok) {
+      setDashError(json.error ?? `HTTP ${res.status}`);
+      return;
+    }
+    const next = typeof json.refreshedBearerJwt === "string" ? json.refreshedBearerJwt.trim() : "";
+    if (next && next.split(".").length >= 2) {
+      try {
+        sessionStorage.setItem(SS_BEARER_JWT, next);
+      } catch {
+        /* */
+      }
+    }
+    setDashByPassport(json.byPassport ?? {});
+  }
+
+  useEffect(() => {
+    if (rows.length === 0 || !dashboardJwtSaved || passportNums.length === 0) return;
+    void fetchDashboardImages(passportNums);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- load when rows/JWT ready
+  }, [rows, dashboardJwtSaved]);
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-lg border border-emerald-200 bg-emerald-50/80 px-4 py-3 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="text-sm font-medium text-zinc-800">Dashboard login (passport images + applicant videos)</p>
+          {dashboardJwtSaved ? (
+            <span className="text-xs font-medium text-emerald-800">JWT saved</span>
+          ) : (
+            <span className="text-xs text-zinc-500">Required for thumbnails</span>
+          )}
+        </div>
+        {otpError ? <pre className="text-[11px] text-red-800 whitespace-pre-wrap">{otpError}</pre> : null}
+        <div className="flex flex-wrap gap-2 items-end">
+          <div className="flex-1 min-w-[200px]">
+            <label className="block text-xs font-medium text-zinc-700 mb-1">Email</label>
+            <input
+              type="email"
+              value={otpEmail}
+              onChange={(e) => setOtpEmail(e.target.value)}
+              className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm bg-white"
+            />
+          </div>
+          <button
+            type="button"
+            onClick={sendClerkOtp}
+            disabled={otpLoading}
+            className="rounded-lg bg-emerald-800 px-3 py-2 text-sm text-white disabled:opacity-50"
+          >
+            Send code
+          </button>
+          <input
+            type="text"
+            inputMode="numeric"
+            maxLength={6}
+            value={otpCode}
+            onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+            placeholder="6-digit"
+            className="w-24 rounded-lg border border-zinc-300 px-2 py-2 text-sm font-mono"
+          />
+          <button
+            type="button"
+            onClick={verifyClerkOtp}
+            disabled={otpLoading}
+            className="rounded-lg border border-emerald-700 px-3 py-2 text-sm text-emerald-900"
+          >
+            Verify
+          </button>
+          {passportNums.length > 0 ? (
+            <button
+              type="button"
+              onClick={() => fetchDashboardImages(passportNums)}
+              className="rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-800"
+            >
+              Load images
+            </button>
+          ) : null}
+        </div>
+      </div>
+
+      {passportResolveErrors?.length ? (
+        <p className="text-xs text-amber-800">{passportResolveErrors.join(" | ")}</p>
+      ) : null}
+      {dashError ? (
+        <p className="text-sm text-amber-800 bg-amber-50 border border-amber-100 rounded-md px-3 py-2">{dashError}</p>
+      ) : null}
+
+      <div>
+        <h2 className="text-sm font-medium text-zinc-800 mb-2">
+          DENIED videos by passport{" "}
+          <span className="font-normal text-zinc-500">(passport, dashboard image, applicant video URLs)</span>
+        </h2>
+        <div className="overflow-auto rounded-xl border border-zinc-200">
+          <table className="min-w-full text-sm">
+            <thead className="bg-zinc-50 border-b border-zinc-200 text-left text-zinc-700">
+              <tr>
+                <th className="px-3 py-2 font-medium">Passport</th>
+                <th className="px-3 py-2 font-medium">DENIED events</th>
+                <th className="px-3 py-2 font-medium">Latest denied</th>
+                <th className="px-3 py-2 font-medium">Dashboard videos</th>
+                <th className="px-3 py-2 font-medium">Emails · recovery</th>
+                <th className="px-3 py-2 font-medium">URNs</th>
+              </tr>
+            </thead>
+            <tbody>
+              {groupedByPassport.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="px-3 py-4 text-zinc-500 text-center">
+                    No DENIED events with passport data in this range.
+                  </td>
+                </tr>
+              ) : (
+                groupedByPassport.map((g) => (
+                  <tr key={g.passportNumber ?? "__no_passport__"} className="border-b border-zinc-100 align-top">
+                    <td className="px-3 py-2">
+                      <div className="font-mono text-xs font-semibold text-zinc-900">
+                        {g.passportNumber ?? <span className="text-amber-700">(no passport in logs)</span>}
+                      </div>
+                      <div className="mt-2">
+                        <PassportCell
+                          passportNumber={g.passportNumber}
+                          entry={g.passportNumber ? dashByPassport[g.passportNumber] : undefined}
+                        />
+                      </div>
+                    </td>
+                    <td className="px-3 py-2 text-xs tabular-nums">{g.deniedCount}</td>
+                    <td className="px-3 py-2 text-xs whitespace-nowrap">
+                      {g.latestDeniedAt ? fmtTime(g.latestDeniedAt) : "—"}
+                    </td>
+                    <td className="px-3 py-2">
+                      <VideosCell entry={g.passportNumber ? dashByPassport[g.passportNumber] : undefined} />
+                    </td>
+                    <td className="px-3 py-2 text-xs max-w-[280px]">
+                      <ul className="list-none space-y-2">
+                        {g.emails.map((e) => (
+                          <EmailRecoveryLine
+                            key={e}
+                            email={e}
+                            recovery={recoveryByEmail[e.trim().toLowerCase()]}
+                          />
+                        ))}
+                      </ul>
+                    </td>
+                    <td className="px-3 py-2 font-mono text-[10px] text-zinc-600 max-w-[160px] break-all">
+                      {g.urns.length ? g.urns.join(", ") : "—"}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}

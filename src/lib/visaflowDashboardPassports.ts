@@ -65,3 +65,11 @@ export type ApplicantImagesPayload = {
   hasImages?: boolean;
   error?: string;
 };
+
+export function parseVideosFromApplicantImages(data: ApplicantImagesPayload): string[] {
+  const raw = data.images?.videos;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((v): v is string => typeof v === "string" && v.trim().length > 0)
+    .map((v) => v.trim());
+}

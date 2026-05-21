@@ -942,8 +942,8 @@ export default function SessionVideosClient() {
               Not accepted <span className="text-zinc-500 font-normal">({notAccepted.length})</span>
             </h2>
             <p className="text-xs text-zinc-500 mb-2">
-              Identity outcome: <code className="text-[10px]">In-house identity verification failed</code> (not approved
-              after in-house solves) or legacy <code className="text-[10px]">status not approved</code> lines. Videos are
+              Identity outcome: terminal fail uses <code className="text-[10px]">/idnfystatus ... never</code> (with
+              legacy fallbacks). Videos are
               same per-session video list as the approved table (all attempts in the window that carry{" "}
               <code className="text-[10px]">VideoLink=</code>).
             </p>
