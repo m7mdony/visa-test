@@ -3,6 +3,10 @@
 import { useEffect, useMemo, useState } from "react";
 import type { DeniedPassportRow } from "@/lib/deniedPassports";
 import type { DeniedEmailRecovery } from "@/lib/deniedRecovery";
+import {
+  buildStagingJobsForAllPassports,
+  buildStagingJobsForPassport,
+} from "@/lib/stagingJobBatches";
 
 const SS_BEARER_JWT = "ui-test-visaflow-dashboard-bearer-jwt";
 const SS_CLERK_REFRESH_SESSION_ID = "ui-test-visaflow-clerk-refresh-session-id";
@@ -88,6 +92,48 @@ function VideosCell({ entry }: { entry?: DashboardPassportEntry }) {
         preload="metadata"
         className="max-h-28 max-w-full rounded border border-zinc-200 bg-black"
       />
+    </div>
+  );
+}
+
+function CopyPassportStagingJsonButton({
+  passportNumber,
+  entry,
+}: {
+  passportNumber: string | null;
+  entry?: DashboardPassportEntry;
+}) {
+  const [copied, setCopied] = useState(false);
+  const { jobs, error } = useMemo(() => {
+    if (!passportNumber?.trim()) return { jobs: [], error: "No passport" };
+    return buildStagingJobsForPassport(passportNumber, entry);
+  }, [passportNumber, entry]);
+
+  async function copy() {
+    if (jobs.length === 0) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(jobs, null, 2));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setCopied(false);
+    }
+  }
+
+  if (!passportNumber?.trim()) return <span className="text-zinc-400 text-xs">—</span>;
+
+  return (
+    <div className="space-y-1">
+      <button
+        type="button"
+        onClick={copy}
+        disabled={jobs.length === 0}
+        title={error ?? undefined}
+        className="rounded border border-zinc-300 bg-white px-2 py-1 text-[10px] font-medium text-zinc-800 hover:bg-zinc-50 disabled:opacity-40 disabled:cursor-not-allowed"
+      >
+        {copied ? "Copied" : jobs.length > 0 ? `Copy ${jobs.length} job${jobs.length === 1 ? "" : "s"}` : "Copy JSON"}
+      </button>
+      {error ? <p className="text-[10px] text-amber-800 max-w-[140px]">{error}</p> : null}
     </div>
   );
 }
@@ -193,6 +239,7 @@ export default function DeniedPassportsByPassportSection({
   const [otpCode, setOtpCode] = useState("");
   const [otpLoading, setOtpLoading] = useState(false);
   const [otpError, setOtpError] = useState<string | null>(null);
+  const [allJobsCopied, setAllJobsCopied] = useState(false);
 
   const groupedByPassport = useMemo(() => groupDeniedRowsByPassport(rows), [rows]);
   const passportNums = [
@@ -358,6 +405,18 @@ export default function DeniedPassportsByPassportSection({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- load when rows/JWT ready
   }, [rows, dashboardJwtSaved]);
 
+  async function copyAllPassportJobs() {
+    const jobs = buildStagingJobsForAllPassports(dashByPassport);
+    if (jobs.length === 0) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(jobs, null, 2));
+      setAllJobsCopied(true);
+      setTimeout(() => setAllJobsCopied(false), 1500);
+    } catch {
+      setAllJobsCopied(false);
+    }
+  }
+
   return (
     <div className="space-y-4">
       <div className="rounded-lg border border-emerald-200 bg-emerald-50/80 px-4 py-3 space-y-3">
@@ -425,10 +484,24 @@ export default function DeniedPassportsByPassportSection({
       ) : null}
 
       <div>
-        <h2 className="text-sm font-medium text-zinc-800 mb-2">
-          DENIED videos by passport{" "}
-          <span className="font-normal text-zinc-500">(passport, dashboard image, applicant video URLs)</span>
-        </h2>
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+          <h2 className="text-sm font-medium text-zinc-800">
+            DENIED videos by passport{" "}
+            <span className="font-normal text-zinc-500">
+              (passport, dashboard image, videos, staging JSON per passport)
+            </span>
+          </h2>
+          {Object.keys(dashByPassport).length > 0 ? (
+            <button
+              type="button"
+              onClick={copyAllPassportJobs}
+              disabled={buildStagingJobsForAllPassports(dashByPassport).length === 0}
+              className="rounded-lg border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-800 hover:bg-zinc-50 disabled:opacity-40"
+            >
+              {allJobsCopied ? "Copied all" : "Copy all passports (JOBS array)"}
+            </button>
+          ) : null}
+        </div>
         <div className="overflow-auto rounded-xl border border-zinc-200">
           <table className="min-w-full text-sm">
             <thead className="bg-zinc-50 border-b border-zinc-200 text-left text-zinc-700">
@@ -437,6 +510,7 @@ export default function DeniedPassportsByPassportSection({
                 <th className="px-3 py-2 font-medium">DENIED events</th>
                 <th className="px-3 py-2 font-medium">Latest denied</th>
                 <th className="px-3 py-2 font-medium">Dashboard videos</th>
+                <th className="px-3 py-2 font-medium">Staging JSON</th>
                 <th className="px-3 py-2 font-medium">Emails · recovery</th>
                 <th className="px-3 py-2 font-medium">URNs</th>
               </tr>
@@ -444,7 +518,7 @@ export default function DeniedPassportsByPassportSection({
             <tbody>
               {groupedByPassport.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="px-3 py-4 text-zinc-500 text-center">
+                  <td colSpan={7} className="px-3 py-4 text-zinc-500 text-center">
                     No DENIED events with passport data in this range.
                   </td>
                 </tr>
@@ -468,6 +542,12 @@ export default function DeniedPassportsByPassportSection({
                     </td>
                     <td className="px-3 py-2">
                       <VideosCell entry={g.passportNumber ? dashByPassport[g.passportNumber] : undefined} />
+                    </td>
+                    <td className="px-3 py-2">
+                      <CopyPassportStagingJsonButton
+                        passportNumber={g.passportNumber}
+                        entry={g.passportNumber ? dashByPassport[g.passportNumber] : undefined}
+                      />
                     </td>
                     <td className="px-3 py-2 text-xs max-w-[280px]">
                       <ul className="list-none space-y-2">

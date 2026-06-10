@@ -10,6 +10,7 @@ const SS_CLERK_REFRESH_SESSION_ID = "ui-test-visaflow-clerk-refresh-session-id";
 const SS_OTP_COOKIE_JAR = "ui-test-clerk-otp-cookie-jar";
 const SS_OTP_SIA = "ui-test-clerk-sign-in-attempt-id";
 const SS_CLIENT_WAIT_STATUS = "ui-test-processing-client-wait-status";
+const SS_LAST_STATUS_UPDATE_AFTER = "ui-test-processing-last-status-update-after";
 
 const CLIENT_WAIT_STATUS_PRESETS = [
   { value: "pending_applicant", label: "Pending applicant" },
@@ -43,7 +44,9 @@ type Totals = {
   clientsScanned: number;
   clientsMatchedCountry: number;
   clientWaitStatus?: string;
+  lastStatusUpdateAfter?: string | null;
   statusMatchedClients?: number;
+  clientsAfterLastStatusUpdateFilter?: number;
   /** @deprecated use statusMatchedClients */
   pendingClients: number;
   applicantsFound: number;
@@ -71,8 +74,10 @@ export default function ProcessingApplicantVideosClient() {
   const [applicantLimit, setApplicantLimit] = useState("50");
   const [clientWaitStatus, setClientWaitStatus] = useState("pending_applicant");
   const [clientWaitStatusCustom, setClientWaitStatusCustom] = useState("");
+  const [lastStatusUpdateAfter, setLastStatusUpdateAfter] = useState("");
   const [expandedVideo, setExpandedVideo] = useState<string | null>(null);
   const [parallelJobsCopied, setParallelJobsCopied] = useState(false);
+  const [videoOnlyJobsCopied, setVideoOnlyJobsCopied] = useState(false);
 
   // key: `${applicantId}-${videoIndex}` → submit state
   const [submitStates, setSubmitStates] = useState<Record<string, SubmitState>>({});
@@ -124,6 +129,8 @@ export default function ProcessingApplicantVideosClient() {
       if (sia) setOtpSignInAttemptId(sia);
       const waitSt = sessionStorage.getItem(SS_CLIENT_WAIT_STATUS);
       if (waitSt) setClientWaitStatus(waitSt);
+      const lsAfter = sessionStorage.getItem(SS_LAST_STATUS_UPDATE_AFTER);
+      if (lsAfter) setLastStatusUpdateAfter(lsAfter);
     } catch {
       /* private mode */
     }
@@ -275,9 +282,20 @@ export default function ProcessingApplicantVideosClient() {
       const limit = parseInt(applicantLimit, 10);
       try {
         sessionStorage.setItem(SS_CLIENT_WAIT_STATUS, clientWaitStatus);
+        if (lastStatusUpdateAfter.trim()) {
+          sessionStorage.setItem(SS_LAST_STATUS_UPDATE_AFTER, lastStatusUpdateAfter.trim());
+        } else {
+          sessionStorage.removeItem(SS_LAST_STATUS_UPDATE_AFTER);
+        }
       } catch {
         /* */
       }
+      const lastStatusCutoffRaw = lastStatusUpdateAfter.trim();
+      const lastStatusCutoffMs = lastStatusCutoffRaw ? Date.parse(lastStatusCutoffRaw) : NaN;
+      const lastStatusCutoff =
+        lastStatusCutoffRaw && Number.isFinite(lastStatusCutoffMs)
+          ? new Date(lastStatusCutoffMs).toISOString()
+          : "";
       const res = await fetch("/api/processing-applicant-videos", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -287,12 +305,14 @@ export default function ProcessingApplicantVideosClient() {
                 bearerJwt: bearerFromStorage,
                 limit: isNaN(limit) || limit <= 0 ? 50 : limit,
                 clientWaitStatus: effectiveClientWaitStatus,
+                ...(lastStatusCutoff ? { lastStatusUpdateAfter: lastStatusCutoff } : {}),
                 ...(refreshSid.startsWith("sess_") ? { clerkSessionId: refreshSid } : {}),
                 ...(refreshJar ? { clerkCookie: refreshJar } : {}),
               }
             : {
                 limit: isNaN(limit) || limit <= 0 ? 50 : limit,
                 clientWaitStatus: effectiveClientWaitStatus,
+                ...(lastStatusCutoff ? { lastStatusUpdateAfter: lastStatusCutoff } : {}),
                 ...(clerkSessionId.trim() ? { clerkSessionId: clerkSessionId.trim() } : {}),
                 ...(clerkCookie.trim() ? { clerkCookie: clerkCookie.trim() } : {}),
                 ...(organizationId.trim() ? { organizationId: organizationId.trim() } : {}),
@@ -341,6 +361,20 @@ export default function ProcessingApplicantVideosClient() {
     return JSON.stringify(jobs, null, 2);
   }, [data]);
 
+  const videoOnlyJobsJson = useMemo(() => {
+    if (!data?.rows) return "";
+    type VideoJob = { label: string; videoUrl: string };
+    const jobs: VideoJob[] = [];
+    for (const row of data.rows) {
+      const firstVideo =
+        row.videos.map((u) => (typeof u === "string" ? u.trim() : "")).find((v) => v.length > 0) ?? "";
+      if (!firstVideo) continue;
+      const label = row.passportNumber.trim() || "UNKNOWN";
+      jobs.push({ label, videoUrl: firstVideo });
+    }
+    return JSON.stringify(jobs, null, 2);
+  }, [data]);
+
   async function copyParallelJobsJson() {
     if (!parallelJobsJson) return;
     try {
@@ -349,6 +383,17 @@ export default function ProcessingApplicantVideosClient() {
       setTimeout(() => setParallelJobsCopied(false), 1500);
     } catch {
       setParallelJobsCopied(false);
+    }
+  }
+
+  async function copyVideoOnlyJobsJson() {
+    if (!videoOnlyJobsJson) return;
+    try {
+      await navigator.clipboard.writeText(videoOnlyJobsJson);
+      setVideoOnlyJobsCopied(true);
+      setTimeout(() => setVideoOnlyJobsCopied(false), 1500);
+    } catch {
+      setVideoOnlyJobsCopied(false);
     }
   }
 
@@ -561,6 +606,18 @@ export default function ProcessingApplicantVideosClient() {
         )}
         <div>
           <label className="block text-xs font-medium text-zinc-700 mb-1">
+            Last status update on or after
+          </label>
+          <input
+            type="datetime-local"
+            value={lastStatusUpdateAfter}
+            onChange={(e) => setLastStatusUpdateAfter(e.target.value)}
+            className="w-52 rounded-lg border border-zinc-300 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-zinc-900"
+          />
+          <p className="text-[10px] text-zinc-500 mt-0.5">Leave empty for no date filter</p>
+        </div>
+        <div>
+          <label className="block text-xs font-medium text-zinc-700 mb-1">
             Target (identity completed + passport + video)
           </label>
           <input
@@ -600,6 +657,17 @@ export default function ProcessingApplicantVideosClient() {
                 {data.totals.statusMatchedClients ?? data.totals.pendingClients}
               </p>
             </div>
+            {data.totals.lastStatusUpdateAfter ? (
+              <div className="rounded-lg border border-sky-200 bg-sky-50 px-3 py-2">
+                <p className="text-xs text-sky-800">After last status update</p>
+                <p className="text-sm font-semibold tabular-nums">
+                  {data.totals.clientsAfterLastStatusUpdateFilter ?? "—"} clients
+                </p>
+                <p className="text-[10px] text-sky-700 font-mono mt-0.5">
+                  ≥ {new Date(data.totals.lastStatusUpdateAfter).toLocaleString()}
+                </p>
+              </div>
+            ) : null}
             <div className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2">
               <p className="text-xs text-zinc-500">Applicants (on status-matched clients)</p>
               <p className="text-lg font-semibold">{data.totals.applicantsFound}</p>
@@ -676,6 +744,34 @@ export default function ProcessingApplicantVideosClient() {
               readOnly
               value={parallelJobsJson || "[]"}
               rows={Math.min(18, Math.max(6, (parallelJobsJson.split("\n").length || 1) + 1))}
+              className="w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-[11px] font-mono text-zinc-900 leading-relaxed focus:outline-none focus:ring-2 focus:ring-zinc-400 resize-y min-h-[8rem]"
+              spellCheck={false}
+            />
+          </div>
+
+          <div className="rounded-lg border border-zinc-200 bg-zinc-50 px-4 py-3 space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h2 className="text-sm font-semibold text-zinc-900">Video-only jobs (JSON)</h2>
+                <p className="text-xs text-zinc-500 mt-0.5">
+                  Same rows, first video each — <code className="text-zinc-700">label</code> +{" "}
+                  <code className="text-zinc-700">videoUrl</code> only (no passport). For liveness-only runs without
+                  face-verify passport image.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={copyVideoOnlyJobsJson}
+                disabled={!videoOnlyJobsJson}
+                className="shrink-0 rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-xs font-medium text-zinc-800 hover:bg-zinc-100 disabled:opacity-50"
+              >
+                {videoOnlyJobsCopied ? "Copied" : "Copy JSON"}
+              </button>
+            </div>
+            <textarea
+              readOnly
+              value={videoOnlyJobsJson || "[]"}
+              rows={Math.min(18, Math.max(6, (videoOnlyJobsJson.split("\n").length || 1) + 1))}
               className="w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-[11px] font-mono text-zinc-900 leading-relaxed focus:outline-none focus:ring-2 focus:ring-zinc-400 resize-y min-h-[8rem]"
               spellCheck={false}
             />

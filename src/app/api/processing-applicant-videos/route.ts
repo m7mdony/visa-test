@@ -39,6 +39,8 @@ type ClientEntry = {
   status: string;
   fromCountry: string;
   toCountry: string;
+  /** Unix ms from API (`lastStatusUpdate` string). */
+  lastStatusUpdateMs: number | null;
   applicants: ClientApplicant[];
 };
 
@@ -237,6 +239,30 @@ function str(v: unknown): string {
   return typeof v === "string" ? v.trim() : "";
 }
 
+function parseLastStatusUpdateMs(v: unknown): number | null {
+  if (typeof v === "number" && Number.isFinite(v) && v > 0) return v;
+  if (typeof v === "string" && v.trim()) {
+    const n = Number(v.trim());
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
+/** ISO date or datetime → epoch ms, or null if empty/invalid. */
+function parseCutoffDateMs(v: unknown): number | null {
+  const s = str(v);
+  if (!s) return null;
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? t : null;
+}
+
+function clientPassesLastStatusUpdateCutoff(client: ClientEntry, cutoffMs: number | null): boolean {
+  if (cutoffMs == null) return true;
+  const lu = client.lastStatusUpdateMs;
+  if (lu == null) return false;
+  return lu >= cutoffMs;
+}
+
 function isAuthFailure(status: number): boolean {
   return status === 401 || status === 403;
 }
@@ -269,6 +295,7 @@ function parseClientsPayload(json: unknown): ClientEntry[] {
       status: typeof c.status === "string" ? c.status.toLowerCase() : "",
       fromCountry: typeof c.fromCountry === "string" ? c.fromCountry.toLowerCase() : "",
       toCountry: typeof c.toCountry === "string" ? c.toCountry.toLowerCase() : "",
+      lastStatusUpdateMs: parseLastStatusUpdateMs(c.lastStatusUpdate),
       applicants,
     });
   }
@@ -326,6 +353,8 @@ export async function POST(req: NextRequest) {
     limit?: unknown;
     /** Client status filter (any route; e.g. pending, processing, pending_applicant). */
     clientWaitStatus?: unknown;
+    /** ISO date/datetime — only clients with `lastStatusUpdate` on or after this instant. */
+    lastStatusUpdateAfter?: unknown;
   };
   try {
     body = await req.json();
@@ -346,6 +375,7 @@ export async function POST(req: NextRequest) {
   const rawLimit = typeof body.limit === "number" ? body.limit : parseInt(str(body.limit), 10);
   const applicantLimit = isNaN(rawLimit) || rawLimit <= 0 ? 50 : Math.min(rawLimit, 500);
   const clientWaitStatus = (str(body.clientWaitStatus) || "pending_applicant").toLowerCase();
+  const lastStatusUpdateAfterMs = parseCutoffDateMs(body.lastStatusUpdateAfter);
 
   const hasBearer = Boolean(bearerJwtRaw && bearerJwtRaw.split(".").length >= 2);
   if (!hasBearer && (!sessionId || !clerkCookie)) {
@@ -414,10 +444,13 @@ export async function POST(req: NextRequest) {
 
   const clients = parseClientsPayload(clientsRes.json);
   const statusMatchedClients = clients.filter((c) => c.status === clientWaitStatus);
+  const dateFilteredClients = statusMatchedClients.filter((c) =>
+    clientPassesLastStatusUpdateCutoff(c, lastStatusUpdateAfterMs),
+  );
 
   /** All applicants under matching-status clients (any route; for totals / scan order). */
   const allCandidates: Array<{ client: ClientEntry; applicant: ClientApplicant }> = [];
-  for (const client of statusMatchedClients) {
+  for (const client of dateFilteredClients) {
     for (const applicant of client.applicants) {
       allCandidates.push({ client, applicant });
     }
@@ -502,7 +535,10 @@ export async function POST(req: NextRequest) {
       /** @deprecated kept for UI compat — same as clientsScanned (no country filter). */
       clientsMatchedCountry: clients.length,
       clientWaitStatus,
+      lastStatusUpdateAfter:
+        lastStatusUpdateAfterMs != null ? new Date(lastStatusUpdateAfterMs).toISOString() : null,
       statusMatchedClients: statusMatchedClients.length,
+      clientsAfterLastStatusUpdateFilter: dateFilteredClients.length,
       /** @deprecated use statusMatchedClients */
       pendingClients: statusMatchedClients.length,
       applicantsFound: allCandidates.length,
