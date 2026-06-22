@@ -256,11 +256,17 @@ function parseCutoffDateMs(v: unknown): number | null {
   return Number.isFinite(t) ? t : null;
 }
 
-function clientPassesLastStatusUpdateCutoff(client: ClientEntry, cutoffMs: number | null): boolean {
-  if (cutoffMs == null) return true;
+function clientPassesLastStatusUpdateRange(
+  client: ClientEntry,
+  afterMs: number | null,
+  beforeMs: number | null,
+): boolean {
+  if (afterMs == null && beforeMs == null) return true;
   const lu = client.lastStatusUpdateMs;
   if (lu == null) return false;
-  return lu >= cutoffMs;
+  if (afterMs != null && lu < afterMs) return false;
+  if (beforeMs != null && lu > beforeMs) return false;
+  return true;
 }
 
 function isAuthFailure(status: number): boolean {
@@ -355,6 +361,8 @@ export async function POST(req: NextRequest) {
     clientWaitStatus?: unknown;
     /** ISO date/datetime — only clients with `lastStatusUpdate` on or after this instant. */
     lastStatusUpdateAfter?: unknown;
+    /** ISO date/datetime — only clients with `lastStatusUpdate` on or before this instant. */
+    lastStatusUpdateBefore?: unknown;
   };
   try {
     body = await req.json();
@@ -376,6 +384,17 @@ export async function POST(req: NextRequest) {
   const applicantLimit = isNaN(rawLimit) || rawLimit <= 0 ? 50 : Math.min(rawLimit, 500);
   const clientWaitStatus = (str(body.clientWaitStatus) || "pending_applicant").toLowerCase();
   const lastStatusUpdateAfterMs = parseCutoffDateMs(body.lastStatusUpdateAfter);
+  const lastStatusUpdateBeforeMs = parseCutoffDateMs(body.lastStatusUpdateBefore);
+  if (
+    lastStatusUpdateAfterMs != null &&
+    lastStatusUpdateBeforeMs != null &&
+    lastStatusUpdateAfterMs > lastStatusUpdateBeforeMs
+  ) {
+    return NextResponse.json(
+      { error: "Invalid last status update range: From must be before To" },
+      { status: 400 },
+    );
+  }
 
   const hasBearer = Boolean(bearerJwtRaw && bearerJwtRaw.split(".").length >= 2);
   if (!hasBearer && (!sessionId || !clerkCookie)) {
@@ -445,7 +464,7 @@ export async function POST(req: NextRequest) {
   const clients = parseClientsPayload(clientsRes.json);
   const statusMatchedClients = clients.filter((c) => c.status === clientWaitStatus);
   const dateFilteredClients = statusMatchedClients.filter((c) =>
-    clientPassesLastStatusUpdateCutoff(c, lastStatusUpdateAfterMs),
+    clientPassesLastStatusUpdateRange(c, lastStatusUpdateAfterMs, lastStatusUpdateBeforeMs),
   );
 
   /** All applicants under matching-status clients (any route; for totals / scan order). */
@@ -537,6 +556,8 @@ export async function POST(req: NextRequest) {
       clientWaitStatus,
       lastStatusUpdateAfter:
         lastStatusUpdateAfterMs != null ? new Date(lastStatusUpdateAfterMs).toISOString() : null,
+      lastStatusUpdateBefore:
+        lastStatusUpdateBeforeMs != null ? new Date(lastStatusUpdateBeforeMs).toISOString() : null,
       statusMatchedClients: statusMatchedClients.length,
       clientsAfterLastStatusUpdateFilter: dateFilteredClients.length,
       /** @deprecated use statusMatchedClients */

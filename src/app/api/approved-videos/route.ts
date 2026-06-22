@@ -18,6 +18,7 @@ import {
 import { buildDeniedPassportRows, type DeniedPassportRow } from "@/lib/deniedPassports";
 import { computeDeniedRecoveryByEmail } from "@/lib/deniedRecovery";
 import { lookupPassportsByEmailBatch } from "@/lib/enrichPassportsByEmail";
+import { buildBotTimingReport } from "@/lib/botTimingStats";
 import {
   buildEmailToPassportMap,
   extractEmailFromIdnfyOrVfsLine,
@@ -507,11 +508,16 @@ function isInHouseVerificationPassedLine(line: string): boolean {
   return /in-house verification passed\b/i.test(line);
 }
 
-/** e.g. `In-house verification passed [solves=1/2, 13524ms]` */
+/** e.g. `TotalSolveTime=7077ms` or legacy `…, 13524ms]` */
 function parseInHouseVerificationPassedMs(line: string): number | null {
-  const m = line.match(/in-house verification passed\s*\[[^\]]*,\s*(\d+)\s*ms\]/i);
-  if (!m?.[1]) return null;
-  const n = parseInt(m[1], 10);
+  const totalM = line.match(/TotalSolveTime=(\d+)ms/i);
+  if (totalM?.[1]) {
+    const n = parseInt(totalM[1], 10);
+    return Number.isFinite(n) ? n : null;
+  }
+  const legacyM = line.match(/in-house verification passed\s*\[[^\]]*,\s*(\d+)\s*ms\]/i);
+  if (!legacyM?.[1]) return null;
+  const n = parseInt(legacyM[1], 10);
   return Number.isFinite(n) ? n : null;
 }
 
@@ -1826,6 +1832,14 @@ export async function POST(req: NextRequest) {
     };
   });
 
+  const attemptPassedLines = vfsAttemptLogs
+    .filter((e) => /Attempt\s+\d+\/\d+\s*:\s*passed\s*\(/i.test(e.line))
+    .map((e) => e.line);
+  const botTimingReport = buildBotTimingReport(
+    attemptPassedLines,
+    inHouseVerificationPassedLogs.map((e) => e.line)
+  );
+
   const erroredAttempts: ErroredAttemptEvent[] = [];
   for (const entry of erroredVideoAttemptLogs) {
     const emailRaw = extractField(entry.line, "email")?.toLowerCase();
@@ -1875,6 +1889,7 @@ export async function POST(req: NextRequest) {
       deniedApplicants,
       erroredAttempts,
     },
+    botTimingReport,
     totals: {
       approvedVideoCount,
       deniedVideoCount,

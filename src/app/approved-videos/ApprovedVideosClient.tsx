@@ -1,7 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import BotTimingAnalyticsSection from "@/components/BotTimingAnalyticsSection";
 import DeniedPassportsByPassportSection from "@/components/DeniedPassportsByPassportSection";
+import type { BotTimingReport } from "@/lib/botTimingStats";
 import type { DeniedPassportRow } from "@/lib/deniedPassports";
 import { computeDeniedRecoveryByEmail, type DeniedEmailRecovery } from "@/lib/deniedRecovery";
 import { collectEmailsFromReportData, collectPassportsFromReportData } from "@/lib/reportEvents";
@@ -106,6 +108,7 @@ type ApiResponse = {
       at: string;
     }>;
   };
+  botTimingReport?: BotTimingReport;
 };
 
 type RouteFilterOptions = {
@@ -804,6 +807,12 @@ export default function ApprovedVideosClient() {
               )}
             </div>
           </div>
+
+          {data.botTimingReport ? (
+            <div className="rounded-xl border border-zinc-200 bg-zinc-50/50 px-4 py-4">
+              <BotTimingAnalyticsSection report={data.botTimingReport} />
+            </div>
+          ) : null}
 
           {(filtered?.failureReasonBreakdown ?? []).length > 0 && (
             <div>
