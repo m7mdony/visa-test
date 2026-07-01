@@ -238,7 +238,7 @@ export function isIdnfyStatusDeniedLine(line: string): boolean {
 
 export function isErroredVideoAttemptLine(line: string): boolean {
   const hay = logLineHaystack(line);
-  return /Attempt\s+\d+\s*\/\s*\d+\s*:\s*failed/i.test(hay);
+  return /Attempt\s+\d+(?:\s*\/\s*\d+)?\s*:\s*failed/i.test(hay);
 }
 
 function escapeLogQLLineFilter(s: string): string {

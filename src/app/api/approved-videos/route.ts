@@ -18,7 +18,7 @@ import {
 import { buildDeniedPassportRows, type DeniedPassportRow } from "@/lib/deniedPassports";
 import { computeDeniedRecoveryByEmail } from "@/lib/deniedRecovery";
 import { lookupPassportsByEmailBatch } from "@/lib/enrichPassportsByEmail";
-import { buildBotTimingReport } from "@/lib/botTimingStats";
+import { buildBotTimingReport, isAttemptPassedTimingLine } from "@/lib/botTimingStats";
 import {
   buildEmailToPassportMap,
   extractEmailFromIdnfyOrVfsLine,
@@ -171,8 +171,8 @@ function extractFailureReasonKeys(line: string): string[] {
   if (isIdnfyStatusNeverFailure(line)) {
     return ["/idnfystatus never"];
   }
-  if (/Attempt\s+\d+\/\d+\s*:\s*failed/i.test(line)) {
-    const dash = line.match(/Attempt\s+\d+\/\d+\s*:\s*failed\s*\([^)]*\)\s*-\s*(.+)$/i);
+  if (/Attempt\s+\d+(?:\/\d+)?\s*:\s*failed/i.test(line)) {
+    const dash = line.match(/Attempt\s+\d+(?:\/\d+)?\s*:\s*failed\s*\([^)]*\)\s*-\s*(.+)$/i);
     const payload = dash?.[1]?.trim();
     if (payload) return [normalizeFailureReasonKey(payload)];
     return [];
@@ -227,14 +227,14 @@ function extractFailureReasonKey(line: string): string | null {
 
 function isInHouseSolverAttemptFailed(line: string): boolean {
   if (/in-house solver attempt failed/i.test(line)) return true;
-  /** New shape: `Attempt 3/3: failed (8859ms) - {...} email=...` */
-  if (/Attempt\s+\d+\/\d+\s*:\s*failed/i.test(line)) return true;
+  /** New shape: `Attempt 3: failed (8859ms) - {...} email=...` */
+  if (/Attempt\s+\d+(?:\/\d+)?\s*:\s*failed/i.test(line)) return true;
   return false;
 }
 
 function isInHouseSolverAttemptSucceeded(line: string): boolean {
   if (/in-house solver attempt succeeded/i.test(line)) return true;
-  if (/Attempt\s+\d+\/\d+\s*:\s*passed/i.test(line)) return true;
+  if (/Attempt\s+\d+(?:\/\d+)?\s*:\s*passed/i.test(line)) return true;
   return false;
 }
 
@@ -462,7 +462,7 @@ function extractSolverAttemptError(line: string): string | null {
   const m = line.match(/Error=(.+?)\s+email=/i);
   const raw = m?.[1]?.trim();
   if (raw && raw.length > 0) return raw;
-  const m2 = line.match(/Attempt\s+\d+\/\d+\s*:\s*failed\s*\([^)]*\)\s*-\s*(.+)$/i);
+  const m2 = line.match(/Attempt\s+\d+(?:\/\d+)?\s*:\s*failed\s*\([^)]*\)\s*-\s*(.+)$/i);
   const raw2 = m2?.[1]?.trim();
   return raw2 && raw2.length > 0 ? raw2 : null;
 }
@@ -1423,7 +1423,7 @@ export async function POST(req: NextRequest) {
   const successLogs = [...identitySuccessLogs].sort((a, b) => a.time.localeCompare(b.time));
 
   const vfsAttemptFiltered = vfsAttemptLogs.filter((e) =>
-    /Attempt\s+\d+\/\d+\s*:\s*(passed|failed)/i.test(e.line)
+    /Attempt\s+\d+(?:\/\d+)?\s*:\s*(passed|failed)/i.test(e.line)
   );
   const vfsSolverAndAttemptLogs = dedupeLogEntries([...solverLogsAll, ...vfsAttemptFiltered]);
   const identityFailLogs = identityOutcomeLogs.filter((entry) => {
@@ -1833,7 +1833,7 @@ export async function POST(req: NextRequest) {
   });
 
   const attemptPassedLines = vfsAttemptLogs
-    .filter((e) => /Attempt\s+\d+\/\d+\s*:\s*passed\s*\(/i.test(e.line))
+    .filter((e) => isAttemptPassedTimingLine(e.line))
     .map((e) => e.line);
   const botTimingReport = buildBotTimingReport(
     attemptPassedLines,

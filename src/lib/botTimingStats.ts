@@ -35,7 +35,12 @@ export type BotTimingReport = {
   };
 };
 
-const ATTEMPT_PASSED_MS_RE = /Attempt\s+\d+\/\d+\s*:\s*passed\s*\((\d+)ms\)/i;
+/** `Attempt 2: passed (1247ms)` or legacy `Attempt 2/3: passed (1247ms)` */
+const ATTEMPT_PASSED_MS_RE = /Attempt\s+\d+(?:\/\d+)?\s*:\s*passed\s*\((\d+)ms\)/i;
+
+export function isAttemptPassedTimingLine(line: string): boolean {
+  return ATTEMPT_PASSED_MS_RE.test(line);
+}
 const IN_HOUSE_NEW_RE =
   /in-house verification passed\s*\[solves=(\d+)\/(\d+),\s*TotalSolveTime=(\d+)ms,\s*BottleneckTime=(\d+)ms\]/i;
 
