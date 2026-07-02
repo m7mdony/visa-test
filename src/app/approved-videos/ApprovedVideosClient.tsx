@@ -8,6 +8,12 @@ import type { DeniedPassportRow } from "@/lib/deniedPassports";
 import { computeDeniedRecoveryByEmail, type DeniedEmailRecovery } from "@/lib/deniedRecovery";
 import { collectEmailsFromReportData, collectPassportsFromReportData } from "@/lib/reportEvents";
 import { computeFilteredTopStats } from "@/lib/reportRouteFilter";
+import VisaflowDashboardLoginPanel from "@/components/VisaflowDashboardLoginPanel";
+import {
+  applyRefreshedBearerJwt,
+  buildDashboardAuthBody,
+  useVisaflowDashboardAuth,
+} from "@/lib/visaflowDashboardAuth";
 import {
   eventMatchesRouteFilter,
   indexPassportRoutes,
@@ -15,10 +21,6 @@ import {
   type PassportRouteInfo,
   type RouteFilterSelection,
 } from "@/lib/visaflowDashboardClients";
-
-const SS_BEARER_JWT = "ui-test-visaflow-dashboard-bearer-jwt";
-const SS_CLERK_REFRESH_SESSION_ID = "ui-test-visaflow-clerk-refresh-session-id";
-const SS_OTP_COOKIE_JAR = "ui-test-clerk-otp-cookie-jar";
 
 type SolveKindUi = "drop" | "verification";
 type DeploymentEnvUi = "prod" | "staging";
@@ -197,38 +199,11 @@ export default function ApprovedVideosClient() {
   const [routeCombinations, setRouteCombinations] = useState<RouteCombination[]>([]);
   const [routesLoading, setRoutesLoading] = useState(false);
   const [routesError, setRoutesError] = useState<string | null>(null);
-  const [dashboardJwtSaved, setDashboardJwtSaved] = useState(false);
-
-  const refreshJwtFlag = useCallback(() => {
-    try {
-      setDashboardJwtSaved(Boolean(sessionStorage.getItem(SS_BEARER_JWT)?.trim()));
-    } catch {
-      setDashboardJwtSaved(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    refreshJwtFlag();
-    const onJwt = () => refreshJwtFlag();
-    window.addEventListener("visaflow-jwt-updated", onJwt);
-    window.addEventListener("focus", onJwt);
-    return () => {
-      window.removeEventListener("visaflow-jwt-updated", onJwt);
-      window.removeEventListener("focus", onJwt);
-    };
-  }, [refreshJwtFlag]);
+  const { authenticated: dashboardJwtSaved } = useVisaflowDashboardAuth();
 
   const fetchPassportRoutes = useCallback(async (report: ApiResponse) => {
-    let bearerFromStorage = "";
-    let refreshSid = "";
-    let refreshJar = "";
-    try {
-      bearerFromStorage = sessionStorage.getItem(SS_BEARER_JWT)?.trim() ?? "";
-      refreshSid = sessionStorage.getItem(SS_CLERK_REFRESH_SESSION_ID)?.trim() ?? "";
-      refreshJar = sessionStorage.getItem(SS_OTP_COOKIE_JAR)?.trim() ?? "";
-    } catch {
-      /* */
-    }
+    const { bearerJwt: bearerFromStorage, clerkSessionId: refreshSid, clerkCookie: refreshJar } =
+      buildDashboardAuthBody();
     if (!bearerFromStorage || bearerFromStorage.split(".").length < 2) {
       setPassportRoutes([]);
       setRouteFilterOptions(null);
@@ -268,13 +243,7 @@ export default function ApprovedVideosClient() {
         return;
       }
       const nextJwt = typeof json.refreshedBearerJwt === "string" ? json.refreshedBearerJwt.trim() : "";
-      if (nextJwt && nextJwt.split(".").length >= 2) {
-        try {
-          sessionStorage.setItem(SS_BEARER_JWT, nextJwt);
-        } catch {
-          /* */
-        }
-      }
+      applyRefreshedBearerJwt(nextJwt);
       setPassportRoutes(json.routes ?? []);
       setRouteFilterOptions(json.filterOptions ?? null);
       setRouteCombinations(json.routeCombinations ?? []);
@@ -420,6 +389,8 @@ export default function ApprovedVideosClient() {
           type (drop vs verification).
         </p>
       </div>
+
+      <VisaflowDashboardLoginPanel hint="Sign in once — stays saved when you refresh or open other ui-test pages." />
 
       <div className="rounded-lg border border-zinc-200 bg-white px-4 py-3 space-y-4">
         <div>
@@ -616,9 +587,7 @@ export default function ApprovedVideosClient() {
               )}
             </div>
             {!dashboardJwtSaved ? (
-              <p className="text-xs text-zinc-600">
-                Sign in with dashboard OTP in the DENIED passports section below to load routes and enable filtering.
-              </p>
+              <p className="text-xs text-zinc-600">Sign in with Visaflow dashboard OTP above to load routes and enable filtering.</p>
             ) : routesLoading ? (
               <p className="text-xs text-zinc-600">Loading passport routes from dashboard…</p>
             ) : routesError ? (

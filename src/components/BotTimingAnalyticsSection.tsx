@@ -59,7 +59,6 @@ function TimingStatsTable({ stats, label }: { stats: TimingAnalytics | null; lab
 }
 
 export default function BotTimingAnalyticsSection({ report }: { report: BotTimingReport }) {
-  const dist = report.inHouseVerification.solveTryDistribution;
   const bn = report.inHouseVerification.bottleneck;
 
   return (
@@ -77,38 +76,18 @@ export default function BotTimingAnalyticsSection({ report }: { report: BotTimin
 
       <div>
         <h2 className="text-sm font-medium text-zinc-800 mb-1">
-          In-house verification solve timing (<code className="text-[10px]">In-house verification passed</code>)
+          In-house verification solve timing (
+          <code className="text-[10px]">In-house verification passed [TotalSolveTime=…, BottleneckTime=…]</code>)
         </h2>
         <p className="text-xs text-zinc-500 mb-3">
           Full solve time until bot fetches VFS results. {report.inHouseVerification.parsedCount} of{" "}
           {report.inHouseVerification.logLineCount} lines parsed.
         </p>
 
-        <div className="grid gap-4 lg:grid-cols-2 mb-4">
-          <div className="rounded-lg border border-violet-200 bg-violet-50/50 px-4 py-3">
-            <div className="text-xs font-medium text-violet-900 mb-2">Succeeded on which try (solves=N/3)</div>
-            <div className="grid grid-cols-3 gap-2 text-center">
-              <div className="rounded bg-white border border-violet-100 px-2 py-2">
-                <div className="text-lg font-semibold text-violet-950">{dist.firstTry}</div>
-                <div className="text-[10px] text-violet-800">1st try</div>
-              </div>
-              <div className="rounded bg-white border border-violet-100 px-2 py-2">
-                <div className="text-lg font-semibold text-violet-950">{dist.secondTry}</div>
-                <div className="text-[10px] text-violet-800">2nd try</div>
-              </div>
-              <div className="rounded bg-white border border-violet-100 px-2 py-2">
-                <div className="text-lg font-semibold text-violet-950">{dist.thirdTry}</div>
-                <div className="text-[10px] text-violet-800">3rd try</div>
-              </div>
-            </div>
-            {dist.other > 0 ? (
-              <p className="mt-2 text-[10px] text-violet-700">Other: {dist.other}</p>
-            ) : null}
-          </div>
-
+        <div className="mb-4">
           <div className="rounded-lg border border-sky-200 bg-sky-50/50 px-4 py-3">
             <div className="text-xs font-medium text-sky-900 mb-2">Bottleneck time</div>
-            <div className="grid grid-cols-2 gap-2 text-center mb-3">
+            <div className="grid grid-cols-2 gap-2 text-center mb-3 max-w-xs">
               <div className="rounded bg-white border border-sky-100 px-2 py-2">
                 <div className="text-lg font-semibold text-sky-950">{bn.zeroCount}</div>
                 <div className="text-[10px] text-sky-800">0 ms</div>

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import type { DeniedPassportRow } from "@/lib/deniedPassports";
 import type { DeniedEmailRecovery } from "@/lib/deniedRecovery";
 import { collectPassportsFromReportData } from "@/lib/reportEvents";
@@ -14,10 +14,12 @@ import {
   type StagingJobBatch,
 } from "@/lib/stagingJobBatches";
 
-const SS_BEARER_JWT = "ui-test-visaflow-dashboard-bearer-jwt";
-const SS_CLERK_REFRESH_SESSION_ID = "ui-test-visaflow-clerk-refresh-session-id";
-const SS_OTP_COOKIE_JAR = "ui-test-clerk-otp-cookie-jar";
-const SS_OTP_SIA = "ui-test-clerk-sign-in-attempt-id";
+import VisaflowDashboardLoginPanel from "@/components/VisaflowDashboardLoginPanel";
+import {
+  applyRefreshedBearerJwt,
+  buildDashboardAuthBody,
+  useVisaflowDashboardAuth,
+} from "@/lib/visaflowDashboardAuth";
 
 const INTERVAL_MS: Record<string, number> = {
   "15m": 15 * 60 * 1000,
@@ -54,63 +56,14 @@ export default function UnrecoveredDeniedJobsClient() {
   const [report, setReport] = useState<ReportPayload | null>(null);
   const [dashByPassport, setDashByPassport] = useState<Record<string, DashboardMediaEntry>>({});
   const [dashError, setDashError] = useState<string | null>(null);
-  const [dashboardJwtSaved, setDashboardJwtSaved] = useState(false);
-  const [otpEmail, setOtpEmail] = useState("");
-  const [otpCookieJar, setOtpCookieJar] = useState("");
-  const [otpSignInAttemptId, setOtpSignInAttemptId] = useState("");
-  const [otpCode, setOtpCode] = useState("");
-  const [otpLoading, setOtpLoading] = useState(false);
-  const [otpError, setOtpError] = useState<string | null>(null);
+  const { authenticated: dashboardJwtSaved } = useVisaflowDashboardAuth();
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
-  const refreshJwtFlag = useCallback(() => {
-    try {
-      setDashboardJwtSaved(Boolean(sessionStorage.getItem(SS_BEARER_JWT)?.trim()));
-    } catch {
-      setDashboardJwtSaved(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    refreshJwtFlag();
-    const onJwt = () => refreshJwtFlag();
-    window.addEventListener("visaflow-jwt-updated", onJwt);
-    window.addEventListener("focus", onJwt);
-    try {
-      const jar = sessionStorage.getItem(SS_OTP_COOKIE_JAR);
-      const sia = sessionStorage.getItem(SS_OTP_SIA);
-      if (jar) setOtpCookieJar(jar);
-      if (sia) setOtpSignInAttemptId(sia);
-    } catch {
-      /* */
-    }
-    return () => {
-      window.removeEventListener("visaflow-jwt-updated", onJwt);
-      window.removeEventListener("focus", onJwt);
-    };
-  }, [refreshJwtFlag]);
-
-  function applyPreset(interval: string) {
-    const ms = INTERVAL_MS[interval] ?? INTERVAL_MS["24h"];
-    const to = new Date();
-    const from = new Date(to.getTime() - ms);
-    setFromStr(toDatetimeLocal(from));
-    setToStr(toDatetimeLocal(to));
-  }
-
   async function fetchDashboardForPassports(passportNumbers: string[]) {
-    let bearerFromStorage = "";
-    let refreshSid = "";
-    let refreshJar = "";
-    try {
-      bearerFromStorage = sessionStorage.getItem(SS_BEARER_JWT)?.trim() ?? "";
-      refreshSid = sessionStorage.getItem(SS_CLERK_REFRESH_SESSION_ID)?.trim() ?? "";
-      refreshJar = sessionStorage.getItem(SS_OTP_COOKIE_JAR)?.trim() ?? "";
-    } catch {
-      /* */
-    }
+    const { bearerJwt: bearerFromStorage, clerkSessionId: refreshSid, clerkCookie: refreshJar } =
+      buildDashboardAuthBody();
     if (!bearerFromStorage || bearerFromStorage.split(".").length < 2) {
-      setDashError("Sign in with dashboard OTP first.");
+      setDashError("Sign in with Visaflow dashboard OTP first.");
       return false;
     }
     setDashError(null);
@@ -120,7 +73,7 @@ export default function UnrecoveredDeniedJobsClient() {
       body: JSON.stringify({
         passportNumbers,
         bearerJwt: bearerFromStorage,
-        ...(refreshSid.startsWith("sess_") ? { clerkSessionId: refreshSid } : {}),
+        ...(refreshSid?.startsWith("sess_") ? { clerkSessionId: refreshSid } : {}),
         ...(refreshJar ? { clerkCookie: refreshJar } : {}),
       }),
     });
@@ -133,16 +86,17 @@ export default function UnrecoveredDeniedJobsClient() {
       setDashError(json.error ?? `HTTP ${res.status}`);
       return false;
     }
-    const nextJwt = typeof json.refreshedBearerJwt === "string" ? json.refreshedBearerJwt.trim() : "";
-    if (nextJwt && nextJwt.split(".").length >= 2) {
-      try {
-        sessionStorage.setItem(SS_BEARER_JWT, nextJwt);
-      } catch {
-        /* */
-      }
-    }
+    applyRefreshedBearerJwt(json.refreshedBearerJwt);
     setDashByPassport(json.byPassport ?? {});
     return true;
+  }
+
+  function applyPreset(interval: string) {
+    const ms = INTERVAL_MS[interval] ?? INTERVAL_MS["24h"];
+    const to = new Date();
+    const from = new Date(to.getTime() - ms);
+    setFromStr(toDatetimeLocal(from));
+    setToStr(toDatetimeLocal(to));
   }
 
   async function handleBuild() {
@@ -238,93 +192,6 @@ export default function UnrecoveredDeniedJobsClient() {
     }
   }
 
-  function parseOtpJsonResponse(text: string): Record<string, unknown> {
-    try {
-      return JSON.parse(text) as Record<string, unknown>;
-    } catch {
-      return { error: text.slice(0, 800) || "Invalid JSON" };
-    }
-  }
-
-  async function sendClerkOtp() {
-    setOtpError(null);
-    const email = otpEmail.trim();
-    if (!email.includes("@")) {
-      setOtpError("Enter a valid email.");
-      return;
-    }
-    setOtpLoading(true);
-    try {
-      const res = await fetch("/api/clerk-email-signin/start", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email }),
-      });
-      const otpData = parseOtpJsonResponse(await res.text());
-      if (!res.ok) {
-        setOtpError(typeof otpData.error === "string" ? otpData.error : `HTTP ${res.status}`);
-        return;
-      }
-      const signInAttemptId = typeof otpData.signInAttemptId === "string" ? otpData.signInAttemptId : "";
-      const cookieJar = typeof otpData.cookieJar === "string" ? otpData.cookieJar : "";
-      if (!signInAttemptId || !cookieJar) {
-        setOtpError("Missing signInAttemptId or cookieJar");
-        return;
-      }
-      setOtpSignInAttemptId(signInAttemptId);
-      setOtpCookieJar(cookieJar);
-      sessionStorage.setItem(SS_OTP_SIA, signInAttemptId);
-      sessionStorage.setItem(SS_OTP_COOKIE_JAR, cookieJar);
-    } catch (e: unknown) {
-      setOtpError(e instanceof Error ? e.message : "Request failed");
-    } finally {
-      setOtpLoading(false);
-    }
-  }
-
-  async function verifyClerkOtp() {
-    setOtpError(null);
-    const sia = otpSignInAttemptId.trim();
-    const jar = otpCookieJar.trim();
-    const code = otpCode.trim().replace(/\s+/g, "");
-    if (!sia.startsWith("sia_")) {
-      setOtpError("Send the email code first.");
-      return;
-    }
-    if (!/^\d{6}$/.test(code)) {
-      setOtpError("Enter the 6-digit code.");
-      return;
-    }
-    setOtpLoading(true);
-    try {
-      const res = await fetch("/api/clerk-email-signin/verify", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ signInAttemptId: sia, code, cookieJar: jar }),
-      });
-      const otpData = parseOtpJsonResponse(await res.text());
-      if (!res.ok) {
-        setOtpError(typeof otpData.error === "string" ? otpData.error : `HTTP ${res.status}`);
-        return;
-      }
-      const jwt = typeof otpData.jwt === "string" ? otpData.jwt.trim() : "";
-      if (!jwt) {
-        setOtpError("No JWT in response");
-        return;
-      }
-      sessionStorage.setItem(SS_BEARER_JWT, jwt);
-      const sid = typeof otpData.sessionId === "string" ? otpData.sessionId.trim() : "";
-      if (sid.startsWith("sess_")) sessionStorage.setItem(SS_CLERK_REFRESH_SESSION_ID, sid);
-      setDashboardJwtSaved(true);
-      setOtpCode("");
-      window.dispatchEvent(new Event("visaflow-jwt-updated"));
-    } catch (e: unknown) {
-      setOtpError(e instanceof Error ? e.message : "Request failed");
-    } finally {
-      setOtpLoading(false);
-    }
-  }
-
   return (
     <div className="w-full space-y-6">
       <div>
@@ -337,49 +204,7 @@ export default function UnrecoveredDeniedJobsClient() {
         </p>
       </div>
 
-      <div className="rounded-lg border border-emerald-200 bg-emerald-50/80 px-4 py-3 space-y-3">
-        <p className="text-sm font-medium text-zinc-800">Dashboard OTP</p>
-        {dashboardJwtSaved ? (
-          <span className="text-xs text-emerald-800 font-medium">JWT saved</span>
-        ) : (
-          <span className="text-xs text-zinc-500">Required before build</span>
-        )}
-        {otpError ? <pre className="text-[11px] text-red-800 whitespace-pre-wrap">{otpError}</pre> : null}
-        <div className="flex flex-wrap gap-2 items-end">
-          <input
-            type="email"
-            value={otpEmail}
-            onChange={(e) => setOtpEmail(e.target.value)}
-            placeholder="Email"
-            className="flex-1 min-w-[180px] rounded-lg border border-zinc-300 px-3 py-2 text-sm bg-white"
-          />
-          <button
-            type="button"
-            onClick={sendClerkOtp}
-            disabled={otpLoading}
-            className="rounded-lg bg-emerald-800 px-3 py-2 text-sm text-white disabled:opacity-50"
-          >
-            Send code
-          </button>
-          <input
-            type="text"
-            inputMode="numeric"
-            maxLength={6}
-            value={otpCode}
-            onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
-            placeholder="6-digit"
-            className="w-24 rounded-lg border border-zinc-300 px-2 py-2 text-sm font-mono"
-          />
-          <button
-            type="button"
-            onClick={verifyClerkOtp}
-            disabled={otpLoading}
-            className="rounded-lg border border-emerald-700 px-3 py-2 text-sm"
-          >
-            Verify
-          </button>
-        </div>
-      </div>
+      <VisaflowDashboardLoginPanel hint="Required before build. Stays signed in across pages and refresh." />
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <div>
