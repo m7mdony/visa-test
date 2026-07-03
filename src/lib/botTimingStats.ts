@@ -25,15 +25,15 @@ export type BotTimingReport = {
 };
 
 /** `Attempt 2: passed (1247ms)` or legacy `Attempt 2/3: passed (1247ms)` */
-const ATTEMPT_PASSED_MS_RE = /Attempt\s+\d+(?:\/\d+)?\s*:\s*passed\s*\((\d+)ms\)/i;
+const ATTEMPT_PASSED_MS_RE = /Attempt\s+\d+(?:\/\d+)?\s*:\s*passed\s*\(\s*(\d+)\s*ms\s*\)/i;
 
-/** `In-house verification passed [TotalSolveTime=5821ms, BottleneckTime=0ms]` */
+/** `[TimeTaken=8605ms, BottleneckTime=0ms]` or `[TotalSolveTime=5821ms, BottleneckTime=0ms]` */
 const IN_HOUSE_RE =
-  /in-house verification passed\s*\[TotalSolveTime=(\d+)ms,\s*BottleneckTime=(\d+)ms\]/i;
+  /in-house verification passed\s*\[(?:TimeTaken|TotalSolveTime)=(\d+)ms,\s*BottleneckTime=(\d+)ms\]/i;
 
 /** Legacy `… [solves=2/3, TotalSolveTime=…, BottleneckTime=…]` */
 const IN_HOUSE_LEGACY_RE =
-  /in-house verification passed\s*\[solves=\d+\/\d+,\s*TotalSolveTime=(\d+)ms,\s*BottleneckTime=(\d+)ms\]/i;
+  /in-house verification passed\s*\[solves=\d+\/\d+,\s*(?:TimeTaken|TotalSolveTime)=(\d+)ms,\s*BottleneckTime=(\d+)ms\]/i;
 
 export function isAttemptPassedTimingLine(line: string): boolean {
   return ATTEMPT_PASSED_MS_RE.test(line);
@@ -56,6 +56,11 @@ export function parseInHouseVerificationEntry(line: string): InHouseVerification
     return null;
   }
   return { totalSolveTimeMs, bottleneckTimeMs };
+}
+
+export function parseInHouseVerificationTotalMs(line: string): number | null {
+  const entry = parseInHouseVerificationEntry(line);
+  return entry?.totalSolveTimeMs ?? null;
 }
 
 export function buildBotTimingReport(

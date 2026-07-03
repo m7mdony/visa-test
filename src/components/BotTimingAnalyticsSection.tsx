@@ -77,7 +77,7 @@ export default function BotTimingAnalyticsSection({ report }: { report: BotTimin
       <div>
         <h2 className="text-sm font-medium text-zinc-800 mb-1">
           In-house verification solve timing (
-          <code className="text-[10px]">In-house verification passed [TotalSolveTime=…, BottleneckTime=…]</code>)
+          <code className="text-[10px]">In-house verification passed [TimeTaken=…, BottleneckTime=…]</code>)
         </h2>
         <p className="text-xs text-zinc-500 mb-3">
           Full solve time until bot fetches VFS results. {report.inHouseVerification.parsedCount} of{" "}
