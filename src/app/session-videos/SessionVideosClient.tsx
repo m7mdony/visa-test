@@ -264,7 +264,7 @@ export default function SessionVideosClient() {
           ...(useBearer
             ? {
                 bearerJwt: bearerFromStorage,
-                ...(refreshSid.startsWith("sess_") ? { clerkSessionId: refreshSid } : {}),
+                ...(refreshSid?.startsWith("sess_") ? { clerkSessionId: refreshSid } : {}),
                 ...(refreshJar ? { clerkCookie: refreshJar } : {}),
               }
             : {

@@ -336,7 +336,7 @@ export default function ProcessingApplicantVideosClient() {
                 clientWaitStatus: effectiveClientWaitStatus,
                 ...(lastStatusFromIso ? { lastStatusUpdateAfter: lastStatusFromIso } : {}),
                 ...(lastStatusToIso ? { lastStatusUpdateBefore: lastStatusToIso } : {}),
-                ...(refreshSid.startsWith("sess_") ? { clerkSessionId: refreshSid } : {}),
+                ...(refreshSid?.startsWith("sess_") ? { clerkSessionId: refreshSid } : {}),
                 ...(refreshJar ? { clerkCookie: refreshJar } : {}),
               }
             : {

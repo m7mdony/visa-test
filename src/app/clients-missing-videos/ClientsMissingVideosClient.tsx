@@ -231,7 +231,7 @@ export default function ClientsMissingVideosClient() {
           useBearer
             ? {
                 bearerJwt: bearerFromStorage,
-                ...(refreshSid.startsWith("sess_") ? { clerkSessionId: refreshSid } : {}),
+                ...(refreshSid?.startsWith("sess_") ? { clerkSessionId: refreshSid } : {}),
                 ...(refreshJar ? { clerkCookie: refreshJar } : {}),
               }
             : {

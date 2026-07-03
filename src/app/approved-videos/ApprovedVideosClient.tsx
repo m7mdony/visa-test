@@ -222,7 +222,7 @@ export default function ApprovedVideosClient() {
           passportNumbers,
           emails,
           bearerJwt: bearerFromStorage,
-          ...(refreshSid.startsWith("sess_") ? { clerkSessionId: refreshSid } : {}),
+          ...(refreshSid?.startsWith("sess_") ? { clerkSessionId: refreshSid } : {}),
           ...(refreshJar ? { clerkCookie: refreshJar } : {}),
         }),
       });
