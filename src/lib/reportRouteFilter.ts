@@ -1,5 +1,12 @@
+import type { BotTimingReport } from "@/lib/botTimingStats";
+import { buildBotTimingReport } from "@/lib/botTimingStats";
 import type { DeniedPassportRow } from "@/lib/deniedPassports";
-import type { ErroredAttemptEvent, EmailStatEvent, StatusVideoEvent } from "@/lib/reportEvents";
+import type {
+  BotTimingLogEvent,
+  ErroredAttemptEvent,
+  EmailStatEvent,
+  StatusVideoEvent,
+} from "@/lib/reportEvents";
 import {
   eventMatchesRouteFilter,
   indexPassportRoutes,
@@ -22,7 +29,36 @@ export type ReportEventsBundle = {
   inHousePassed: EmailStatEvent[];
   deniedApplicants: EmailStatEvent[];
   erroredAttempts: ErroredAttemptEvent[];
+  attemptPassedTimings?: BotTimingLogEvent[];
+  inHouseTimingLogs?: BotTimingLogEvent[];
 };
+
+export function computeFilteredBotTimingReport(
+  events: ReportEventsBundle | undefined,
+  routes: PassportRouteInfo[],
+  emailToRoute: Map<string, PassportRouteInfo>,
+  filter: RouteFilterSelection,
+  fallback: BotTimingReport | undefined
+): BotTimingReport | null {
+  if (!fallback) return null;
+  if (!events || !isRouteFilterActive(filter)) return fallback;
+
+  const routesByKey = indexPassportRoutes(routes);
+  const matches = (email: string, passport: string | null) =>
+    eventMatchesRouteFilter(email, passport, routesByKey, emailToRoute, filter);
+
+  const attemptLines = (events.attemptPassedTimings ?? [])
+    .filter((e) => matches(e.email, e.passportNumber))
+    .map((e) => e.line);
+  const inHouseLines = (events.inHouseTimingLogs ?? [])
+    .filter((e) => matches(e.email, e.passportNumber))
+    .map((e) => e.line);
+
+  // Older API payloads lack timing identity — keep full-window report.
+  if (!events.attemptPassedTimings && !events.inHouseTimingLogs) return fallback;
+
+  return buildBotTimingReport(attemptLines, inHouseLines);
+}
 
 export type FailureReasonRow = {
   reason: string;

@@ -7,7 +7,7 @@ import type { BotTimingReport } from "@/lib/botTimingStats";
 import type { DeniedPassportRow } from "@/lib/deniedPassports";
 import { computeDeniedRecoveryByEmail, type DeniedEmailRecovery } from "@/lib/deniedRecovery";
 import { collectEmailsFromReportData, collectPassportsFromReportData } from "@/lib/reportEvents";
-import { computeFilteredTopStats } from "@/lib/reportRouteFilter";
+import { computeFilteredBotTimingReport, computeFilteredTopStats } from "@/lib/reportRouteFilter";
 import VisaflowDashboardLoginPanel from "@/components/VisaflowDashboardLoginPanel";
 import {
   applyRefreshedBearerJwt,
@@ -107,6 +107,18 @@ type ApiResponse = {
       email: string;
       passportNumber: string | null;
       reason: string;
+      at: string;
+    }>;
+    attemptPassedTimings?: Array<{
+      email: string;
+      passportNumber: string | null;
+      line: string;
+      at: string;
+    }>;
+    inHouseTimingLogs?: Array<{
+      email: string;
+      passportNumber: string | null;
+      line: string;
       at: string;
     }>;
   };
@@ -315,6 +327,17 @@ export default function ApprovedVideosClient() {
   }, [data, routeFilter, passportRoutes, emailToRoute]);
 
   const routeFilterActive = isRouteFilterActive(routeFilter);
+
+  const filteredBotTimingReport = useMemo(() => {
+    if (!data?.botTimingReport) return null;
+    return computeFilteredBotTimingReport(
+      data.reportEvents,
+      passportRoutes,
+      emailToRoute,
+      routeFilter,
+      data.botTimingReport
+    );
+  }, [data, routeFilter, passportRoutes, emailToRoute]);
 
   const unresolvedEmails =
     data?.applicantOutcomes
@@ -777,9 +800,9 @@ export default function ApprovedVideosClient() {
             </div>
           </div>
 
-          {data.botTimingReport ? (
+          {filteredBotTimingReport ? (
             <div className="rounded-xl border border-zinc-200 bg-zinc-50/50 px-4 py-4">
-              <BotTimingAnalyticsSection report={data.botTimingReport} />
+              <BotTimingAnalyticsSection report={filteredBotTimingReport} />
             </div>
           ) : null}
 

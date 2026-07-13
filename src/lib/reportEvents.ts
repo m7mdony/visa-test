@@ -20,6 +20,14 @@ export type ErroredAttemptEvent = {
   at: string;
 };
 
+/** Attempt-passed / in-house timing log lines with identity for route filtering. */
+export type BotTimingLogEvent = {
+  email: string;
+  passportNumber: string | null;
+  line: string;
+  at: string;
+};
+
 export function buildEmailToPassportMap(
   pairs: Array<{ email: string; passportNumber: string | null | undefined }>
 ): Map<string, string> {
@@ -88,6 +96,8 @@ export function collectEmailsFromReportData(data: {
     inHousePassed?: Array<{ email: string }>;
     deniedApplicants?: Array<{ email: string }>;
     erroredAttempts?: Array<{ email: string }>;
+    attemptPassedTimings?: Array<{ email: string }>;
+    inHouseTimingLogs?: Array<{ email: string }>;
   };
   deniedPassportRows?: Array<{ email: string }>;
 }): string[] {
@@ -101,6 +111,8 @@ export function collectEmailsFromReportData(data: {
   for (const e of data.reportEvents?.inHousePassed ?? []) add(e.email);
   for (const e of data.reportEvents?.deniedApplicants ?? []) add(e.email);
   for (const e of data.reportEvents?.erroredAttempts ?? []) add(e.email);
+  for (const e of data.reportEvents?.attemptPassedTimings ?? []) add(e.email);
+  for (const e of data.reportEvents?.inHouseTimingLogs ?? []) add(e.email);
   return [...emails];
 }
 
@@ -111,6 +123,8 @@ export function collectPassportsFromReportData(data: {
     inHousePassed?: EmailStatEvent[];
     deniedApplicants?: EmailStatEvent[];
     erroredAttempts?: ErroredAttemptEvent[];
+    attemptPassedTimings?: BotTimingLogEvent[];
+    inHouseTimingLogs?: BotTimingLogEvent[];
   };
 }): string[] {
   const keys = new Set<string>();
@@ -124,5 +138,7 @@ export function collectPassportsFromReportData(data: {
   for (const e of data.reportEvents?.inHousePassed ?? []) add(e.passportNumber);
   for (const e of data.reportEvents?.deniedApplicants ?? []) add(e.passportNumber);
   for (const e of data.reportEvents?.erroredAttempts ?? []) add(e.passportNumber);
+  for (const e of data.reportEvents?.attemptPassedTimings ?? []) add(e.passportNumber);
+  for (const e of data.reportEvents?.inHouseTimingLogs ?? []) add(e.passportNumber);
   return [...keys];
 }

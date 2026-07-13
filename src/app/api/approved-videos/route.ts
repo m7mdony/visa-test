@@ -1829,16 +1829,38 @@ export async function POST(req: NextRequest) {
     };
   });
 
-  const attemptPassedLines = dedupeLogEntries([
+  const attemptPassedEntries = dedupeLogEntries([
     ...vfsAttemptLogs,
     ...solverLogsAll,
     ...identityMiscLogs,
-  ])
-    .filter((e) => isAttemptPassedTimingLine(e.line))
-    .map((e) => e.line);
+  ]).filter((e) => isAttemptPassedTimingLine(e.line));
+  const attemptPassedTimings = attemptPassedEntries.map((entry) => {
+    const email =
+      extractField(entry.line, "email")?.toLowerCase() ??
+      extractEmailFromIdnfyOrVfsLine(entry.line) ??
+      "";
+    return {
+      email,
+      passportNumber: resolvePassportForLog(entry.line, email || null, emailToPassport),
+      line: entry.line,
+      at: entry.time,
+    };
+  });
+  const inHouseTimingLogs = inHouseVerificationPassedLogs.map((entry) => {
+    const email =
+      extractField(entry.line, "email")?.toLowerCase() ??
+      extractEmailFromIdnfyOrVfsLine(entry.line) ??
+      "";
+    return {
+      email,
+      passportNumber: resolvePassportForLog(entry.line, email || null, emailToPassport),
+      line: entry.line,
+      at: entry.time,
+    };
+  });
   const botTimingReport = buildBotTimingReport(
-    attemptPassedLines,
-    inHouseVerificationPassedLogs.map((e) => e.line)
+    attemptPassedTimings.map((e) => e.line),
+    inHouseTimingLogs.map((e) => e.line)
   );
 
   const erroredAttempts: ErroredAttemptEvent[] = [];
@@ -1889,6 +1911,8 @@ export async function POST(req: NextRequest) {
       inHousePassed,
       deniedApplicants,
       erroredAttempts,
+      attemptPassedTimings,
+      inHouseTimingLogs,
     },
     botTimingReport,
     totals: {
