@@ -625,16 +625,148 @@ function parseAzureLivenessSolvingLine(line: string): { sessionPrefix: string; p
   return { sessionPrefix: m[1].trim().toLowerCase(), passport: m[2].trim() };
 }
 
-function buildSessionSolveKindMap(azureLogs: LogEntry[]): Map<string, SolveKind> {
+function setSolveKindPrefix(map: Map<string, SolveKind>, rawId: string, kind: SolveKind) {
+  const prefix = taskIdToSessionPrefix(rawId);
+  if (!prefix) return;
+  // Prefer verification if any signal for this prefix says so.
+  if (kind === "verification" || !map.has(prefix)) {
+    map.set(prefix, kind);
+  }
+}
+
+/**
+ * Session-prefix → drop|verification.
+ * 1) `[REDIS][PAYLOAD]` `isVerificationJob` + sessionId/id + message_id
+ * 2) `Solving face verification … (passport: VERIFICATION|real)`
+ */
+function buildSessionSolveKindMap(
+  azureLogs: LogEntry[],
+  azurePayloadLogs: LogEntry[] = []
+): Map<string, SolveKind> {
   const map = new Map<string, SolveKind>();
+
+  for (const e of azurePayloadLogs) {
+    if (!e.line.includes("[REDIS][PAYLOAD]")) continue;
+    const payloadMatch = e.line.match(/payload=(\{.+\})\s*$/);
+    if (!payloadMatch?.[1]) continue;
+    try {
+      const payload = JSON.parse(payloadMatch[1]) as Record<string, unknown>;
+      const kind: SolveKind = payload.isVerificationJob === true ? "verification" : "drop";
+      const sessionId =
+        typeof payload.sessionId === "string" && payload.sessionId.trim()
+          ? payload.sessionId.trim()
+          : typeof payload.id === "string" && payload.id.trim()
+            ? payload.id.trim()
+            : "";
+      if (sessionId) setSolveKindPrefix(map, sessionId, kind);
+      const messageId = extractField(e.line, "message_id");
+      if (messageId) setSolveKindPrefix(map, messageId, kind);
+    } catch {
+      /* ignore bad payload JSON */
+    }
+  }
+
   for (const e of azureLogs) {
     const parsed = parseAzureLivenessSolvingLine(e.line);
     if (!parsed) continue;
     const kind: SolveKind =
       parsed.passport.toUpperCase() === "VERIFICATION" ? "verification" : "drop";
-    map.set(parsed.sessionPrefix, kind);
+    setSolveKindPrefix(map, parsed.sessionPrefix, kind);
   }
   return map;
+}
+
+type ActivationWindow = {
+  email: string;
+  ref: string;
+  startMs: number;
+  endMsExclusive: number;
+};
+
+function extractJsonUrn(line: string): string | undefined {
+  const aurn = line.match(/"aurn"\s*:\s*"([^"]+)"/i)?.[1];
+  const urn = line.match(/"urn"\s*:\s*"([^"]+)"/i)?.[1];
+  const v = (aurn || urn)?.trim().toLowerCase();
+  return v || undefined;
+}
+
+function resolveSessionRefForLine(line: string, urnToRef: Map<string, string>): string | undefined {
+  const actRef = extractActivatedReferenceNumber(line)?.toLowerCase();
+  if (actRef) return actRef;
+  const urn = extractUrn(line) ?? extractJsonUrn(line);
+  if (!urn) return undefined;
+  return urnToRef.get(urn);
+}
+
+function buildActivationWindows(sessionAnchorLogs: LogEntry[]): ActivationWindow[] {
+  const sorted = [...sessionAnchorLogs].sort((a, b) => a.time.localeCompare(b.time));
+  const windows: ActivationWindow[] = [];
+  for (let i = 0; i < sorted.length; i++) {
+    const email = extractField(sorted[i].line, "email")?.toLowerCase();
+    const ref = extractActivatedReferenceNumber(sorted[i].line)?.toLowerCase();
+    const startMs = Date.parse(sorted[i].time);
+    if (!email || !ref || !Number.isFinite(startMs)) continue;
+    let endMs = Number.POSITIVE_INFINITY;
+    for (let j = i + 1; j < sorted.length; j++) {
+      const emailJ = extractField(sorted[j].line, "email")?.toLowerCase();
+      if (emailJ !== email) continue;
+      const t1 = Date.parse(sorted[j].time);
+      if (Number.isFinite(t1)) endMs = t1;
+      break;
+    }
+    windows.push({ email, ref, startMs, endMsExclusive: endMs });
+  }
+  return windows;
+}
+
+function groupActivationWindowsByEmail(
+  windows: ActivationWindow[]
+): Map<string, ActivationWindow[]> {
+  const m = new Map<string, ActivationWindow[]>();
+  for (const w of windows) {
+    const arr = m.get(w.email) ?? [];
+    arr.push(w);
+    m.set(w.email, arr);
+  }
+  return m;
+}
+
+/** Attribute a VFS/idnfy log to the selected solveKind via session ref (URN) or email+activation window. */
+function entryMatchesSolveKind(
+  entry: LogEntry,
+  allowedRefs: Set<string>,
+  urnToRef: Map<string, string>,
+  windowsByEmail: Map<string, ActivationWindow[]>
+): boolean {
+  const ref = resolveSessionRefForLine(entry.line, urnToRef);
+  if (ref) return allowedRefs.has(ref);
+
+  const email =
+    extractField(entry.line, "email")?.toLowerCase() ??
+    extractEmailFromIdnfyOrVfsLine(entry.line);
+  if (!email) return false;
+  const t = Date.parse(entry.time);
+  if (!Number.isFinite(t)) return false;
+  const wins = windowsByEmail.get(email) ?? [];
+  return wins.some((w) => t >= w.startMs && t < w.endMsExclusive);
+}
+
+function filterLogsBySolveKind(
+  logs: LogEntry[],
+  allowedRefs: Set<string>,
+  urnToRef: Map<string, string>,
+  windowsByEmail: Map<string, ActivationWindow[]>
+): { matched: LogEntry[]; unmatched: number } {
+  const matched: LogEntry[] = [];
+  let unmatched = 0;
+  for (const entry of logs) {
+    if (entryMatchesSolveKind(entry, allowedRefs, urnToRef, windowsByEmail)) {
+      matched.push(entry);
+    } else {
+      unmatched += 1;
+    }
+  }
+  return { matched, unmatched };
 }
 
 function classifyVfsVerificationLine(
@@ -1356,7 +1488,7 @@ export async function POST(req: NextRequest) {
     ...idnfyStatusResponseStrictLogs,
   ]);
   const idnfyStatusRawLogLines = idnfyStatusMergedRaw.length;
-  const idnfyStatusResponseDeduped = idnfyStatusMergedRaw.filter((e) =>
+  let idnfyStatusResponseDeduped = idnfyStatusMergedRaw.filter((e) =>
     isIdnfyStatusResponseLine(e.line)
   );
   let approvedVideoCount = 0;
@@ -1365,7 +1497,7 @@ export async function POST(req: NextRequest) {
     if (isIdnfyStatusApprovedLine(entry.line)) approvedVideoCount += 1;
     else if (isIdnfyStatusDeniedLine(entry.line)) deniedVideoCount += 1;
   }
-  const idnfyStatusResponseLogLines = idnfyStatusResponseDeduped.length;
+  const idnfyStatusResponseLogLinesRaw = idnfyStatusResponseDeduped.length;
   logIdnfyParseDebug(
     idnfyStatusResponseLogs,
     idnfyStatusResponseStrictLogs,
@@ -1375,26 +1507,26 @@ export async function POST(req: NextRequest) {
     deniedVideoCount
   );
 
-  const inHouseVerificationPassedLogs = dedupeLogEntries(
+  let inHouseVerificationPassedLogs = dedupeLogEntries(
     verificationPassedLogs.filter((entry) => isInHouseVerificationPassedLine(entry.line))
   );
-  const approvedApplicantCount = inHouseVerificationPassedLogs.length;
-  const inHousePassedMs: number[] = [];
+  let approvedApplicantCount = inHouseVerificationPassedLogs.length;
+  let inHousePassedMs: number[] = [];
   for (const entry of inHouseVerificationPassedLogs) {
     const ms = parseInHouseVerificationPassedMs(entry.line);
     if (ms != null) inHousePassedMs.push(ms);
   }
-  const inHouseVerificationPassedAvgMs =
+  let inHouseVerificationPassedAvgMs =
     inHousePassedMs.length > 0
       ? Math.round(inHousePassedMs.reduce((a, b) => a + b, 0) / inHousePassedMs.length)
       : null;
 
-  const deniedApplicantLogs = dedupeLogEntries(
+  let deniedApplicantLogs = dedupeLogEntries(
     idnfyStatusLogs.filter((entry) => isIdnfyStatusNeverFailure(entry.line))
   );
-  const deniedApplicantCount = deniedApplicantLogs.length;
+  let deniedApplicantCount = deniedApplicantLogs.length;
 
-  const erroredVideoAttemptLogs = dedupeLogEntries(
+  let erroredVideoAttemptLogs = dedupeLogEntries(
     vfsAttemptLogs.filter((entry) => isErroredVideoAttemptLine(entry.line))
   );
 
@@ -1429,7 +1561,7 @@ export async function POST(req: NextRequest) {
   });
   const failLogs = identityFailLogs;
 
-  const sessionSolveKind = buildSessionSolveKindMap(azureLivenessLogs);
+  const sessionSolveKind = buildSessionSolveKindMap(azureLivenessLogs, azurePayloadLogs);
   const urnToRef = buildUrnToReferenceMap(activationLogs);
 
   let solvingNoTaskId = 0;
@@ -1457,6 +1589,74 @@ export async function POST(req: NextRequest) {
     }
     return true;
   });
+
+  const allowedSessionRefs = new Set(
+    sessionAnchorLogs
+      .map((e) => extractActivatedReferenceNumber(e.line)?.toLowerCase() ?? "")
+      .filter(Boolean)
+  );
+  const windowsByEmail = groupActivationWindowsByEmail(buildActivationWindows(sessionAnchorLogs));
+
+  const idnfyKind = filterLogsBySolveKind(
+    idnfyStatusResponseDeduped,
+    allowedSessionRefs,
+    urnToRef,
+    windowsByEmail
+  );
+  idnfyStatusResponseDeduped = idnfyKind.matched;
+  approvedVideoCount = 0;
+  deniedVideoCount = 0;
+  for (const entry of idnfyStatusResponseDeduped) {
+    if (isIdnfyStatusApprovedLine(entry.line)) approvedVideoCount += 1;
+    else if (isIdnfyStatusDeniedLine(entry.line)) deniedVideoCount += 1;
+  }
+
+  const inHouseKind = filterLogsBySolveKind(
+    inHouseVerificationPassedLogs,
+    allowedSessionRefs,
+    urnToRef,
+    windowsByEmail
+  );
+  inHouseVerificationPassedLogs = inHouseKind.matched;
+  approvedApplicantCount = inHouseVerificationPassedLogs.length;
+  inHousePassedMs = [];
+  for (const entry of inHouseVerificationPassedLogs) {
+    const ms = parseInHouseVerificationPassedMs(entry.line);
+    if (ms != null) inHousePassedMs.push(ms);
+  }
+  inHouseVerificationPassedAvgMs =
+    inHousePassedMs.length > 0
+      ? Math.round(inHousePassedMs.reduce((a, b) => a + b, 0) / inHousePassedMs.length)
+      : null;
+
+  const deniedApplicantKind = filterLogsBySolveKind(
+    deniedApplicantLogs,
+    allowedSessionRefs,
+    urnToRef,
+    windowsByEmail
+  );
+  deniedApplicantLogs = deniedApplicantKind.matched;
+  deniedApplicantCount = deniedApplicantLogs.length;
+
+  const erroredKind = filterLogsBySolveKind(
+    erroredVideoAttemptLogs,
+    allowedSessionRefs,
+    urnToRef,
+    windowsByEmail
+  );
+  erroredVideoAttemptLogs = erroredKind.matched;
+
+  const attemptPassedRaw = dedupeLogEntries([
+    ...vfsAttemptLogs,
+    ...solverLogsAll,
+    ...identityMiscLogs,
+  ]).filter((e) => isAttemptPassedTimingLine(e.line));
+  const attemptPassedKind = filterLogsBySolveKind(
+    attemptPassedRaw,
+    allowedSessionRefs,
+    urnToRef,
+    windowsByEmail
+  );
 
   const timelinesBySessionRef = mergeSessionRefTimelines(urnToRef, [
     activationLogs,
@@ -1702,7 +1902,7 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  const deniedStatusLogs = idnfyStatusMergedRaw.filter((e) => isIdnfyStatusDeniedLine(e.line));
+  const deniedStatusLogs = idnfyStatusResponseDeduped.filter((e) => isIdnfyStatusDeniedLine(e.line));
   let deniedPassportErrors: string[] = [];
   const { rows: deniedPassportRows, errors: deniedLookupErrors } = await buildDeniedPassportRows({
     base,
@@ -1829,12 +2029,7 @@ export async function POST(req: NextRequest) {
     };
   });
 
-  const attemptPassedEntries = dedupeLogEntries([
-    ...vfsAttemptLogs,
-    ...solverLogsAll,
-    ...identityMiscLogs,
-  ]).filter((e) => isAttemptPassedTimingLine(e.line));
-  const attemptPassedTimings = attemptPassedEntries.map((entry) => {
+  const attemptPassedTimings = attemptPassedKind.matched.map((entry) => {
     const email =
       extractField(entry.line, "email")?.toLowerCase() ??
       extractEmailFromIdnfyOrVfsLine(entry.line) ??
@@ -1919,7 +2114,8 @@ export async function POST(req: NextRequest) {
       approvedVideoCount,
       deniedVideoCount,
       idnfyStatusRawLogLines,
-      idnfyStatusResponseLogLines,
+      idnfyStatusResponseLogLines: idnfyStatusResponseDeduped.length,
+      idnfyStatusResponseLogLinesRaw,
       approvedApplicantCount,
       deniedApplicantCount,
       erroredVideoAttemptCount,
@@ -1944,6 +2140,14 @@ export async function POST(req: NextRequest) {
       solvingExcludedNoTaskId: solvingNoTaskId,
       solvingExcludedNoAzureMatch: solvingNoAzureMatch,
       solvingExcludedWrongKind: solvingWrongKind,
+      solveKindDropPrefixes: [...sessionSolveKind.values()].filter((k) => k === "drop").length,
+      solveKindVerificationPrefixes: [...sessionSolveKind.values()].filter((k) => k === "verification")
+        .length,
+      solveKindUnmatchedIdnfy: idnfyKind.unmatched,
+      solveKindUnmatchedInHouse: inHouseKind.unmatched,
+      solveKindUnmatchedDeniedApplicants: deniedApplicantKind.unmatched,
+      solveKindUnmatchedErroredAttempts: erroredKind.unmatched,
+      solveKindUnmatchedAttemptPassed: attemptPassedKind.unmatched,
       azurePayloadLogLines: azurePayloadLogs.length,
       azureResultFailedLogLines: azureResultFailedLogs.length,
       taskPayloadRows: taskPayloadIatRows.length,

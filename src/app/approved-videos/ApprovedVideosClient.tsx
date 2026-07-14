@@ -63,6 +63,14 @@ type ApiResponse = {
     solvingExcludedNoTaskId?: number;
     solvingExcludedNoAzureMatch?: number;
     solvingExcludedWrongKind?: number;
+    solveKindDropPrefixes?: number;
+    solveKindVerificationPrefixes?: number;
+    solveKindUnmatchedIdnfy?: number;
+    solveKindUnmatchedInHouse?: number;
+    solveKindUnmatchedDeniedApplicants?: number;
+    solveKindUnmatchedErroredAttempts?: number;
+    solveKindUnmatchedAttemptPassed?: number;
+    idnfyStatusResponseLogLinesRaw?: number;
     azurePayloadLogLines?: number;
     azureResultFailedLogLines?: number;
     taskPayloadRows?: number;
@@ -403,13 +411,11 @@ export default function ApprovedVideosClient() {
       <div>
         <h1 className="text-2xl font-semibold text-zinc-900">In-house verification outcomes</h1>
         <p className="text-sm text-zinc-600 mt-1">
-          Top cards count raw VFS lines in the window: videos from{" "}
-          <code className="text-xs">appointment/idnfystatus</code> response lines (
-          <code className="text-xs">APPROVED</code> / <code className="text-xs">DENIED</code>
-          ), applicants from <code className="text-xs">In-house verification passed</code> and{" "}
-          <code className="text-xs">/idnfystatus never returned APPROVED</code>. Errored video attempts:{" "}
-          <code className="text-xs">Attempt … failed (</code>. Cohort outcomes below still filter by activation + Azure job
-          type (drop vs verification).
+          All cards, timings, and cohort outcomes are scoped to{" "}
+          <span className="font-medium">Drop</span> or <span className="font-medium">Verification</span>{" "}
+          — click <span className="font-medium">Generate</span> after switching. Job type from Azure{" "}
+          <code className="text-xs">passport: VERIFICATION</code> / Redis{" "}
+          <code className="text-xs">isVerificationJob</code>.
         </p>
       </div>
 
@@ -452,7 +458,12 @@ export default function ApprovedVideosClient() {
               <button
                 key={opt.id}
                 type="button"
-                onClick={() => setSolveKind(opt.id)}
+                onClick={() => {
+                  if (opt.id === solveKind) return;
+                  setSolveKind(opt.id);
+                  setData(null);
+                  setError(null);
+                }}
                 className={`rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors ${
                   solveKind === opt.id
                     ? "border-zinc-900 bg-zinc-900 text-white"
@@ -585,6 +596,22 @@ export default function ApprovedVideosClient() {
               <div className="mt-1 text-[11px] text-zinc-500">
                 Excluded VFS solving lines: no TaskId {data.totals.solvingExcludedNoTaskId ?? 0}, no Azure match{" "}
                 {data.totals.solvingExcludedNoAzureMatch ?? 0}, other job type {data.totals.solvingExcludedWrongKind ?? 0}
+              </div>
+            )}
+            <div className="mt-1 text-[11px] text-zinc-500">
+              Azure kind map: drop prefixes {data.totals.solveKindDropPrefixes ?? "—"} · verification prefixes{" "}
+              {data.totals.solveKindVerificationPrefixes ?? "—"} · this report included{" "}
+              {data.totals.solvingLogLines ?? "—"} VFS activations
+            </div>
+            {(data.totals.solveKindUnmatchedIdnfy ?? 0) +
+              (data.totals.solveKindUnmatchedAttemptPassed ?? 0) >
+              0 && (
+              <div className="mt-1 text-[11px] text-amber-800">
+                Unmatched to this job type (excluded from cards/timings): idnfy{" "}
+                {data.totals.solveKindUnmatchedIdnfy ?? 0}, attempt timings{" "}
+                {data.totals.solveKindUnmatchedAttemptPassed ?? 0}, in-house{" "}
+                {data.totals.solveKindUnmatchedInHouse ?? 0}, errored{" "}
+                {data.totals.solveKindUnmatchedErroredAttempts ?? 0}
               </div>
             )}
             <div className="mt-1 text-[11px] text-zinc-500">
