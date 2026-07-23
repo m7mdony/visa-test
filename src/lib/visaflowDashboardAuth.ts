@@ -1,8 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 export const VISAFLOW_JWT_UPDATED_EVENT = "visaflow-jwt-updated";
+
+/** Treat JWT as expired this many ms before `exp` (clock skew). */
+const JWT_EXP_SKEW_MS = 60_000;
 
 const KEYS = {
   bearerJwt: "ui-test-visaflow-dashboard-bearer-jwt",
@@ -68,6 +71,49 @@ function removeKey(key: string): void {
   }
 }
 
+function decodeJwtPayload(jwt: string): Record<string, unknown> | null {
+  const parts = jwt.split(".");
+  if (parts.length < 2) return null;
+  try {
+    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const json = atob(padded);
+    return JSON.parse(json) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function extractSidFromCookieJar(cookieHeader: string): string | null {
+  for (const part of cookieHeader.split(";")) {
+    const trimmed = part.trim();
+    if (!trimmed.toLowerCase().startsWith("__client=")) continue;
+    const val = trimmed.slice("__client=".length).trim();
+    if (!val || val === "deleted") continue;
+    const payload = decodeJwtPayload(val);
+    const sid = payload?.sid;
+    if (typeof sid === "string" && sid.startsWith("sess_")) return sid;
+  }
+  return null;
+}
+
+/** True if any dashboard auth material is present (even if access JWT is expired). */
+export function hasStoredDashboardAuth(): boolean {
+  const jwt = getBearerJwt();
+  if (jwt.split(".").length >= 2) return true;
+  if (getClerkSessionId().startsWith("sess_")) return true;
+  return getClerkCookieJar().length > 0;
+}
+
+/** Clerk refresh session: `sess_` + cookie jar (can mint new access JWTs). */
+export function hasClerkRefreshSession(): boolean {
+  const jar = getClerkCookieJar();
+  if (!jar) return false;
+  const sid = getClerkSessionId();
+  if (sid.startsWith("sess_")) return true;
+  return Boolean(extractSidFromCookieJar(jar));
+}
+
 export function getBearerJwt(): string {
   return readKey(KEYS.bearerJwt);
 }
@@ -100,8 +146,24 @@ export function setOtpSignInAttemptId(signInAttemptId: string): void {
   writeKey(KEYS.otpSia, signInAttemptId);
 }
 
+/** Access JWT present and not past `exp` (with skew). */
+export function isAccessJwtFresh(): boolean {
+  const jwt = getBearerJwt();
+  if (jwt.split(".").length < 2) return false;
+  const payload = decodeJwtPayload(jwt);
+  if (!payload) return false;
+  const exp = payload.exp;
+  if (typeof exp !== "number") return true;
+  return Date.now() < exp * 1000 - JWT_EXP_SKEW_MS;
+}
+
+/**
+ * Signed in for UI: fresh access JWT, or Clerk refresh session still usable.
+ * Access JWT may be stale — callers should `ensureFreshBearerJwt()` before API use.
+ */
 export function isDashboardAuthenticated(): boolean {
-  return getBearerJwt().split(".").length >= 2;
+  if (isAccessJwtFresh()) return true;
+  return hasClerkRefreshSession();
 }
 
 export function persistAfterVerify(payload: {
@@ -122,6 +184,7 @@ export function applyRefreshedBearerJwt(jwt: string | undefined | null): void {
   const next = jwt?.trim() ?? "";
   if (next && next.split(".").length >= 2) {
     setBearerJwt(next);
+    notifyJwtUpdated();
   }
 }
 
@@ -133,11 +196,62 @@ export function buildDashboardAuthBody(): {
   const bearerJwt = getBearerJwt();
   const sid = getClerkSessionId();
   const jar = getClerkCookieJar();
+  const sidFromJar = jar ? extractSidFromCookieJar(jar) : null;
+  const sessionId = sid.startsWith("sess_") ? sid : sidFromJar ?? "";
   return {
     bearerJwt,
-    ...(sid.startsWith("sess_") ? { clerkSessionId: sid } : {}),
+    ...(sessionId.startsWith("sess_") ? { clerkSessionId: sessionId } : {}),
     ...(jar ? { clerkCookie: jar } : {}),
   };
+}
+
+/**
+ * Ensure a usable access JWT: return cached if fresh, else mint via Clerk
+ * `/sessions/{sess_}/tokens` using stored refresh session + cookie jar.
+ */
+export async function ensureFreshBearerJwt(): Promise<string | null> {
+  if (isAccessJwtFresh()) return getBearerJwt();
+  if (!hasClerkRefreshSession()) return null;
+
+  const { clerkSessionId, clerkCookie } = buildDashboardAuthBody();
+  if (!clerkCookie || !clerkSessionId?.startsWith("sess_")) return null;
+
+  try {
+    const res = await fetch("/api/clerk-session-refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clerkSessionId, clerkCookie }),
+    });
+    const json = (await res.json().catch(() => ({}))) as {
+      jwt?: string;
+      sessionId?: string;
+      cookieJar?: string;
+      error?: string;
+    };
+    if (!res.ok) return null;
+    const jwt = typeof json.jwt === "string" ? json.jwt.trim() : "";
+    if (!jwt || jwt.split(".").length < 2) return null;
+    setBearerJwt(jwt);
+    if (typeof json.sessionId === "string" && json.sessionId.startsWith("sess_")) {
+      setClerkSessionId(json.sessionId);
+    }
+    if (typeof json.cookieJar === "string" && json.cookieJar.trim()) {
+      setClerkCookieJar(json.cookieJar.trim());
+    }
+    notifyJwtUpdated();
+    return jwt;
+  } catch {
+    return null;
+  }
+}
+
+/** Wipe access JWT + Clerk refresh session before starting a fresh OTP. */
+export function clearDashboardSessionForRelogin(): void {
+  removeKey(KEYS.bearerJwt);
+  removeKey(KEYS.clerkSessionId);
+  removeKey(KEYS.clerkCookieJar);
+  removeKey(KEYS.otpSia);
+  notifyJwtUpdated();
 }
 
 export function clearDashboardAuth(): void {
@@ -157,23 +271,65 @@ export function notifyJwtUpdated(): void {
 
 export function useVisaflowDashboardAuth() {
   const [authenticated, setAuthenticated] = useState(false);
+  const [hasStoredAuth, setHasStoredAuth] = useState(false);
+  const [hasRefreshSession, setHasRefreshSession] = useState(false);
+  const [accessJwtFresh, setAccessJwtFresh] = useState(false);
+  const [refreshingJwt, setRefreshingJwt] = useState(false);
+  const refreshInFlight = useRef<Promise<string | null> | null>(null);
 
-  const refresh = useCallback(() => {
+  const sync = useCallback(() => {
     setAuthenticated(isDashboardAuthenticated());
+    setHasStoredAuth(hasStoredDashboardAuth());
+    setHasRefreshSession(hasClerkRefreshSession());
+    setAccessJwtFresh(isAccessJwtFresh());
   }, []);
 
+  const refreshAccessJwtIfNeeded = useCallback(async () => {
+    if (isAccessJwtFresh()) {
+      sync();
+      return getBearerJwt();
+    }
+    if (!hasClerkRefreshSession()) {
+      sync();
+      return null;
+    }
+    if (refreshInFlight.current) return refreshInFlight.current;
+    setRefreshingJwt(true);
+    const p = ensureFreshBearerJwt().finally(() => {
+      refreshInFlight.current = null;
+      setRefreshingJwt(false);
+      sync();
+    });
+    refreshInFlight.current = p;
+    return p;
+  }, [sync]);
+
   useEffect(() => {
-    refresh();
-    const onUpdate = () => refresh();
+    sync();
+    void refreshAccessJwtIfNeeded();
+    const onUpdate = () => sync();
+    const onFocus = () => {
+      sync();
+      void refreshAccessJwtIfNeeded();
+    };
     window.addEventListener(VISAFLOW_JWT_UPDATED_EVENT, onUpdate);
-    window.addEventListener("focus", onUpdate);
+    window.addEventListener("focus", onFocus);
     window.addEventListener("storage", onUpdate);
     return () => {
       window.removeEventListener(VISAFLOW_JWT_UPDATED_EVENT, onUpdate);
-      window.removeEventListener("focus", onUpdate);
+      window.removeEventListener("focus", onFocus);
       window.removeEventListener("storage", onUpdate);
     };
-  }, [refresh]);
+  }, [sync, refreshAccessJwtIfNeeded]);
 
-  return { authenticated, refresh, clearAuth: clearDashboardAuth };
+  return {
+    authenticated,
+    hasStoredAuth,
+    hasRefreshSession,
+    accessJwtFresh,
+    refreshingJwt,
+    refresh: sync,
+    refreshAccessJwtIfNeeded,
+    clearAuth: clearDashboardAuth,
+  };
 }

@@ -12,6 +12,7 @@ import VisaflowDashboardLoginPanel from "@/components/VisaflowDashboardLoginPane
 import {
   applyRefreshedBearerJwt,
   buildDashboardAuthBody,
+  ensureFreshBearerJwt,
   useVisaflowDashboardAuth,
 } from "@/lib/visaflowDashboardAuth";
 import {
@@ -222,9 +223,13 @@ export default function ApprovedVideosClient() {
   const { authenticated: dashboardJwtSaved } = useVisaflowDashboardAuth();
 
   const fetchPassportRoutes = useCallback(async (report: ApiResponse) => {
+    await ensureFreshBearerJwt();
     const { bearerJwt: bearerFromStorage, clerkSessionId: refreshSid, clerkCookie: refreshJar } =
       buildDashboardAuthBody();
-    if (!bearerFromStorage || bearerFromStorage.split(".").length < 2) {
+    if (
+      (!bearerFromStorage || bearerFromStorage.split(".").length < 2) &&
+      !(refreshSid?.startsWith("sess_") && refreshJar)
+    ) {
       setPassportRoutes([]);
       setRouteFilterOptions(null);
       setRoutesError(null);

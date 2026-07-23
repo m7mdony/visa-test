@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import {
+  clearDashboardSessionForRelogin,
   getClerkCookieJar,
   getOtpSignInAttemptId,
   isDashboardAuthenticated,
@@ -14,6 +15,7 @@ import {
 type Props = {
   title?: string;
   hint?: string;
+  /** @deprecated Sign out is always available when signed in / stored auth exists. */
   showClearButton?: boolean;
   onAuthenticated?: () => void;
 };
@@ -28,11 +30,18 @@ function parseOtpJsonResponse(text: string): Record<string, unknown> {
 
 export default function VisaflowDashboardLoginPanel({
   title = "Visaflow dashboard login",
-  hint = "Email OTP — saved across pages until you clear it or sign out.",
-  showClearButton = false,
+  hint = "Email OTP — saved across pages until you clear it or sign out. Access JWT refreshes via Clerk session.",
   onAuthenticated,
 }: Props) {
-  const { authenticated, clearAuth } = useVisaflowDashboardAuth();
+  const {
+    authenticated,
+    hasStoredAuth,
+    hasRefreshSession,
+    accessJwtFresh,
+    refreshingJwt,
+    clearAuth,
+  } = useVisaflowDashboardAuth();
+  const [reloginOpen, setReloginOpen] = useState(false);
   const [otpEmail, setOtpEmail] = useState("");
   const [otpCookieJar, setOtpCookieJarState] = useState("");
   const [otpSignInAttemptId, setOtpSignInAttemptIdState] = useState("");
@@ -57,6 +66,13 @@ export default function VisaflowDashboardLoginPanel({
     if (!email.includes("@")) {
       setOtpError("Enter a valid email.");
       return;
+    }
+    // Fresh OTP replaces the persistent session once the user commits to Send code.
+    if (reloginOpen || hasStoredAuth) {
+      clearDashboardSessionForRelogin();
+      setOtpCookieJarState("");
+      setOtpSignInAttemptIdState("");
+      setOtpCode("");
     }
     setOtpLoading(true);
     try {
@@ -123,6 +139,7 @@ export default function VisaflowDashboardLoginPanel({
         cookieJar: typeof otpData.cookieJar === "string" ? otpData.cookieJar : jar,
       });
       setOtpCode("");
+      setReloginOpen(false);
     } catch (e: unknown) {
       setOtpError(e instanceof Error ? e.message : "Request failed");
     } finally {
@@ -130,10 +147,49 @@ export default function VisaflowDashboardLoginPanel({
     }
   }
 
-  if (authenticated && !showClearButton) {
+  function signOut() {
+    clearAuth();
+    setOtpCode("");
+    setOtpCookieJarState("");
+    setOtpSignInAttemptIdState("");
+    setOtpError(null);
+    setReloginOpen(false);
+  }
+
+  const showCompactSignedIn = authenticated && !reloginOpen;
+  // Only force OTP when stored junk exists but neither fresh JWT nor Clerk refresh works.
+  const needsOtpAgain = hasStoredAuth && !authenticated && !refreshingJwt;
+
+  if (showCompactSignedIn) {
+    const statusLabel = refreshingJwt
+      ? "Refreshing session…"
+      : accessJwtFresh
+        ? "Visaflow dashboard signed in"
+        : hasRefreshSession
+          ? "Signed in (refresh session)"
+          : "Visaflow dashboard signed in";
     return (
-      <div className="rounded-lg border border-emerald-200 bg-emerald-50/80 px-4 py-2">
-        <span className="text-xs font-medium text-emerald-800">Visaflow dashboard signed in</span>
+      <div className="rounded-lg border border-emerald-200 bg-emerald-50/80 px-4 py-2 flex flex-wrap items-center justify-between gap-2">
+        <span className="text-xs font-medium text-emerald-800">{statusLabel}</span>
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              setReloginOpen(true);
+              setOtpError(null);
+            }}
+            className="rounded-lg border border-emerald-700 px-3 py-1.5 text-xs text-emerald-900 bg-white"
+          >
+            Re-login
+          </button>
+          <button
+            type="button"
+            onClick={signOut}
+            className="rounded-lg border border-zinc-300 px-3 py-1.5 text-xs text-zinc-700 bg-white"
+          >
+            Sign out
+          </button>
+        </div>
       </div>
     );
   }
@@ -143,12 +199,20 @@ export default function VisaflowDashboardLoginPanel({
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-sm font-medium text-zinc-800">{title}</p>
         {authenticated ? (
-          <span className="text-xs font-medium text-emerald-800">Signed in</span>
+          <span className="text-xs font-medium text-emerald-800">Signed in — re-login</span>
+        ) : needsOtpAgain ? (
+          <span className="text-xs font-medium text-amber-800">Session expired — sign in again</span>
         ) : (
           <span className="text-xs text-zinc-500">Required</span>
         )}
       </div>
       {hint ? <p className="text-xs text-zinc-500">{hint}</p> : null}
+      {reloginOpen && authenticated ? (
+        <p className="text-xs text-zinc-600">
+          Current session (including refresh) stays until you click{" "}
+          <span className="font-medium">Send code</span>.
+        </p>
+      ) : null}
       {otpError ? <pre className="text-[11px] text-red-800 whitespace-pre-wrap">{otpError}</pre> : null}
       <div className="flex flex-wrap gap-2 items-end">
         <div className="flex-1 min-w-[200px]">
@@ -185,13 +249,22 @@ export default function VisaflowDashboardLoginPanel({
         >
           Verify
         </button>
-        {showClearButton && authenticated ? (
+        {reloginOpen && authenticated ? (
           <button
             type="button"
             onClick={() => {
-              clearAuth();
-              setOtpCode("");
+              setReloginOpen(false);
+              setOtpError(null);
             }}
+            className="rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-700"
+          >
+            Cancel
+          </button>
+        ) : null}
+        {hasStoredAuth || authenticated ? (
+          <button
+            type="button"
+            onClick={signOut}
             className="rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-700"
           >
             Sign out
