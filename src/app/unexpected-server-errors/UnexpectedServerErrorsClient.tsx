@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import AnsiLogLine from "@/components/AnsiLogLine";
 
 type LogEntry = { time: string; line: string };
 
@@ -427,9 +428,10 @@ export default function UnexpectedServerErrorsClient() {
                       </div>
                     </div>
                   </div>
-                  <pre className="mt-1 text-xs whitespace-pre-wrap break-words text-zinc-800 font-mono">
-                    {entry.line}
-                  </pre>
+                  <AnsiLogLine
+                    text={entry.line}
+                    className="mt-1 text-xs whitespace-pre-wrap break-words text-zinc-800 font-mono"
+                  />
                 </button>
               ))}
             </div>
@@ -503,9 +505,10 @@ export default function UnexpectedServerErrorsClient() {
                 filteredPopupLogs.map((entry, idx) => (
                   <div key={`${entry.time}-${idx}`} className="px-4 py-3">
                     <div className="text-xs text-zinc-500">{fmtTime(entry.time)}</div>
-                    <pre className="mt-1 text-xs whitespace-pre-wrap break-words text-zinc-800 font-mono">
-                      {entry.line}
-                    </pre>
+                    <AnsiLogLine
+                      text={entry.line}
+                      className="mt-1 text-xs whitespace-pre-wrap break-words text-zinc-800 font-mono"
+                    />
                   </div>
                 ))
               )}

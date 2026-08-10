@@ -1,6 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  isRouteFilterActive,
+  type RouteFilterSelection,
+} from "@/lib/visaflowDashboardClients";
 
 const SS_CLERK_SESSION = "ui-test-visaflow-clerk-session";
 const SS_CLERK_COOKIE = "ui-test-visaflow-clerk-cookie";
@@ -14,6 +18,29 @@ const SS_LAST_STATUS_UPDATE_FROM = "ui-test-processing-last-status-update-from";
 const SS_LAST_STATUS_UPDATE_TO = "ui-test-processing-last-status-update-to";
 /** @deprecated migrated to FROM key */
 const SS_LAST_STATUS_UPDATE_AFTER = "ui-test-processing-last-status-update-after";
+const SS_ROUTE_FROM = "ui-test-processing-route-from";
+const SS_ROUTE_TO = "ui-test-processing-route-to";
+const SS_ROUTE_SUB = "ui-test-processing-route-sub";
+
+const EMPTY_ROUTE_FILTER: RouteFilterSelection = {
+  fromCountry: "",
+  toCountry: "",
+  subVisaCategoryName: "",
+};
+
+type RouteFilterOptions = {
+  fromCountries: string[];
+  toCountries: string[];
+  subVisaCategories: string[];
+};
+
+type RouteCombination = {
+  id: string;
+  fromCountry: string;
+  toCountry: string;
+  subVisaCategoryName: string;
+  label: string;
+};
 
 const CLIENT_WAIT_STATUS_PRESETS = [
   { value: "pending_applicant", label: "Pending applicant" },
@@ -40,6 +67,7 @@ type ApplicantVideoRow = {
   identityVerificationStatus: string;
   fromCountry: string;
   toCountry: string;
+  subVisaCategoryName?: string;
   videos: string[];
 };
 
@@ -47,10 +75,14 @@ type Totals = {
   clientsScanned: number;
   clientsMatchedCountry: number;
   clientWaitStatus?: string;
+  fromCountry?: string | null;
+  toCountry?: string | null;
+  subVisaCategoryName?: string | null;
   lastStatusUpdateAfter?: string | null;
   lastStatusUpdateBefore?: string | null;
   statusMatchedClients?: number;
   clientsAfterLastStatusUpdateFilter?: number;
+  clientsAfterRouteFilter?: number;
   /** @deprecated use statusMatchedClients */
   pendingClients: number;
   applicantsFound: number;
@@ -80,6 +112,11 @@ export default function ProcessingApplicantVideosClient() {
   const [clientWaitStatusCustom, setClientWaitStatusCustom] = useState("");
   const [lastStatusUpdateFrom, setLastStatusUpdateFrom] = useState("");
   const [lastStatusUpdateTo, setLastStatusUpdateTo] = useState("");
+  const [routeFilter, setRouteFilter] = useState<RouteFilterSelection>(EMPTY_ROUTE_FILTER);
+  const [routeFilterOptions, setRouteFilterOptions] = useState<RouteFilterOptions | null>(null);
+  const [routeCombinations, setRouteCombinations] = useState<RouteCombination[]>([]);
+  const [routesLoading, setRoutesLoading] = useState(false);
+  const [routesError, setRoutesError] = useState<string | null>(null);
   const [expandedVideo, setExpandedVideo] = useState<string | null>(null);
   const [parallelJobsCopied, setParallelJobsCopied] = useState(false);
   const [videoOnlyJobsCopied, setVideoOnlyJobsCopied] = useState(false);
@@ -141,10 +178,96 @@ export default function ProcessingApplicantVideosClient() {
       if (lsFrom) setLastStatusUpdateFrom(lsFrom);
       const lsTo = sessionStorage.getItem(SS_LAST_STATUS_UPDATE_TO);
       if (lsTo) setLastStatusUpdateTo(lsTo);
+      const rfFrom = sessionStorage.getItem(SS_ROUTE_FROM) ?? "";
+      const rfTo = sessionStorage.getItem(SS_ROUTE_TO) ?? "";
+      const rfSub = sessionStorage.getItem(SS_ROUTE_SUB) ?? "";
+      if (rfFrom || rfTo || rfSub) {
+        setRouteFilter({
+          fromCountry: rfFrom,
+          toCountry: rfTo,
+          subVisaCategoryName: rfSub,
+        });
+      }
     } catch {
       /* private mode */
     }
   }, []);
+
+  const routeFilterActive = isRouteFilterActive(routeFilter);
+
+  const fetchRouteOptions = useCallback(async () => {
+    let bearerFromStorage = "";
+    let refreshSid = "";
+    let refreshJar = "";
+    try {
+      bearerFromStorage = sessionStorage.getItem(SS_BEARER_JWT)?.trim() ?? "";
+      refreshSid = sessionStorage.getItem(SS_CLERK_REFRESH_SESSION_ID)?.trim() ?? "";
+      refreshJar = sessionStorage.getItem(SS_OTP_COOKIE_JAR)?.trim() ?? "";
+    } catch {
+      /* */
+    }
+    if (
+      (!bearerFromStorage || bearerFromStorage.split(".").length < 2) &&
+      !(refreshSid.startsWith("sess_") && refreshJar)
+    ) {
+      setRouteFilterOptions(null);
+      setRouteCombinations([]);
+      setRoutesError(null);
+      return;
+    }
+    setRoutesLoading(true);
+    setRoutesError(null);
+    try {
+      const res = await fetch("/api/dashboard-passport-routes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          passportNumbers: [],
+          emails: [],
+          bearerJwt: bearerFromStorage,
+          ...(refreshSid.startsWith("sess_") ? { clerkSessionId: refreshSid } : {}),
+          ...(refreshJar ? { clerkCookie: refreshJar } : {}),
+        }),
+      });
+      const json = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        filterOptions?: RouteFilterOptions;
+        routeCombinations?: RouteCombination[];
+        refreshedBearerJwt?: string;
+      };
+      if (!res.ok) {
+        setRoutesError(json.error ?? `HTTP ${res.status}`);
+        setRouteFilterOptions(null);
+        setRouteCombinations([]);
+        return;
+      }
+      if (typeof json.refreshedBearerJwt === "string" && json.refreshedBearerJwt.trim()) {
+        try {
+          sessionStorage.setItem(SS_BEARER_JWT, json.refreshedBearerJwt.trim());
+        } catch {
+          /* */
+        }
+      }
+      setRouteFilterOptions(json.filterOptions ?? null);
+      setRouteCombinations(json.routeCombinations ?? []);
+    } catch (e: unknown) {
+      setRoutesError(e instanceof Error ? e.message : "Route lookup failed");
+      setRouteFilterOptions(null);
+      setRouteCombinations([]);
+    } finally {
+      setRoutesLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!dashboardJwtSaved) {
+      setRouteFilterOptions(null);
+      setRouteCombinations([]);
+      setRoutesError(null);
+      return;
+    }
+    void fetchRouteOptions();
+  }, [dashboardJwtSaved, fetchRouteOptions]);
 
   const effectiveClientWaitStatus = useMemo(() => {
     if (clientWaitStatus === "custom") {
@@ -319,12 +442,25 @@ export default function ProcessingApplicantVideosClient() {
         } else {
           sessionStorage.removeItem(SS_LAST_STATUS_UPDATE_TO);
         }
+        if (routeFilter.fromCountry) sessionStorage.setItem(SS_ROUTE_FROM, routeFilter.fromCountry);
+        else sessionStorage.removeItem(SS_ROUTE_FROM);
+        if (routeFilter.toCountry) sessionStorage.setItem(SS_ROUTE_TO, routeFilter.toCountry);
+        else sessionStorage.removeItem(SS_ROUTE_TO);
+        if (routeFilter.subVisaCategoryName) sessionStorage.setItem(SS_ROUTE_SUB, routeFilter.subVisaCategoryName);
+        else sessionStorage.removeItem(SS_ROUTE_SUB);
       } catch {
         /* */
       }
       const lastStatusFromIso =
         fromRaw && Number.isFinite(fromMs) ? new Date(fromMs).toISOString() : "";
       const lastStatusToIso = toRaw && Number.isFinite(toMs) ? new Date(toMs).toISOString() : "";
+      const routeBody = {
+        ...(routeFilter.fromCountry ? { fromCountry: routeFilter.fromCountry } : {}),
+        ...(routeFilter.toCountry ? { toCountry: routeFilter.toCountry } : {}),
+        ...(routeFilter.subVisaCategoryName
+          ? { subVisaCategoryName: routeFilter.subVisaCategoryName }
+          : {}),
+      };
       const res = await fetch("/api/processing-applicant-videos", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -336,6 +472,7 @@ export default function ProcessingApplicantVideosClient() {
                 clientWaitStatus: effectiveClientWaitStatus,
                 ...(lastStatusFromIso ? { lastStatusUpdateAfter: lastStatusFromIso } : {}),
                 ...(lastStatusToIso ? { lastStatusUpdateBefore: lastStatusToIso } : {}),
+                ...routeBody,
                 ...(refreshSid?.startsWith("sess_") ? { clerkSessionId: refreshSid } : {}),
                 ...(refreshJar ? { clerkCookie: refreshJar } : {}),
               }
@@ -344,6 +481,7 @@ export default function ProcessingApplicantVideosClient() {
                 clientWaitStatus: effectiveClientWaitStatus,
                 ...(lastStatusFromIso ? { lastStatusUpdateAfter: lastStatusFromIso } : {}),
                 ...(lastStatusToIso ? { lastStatusUpdateBefore: lastStatusToIso } : {}),
+                ...routeBody,
                 ...(clerkSessionId.trim() ? { clerkSessionId: clerkSessionId.trim() } : {}),
                 ...(clerkCookie.trim() ? { clerkCookie: clerkCookie.trim() } : {}),
                 ...(organizationId.trim() ? { organizationId: organizationId.trim() } : {}),
@@ -498,11 +636,12 @@ export default function ProcessingApplicantVideosClient() {
       <div>
         <h1 className="text-2xl font-semibold text-zinc-900">Processing applicant videos</h1>
         <p className="text-sm text-zinc-600 mt-1">
-          Uses clients on <strong>any route</strong> whose <strong>client</strong> status matches your selection below. Loads up to
-          your <strong>target</strong> count of applicants with <strong>identity</strong>{" "}
-          <code>completed</code> who have both a <strong>passport image</strong> and <strong>video</strong>. Eligible
-          applicants are <strong>shuffled</strong> each request, then scanned in batches until the target is met or the
-          pool/cap is exhausted (so two runs with the same target usually differ when enough people qualify).
+          Uses clients matching your <strong>route</strong> (optional), <strong>client</strong> status, and optional{" "}
+          <strong>last status update</strong> range. Loads up to your <strong>target</strong> count of applicants with{" "}
+          <strong>identity</strong> <code>completed</code> who have both a <strong>passport image</strong> and{" "}
+          <strong>video</strong>. Eligible applicants are <strong>shuffled</strong> each request, then scanned in batches
+          until the target is met or the pool/cap is exhausted (so two runs with the same target usually differ when enough
+          people qualify).
         </p>
       </div>
 
@@ -632,6 +771,121 @@ export default function ProcessingApplicantVideosClient() {
         </div>
       </details>
 
+      <div className="rounded-lg border border-blue-200 bg-blue-50/60 px-4 py-3 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="text-sm font-medium text-zinc-800">Filter by dashboard route</p>
+          {routeFilterActive ? (
+            <span className="text-xs font-medium text-blue-900">Filtered</span>
+          ) : (
+            <span className="text-xs text-zinc-600">All routes (no filter)</span>
+          )}
+        </div>
+        {!dashboardJwtSaved ? (
+          <p className="text-xs text-zinc-600">Sign in with Visaflow dashboard OTP above to load routes.</p>
+        ) : routesLoading ? (
+          <p className="text-xs text-zinc-600">Loading passport routes from dashboard…</p>
+        ) : routesError ? (
+          <p className="text-xs text-red-700">{routesError}</p>
+        ) : routeFilterOptions ? (
+          <p className="text-xs text-zinc-500">
+            Pick one combined route or use separate dropdowns (empty = all). Applied on Fetch.
+          </p>
+        ) : null}
+        {routeCombinations.length > 0 ? (
+          <div>
+            <label className="block text-xs font-medium text-zinc-700 mb-1">Route (from → to · category)</label>
+            <select
+              value={
+                routeFilter.fromCountry || routeFilter.toCountry || routeFilter.subVisaCategoryName
+                  ? `${routeFilter.fromCountry}|${routeFilter.toCountry}|${routeFilter.subVisaCategoryName}`
+                  : ""
+              }
+              onChange={(e) => {
+                const id = e.target.value;
+                if (!id) {
+                  setRouteFilter(EMPTY_ROUTE_FILTER);
+                  return;
+                }
+                const combo = routeCombinations.find((c) => c.id === id);
+                if (!combo) return;
+                setRouteFilter({
+                  fromCountry: combo.fromCountry,
+                  toCountry: combo.toCountry,
+                  subVisaCategoryName: combo.subVisaCategoryName,
+                });
+              }}
+              className="w-full rounded-lg border border-zinc-300 px-2 py-2 text-sm bg-white"
+            >
+              <option value="">All routes</option>
+              {routeCombinations.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        ) : null}
+        <div className="grid gap-3 sm:grid-cols-3">
+          <div>
+            <label className="block text-xs font-medium text-zinc-700 mb-1">From country</label>
+            <select
+              value={routeFilter.fromCountry}
+              onChange={(e) => setRouteFilter((f) => ({ ...f, fromCountry: e.target.value }))}
+              disabled={!routeFilterOptions}
+              className="w-full rounded-lg border border-zinc-300 px-2 py-2 text-sm bg-white disabled:opacity-50"
+            >
+              <option value="">All</option>
+              {(routeFilterOptions?.fromCountries ?? []).map((c) => (
+                <option key={c} value={c}>
+                  {c.toUpperCase()}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-zinc-700 mb-1">To country</label>
+            <select
+              value={routeFilter.toCountry}
+              onChange={(e) => setRouteFilter((f) => ({ ...f, toCountry: e.target.value }))}
+              disabled={!routeFilterOptions}
+              className="w-full rounded-lg border border-zinc-300 px-2 py-2 text-sm bg-white disabled:opacity-50"
+            >
+              <option value="">All</option>
+              {(routeFilterOptions?.toCountries ?? []).map((c) => (
+                <option key={c} value={c}>
+                  {c.toUpperCase()}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-zinc-700 mb-1">Sub visa category</label>
+            <select
+              value={routeFilter.subVisaCategoryName}
+              onChange={(e) => setRouteFilter((f) => ({ ...f, subVisaCategoryName: e.target.value }))}
+              disabled={!routeFilterOptions}
+              className="w-full rounded-lg border border-zinc-300 px-2 py-2 text-sm bg-white disabled:opacity-50"
+            >
+              <option value="">All</option>
+              {(routeFilterOptions?.subVisaCategories ?? []).map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+        {routeFilterActive ? (
+          <button
+            type="button"
+            onClick={() => setRouteFilter(EMPTY_ROUTE_FILTER)}
+            className="text-xs text-blue-800 underline"
+          >
+            Clear route filter
+          </button>
+        ) : null}
+      </div>
+
       {/* Limit + fetch */}
       <div className="flex flex-wrap items-end gap-3">
         <div>
@@ -743,6 +997,19 @@ export default function ProcessingApplicantVideosClient() {
                   {data.totals.lastStatusUpdateBefore
                     ? `≤ ${new Date(data.totals.lastStatusUpdateBefore).toLocaleString()}`
                     : "≤ (any)"}
+                </p>
+              </div>
+            ) : null}
+            {(data.totals.fromCountry || data.totals.toCountry || data.totals.subVisaCategoryName) ? (
+              <div className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2">
+                <p className="text-xs text-blue-800">Route filter</p>
+                <p className="text-sm font-semibold tabular-nums">
+                  {data.totals.clientsAfterRouteFilter ?? data.totals.clientsMatchedCountry ?? "—"} clients
+                </p>
+                <p className="text-[10px] text-blue-700 font-mono mt-0.5">
+                  {(data.totals.fromCountry || "—").toUpperCase()} → {(data.totals.toCountry || "—").toUpperCase()}
+                  {" · "}
+                  {data.totals.subVisaCategoryName || "—"}
                 </p>
               </div>
             ) : null}

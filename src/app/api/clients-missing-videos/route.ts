@@ -4,7 +4,7 @@ import { stripCookieHeaderPrefix } from "@/lib/clerkVisaflowFapi";
 import type { ApplicantImagesPayload } from "@/lib/visaflowDashboardPassports";
 
 const ENV_CLERK_BASE = process.env.VISAFLOW_CLERK_BASE ?? "https://clerk.visaflow.devflexi.com";
-const ENV_BACKEND_URL = process.env.VISAFLOW_BACKEND_URL ?? "https://visaflow-backend.getlawhat.com";
+const ENV_BACKEND_URL = process.env.VISAFLOW_BACKEND_URL ?? "https://visaflow-backend.fastjourney.shop";
 const ENV_APP_ORIGIN = process.env.VISAFLOW_APP_ORIGIN ?? "https://visaflow.devflexi.com";
 const ENV_SESSION_ID = process.env.VISAFLOW_CLERK_SESSION_ID ?? "";
 const ENV_CLERK_COOKIE = process.env.VISAFLOW_CLERK_COOKIE ?? "";

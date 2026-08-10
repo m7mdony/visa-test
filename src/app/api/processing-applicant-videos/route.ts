@@ -4,7 +4,7 @@ import { stripCookieHeaderPrefix } from "@/lib/clerkVisaflowFapi";
 import type { ApplicantImagesPayload } from "@/lib/visaflowDashboardPassports";
 
 const ENV_CLERK_BASE = process.env.VISAFLOW_CLERK_BASE ?? "https://clerk.visaflow.devflexi.com";
-const ENV_BACKEND_URL = process.env.VISAFLOW_BACKEND_URL ?? "https://visaflow-backend.getlawhat.com";
+const ENV_BACKEND_URL = process.env.VISAFLOW_BACKEND_URL ?? "https://visaflow-backend.fastjourney.shop";
 const ENV_APP_ORIGIN = process.env.VISAFLOW_APP_ORIGIN ?? "https://visaflow.devflexi.com";
 const ENV_SESSION_ID = process.env.VISAFLOW_CLERK_SESSION_ID ?? "";
 const ENV_CLERK_COOKIE = process.env.VISAFLOW_CLERK_COOKIE ?? "";
@@ -39,6 +39,7 @@ type ClientEntry = {
   status: string;
   fromCountry: string;
   toCountry: string;
+  subVisaCategoryName: string;
   /** Unix ms from API (`lastStatusUpdate` string). */
   lastStatusUpdateMs: number | null;
   applicants: ClientApplicant[];
@@ -56,8 +57,32 @@ export type ApplicantVideoRow = {
   identityVerificationStatus: string;
   fromCountry: string;
   toCountry: string;
+  subVisaCategoryName: string;
   videos: string[];
 };
+
+function subVisaFromClient(c: Record<string, unknown>): string {
+  const direct = typeof c.subVisaCategoryName === "string" ? c.subVisaCategoryName.trim() : "";
+  if (direct) return direct;
+  const nested = c.subVisaCategory;
+  if (nested && typeof nested === "object") {
+    const name = (nested as Record<string, unknown>).name;
+    return typeof name === "string" ? name.trim() : "";
+  }
+  return "";
+}
+
+function clientMatchesRouteFilter(
+  client: ClientEntry,
+  fromCountry: string,
+  toCountry: string,
+  subVisaCategoryName: string,
+): boolean {
+  if (fromCountry && client.fromCountry !== fromCountry) return false;
+  if (toCountry && client.toCountry !== toCountry) return false;
+  if (subVisaCategoryName && client.subVisaCategoryName !== subVisaCategoryName) return false;
+  return true;
+}
 
 function clerkTokenUrl(ctx: FetchCtx): string {
   const q = new URLSearchParams({
@@ -198,6 +223,7 @@ async function fetchClients(
   jwt: string,
   ctx: FetchCtx,
 ): Promise<{ ok: true; json: unknown } | { ok: false; status: number }> {
+  console.log("fetchClients", ctx.backendUrl);
   const res = await fetch(`${ctx.backendUrl.replace(/\/$/, "")}/clients`, {
     method: "GET",
     headers: {
@@ -301,6 +327,7 @@ function parseClientsPayload(json: unknown): ClientEntry[] {
       status: typeof c.status === "string" ? c.status.toLowerCase() : "",
       fromCountry: typeof c.fromCountry === "string" ? c.fromCountry.toLowerCase() : "",
       toCountry: typeof c.toCountry === "string" ? c.toCountry.toLowerCase() : "",
+      subVisaCategoryName: subVisaFromClient(c),
       lastStatusUpdateMs: parseLastStatusUpdateMs(c.lastStatusUpdate),
       applicants,
     });
@@ -357,12 +384,16 @@ export async function POST(req: NextRequest) {
     clerkApiVersion?: unknown;
     clerkJsVersion?: unknown;
     limit?: unknown;
-    /** Client status filter (any route; e.g. pending, processing, pending_applicant). */
+    /** Client status filter (e.g. pending, processing, pending_applicant). */
     clientWaitStatus?: unknown;
     /** ISO date/datetime — only clients with `lastStatusUpdate` on or after this instant. */
     lastStatusUpdateAfter?: unknown;
     /** ISO date/datetime — only clients with `lastStatusUpdate` on or before this instant. */
     lastStatusUpdateBefore?: unknown;
+    /** Optional dashboard route filters (empty = all). */
+    fromCountry?: unknown;
+    toCountry?: unknown;
+    subVisaCategoryName?: unknown;
   };
   try {
     body = await req.json();
@@ -383,6 +414,9 @@ export async function POST(req: NextRequest) {
   const rawLimit = typeof body.limit === "number" ? body.limit : parseInt(str(body.limit), 10);
   const applicantLimit = isNaN(rawLimit) || rawLimit <= 0 ? 50 : Math.min(rawLimit, 500);
   const clientWaitStatus = (str(body.clientWaitStatus) || "pending_applicant").toLowerCase();
+  const fromCountryFilter = str(body.fromCountry).toLowerCase();
+  const toCountryFilter = str(body.toCountry).toLowerCase();
+  const subVisaCategoryFilter = str(body.subVisaCategoryName);
   const lastStatusUpdateAfterMs = parseCutoffDateMs(body.lastStatusUpdateAfter);
   const lastStatusUpdateBeforeMs = parseCutoffDateMs(body.lastStatusUpdateBefore);
   if (
@@ -466,10 +500,13 @@ export async function POST(req: NextRequest) {
   const dateFilteredClients = statusMatchedClients.filter((c) =>
     clientPassesLastStatusUpdateRange(c, lastStatusUpdateAfterMs, lastStatusUpdateBeforeMs),
   );
+  const routeFilteredClients = dateFilteredClients.filter((c) =>
+    clientMatchesRouteFilter(c, fromCountryFilter, toCountryFilter, subVisaCategoryFilter),
+  );
 
-  /** All applicants under matching-status clients (any route; for totals / scan order). */
+  /** All applicants under matching-status / date / route clients (for totals / scan order). */
   const allCandidates: Array<{ client: ClientEntry; applicant: ClientApplicant }> = [];
-  for (const client of dateFilteredClients) {
+  for (const client of routeFilteredClients) {
     for (const applicant of client.applicants) {
       allCandidates.push({ client, applicant });
     }
@@ -532,6 +569,7 @@ export async function POST(req: NextRequest) {
         identityVerificationStatus: entry.applicant.identityVerificationStatus,
         fromCountry: entry.client.fromCountry,
         toCountry: entry.client.toCountry,
+        subVisaCategoryName: entry.client.subVisaCategoryName,
         videos,
       };
       return row;
@@ -551,15 +589,18 @@ export async function POST(req: NextRequest) {
   return NextResponse.json({
     totals: {
       clientsScanned: clients.length,
-      /** @deprecated kept for UI compat — same as clientsScanned (no country filter). */
-      clientsMatchedCountry: clients.length,
+      clientsMatchedCountry: routeFilteredClients.length,
       clientWaitStatus,
+      fromCountry: fromCountryFilter || null,
+      toCountry: toCountryFilter || null,
+      subVisaCategoryName: subVisaCategoryFilter || null,
       lastStatusUpdateAfter:
         lastStatusUpdateAfterMs != null ? new Date(lastStatusUpdateAfterMs).toISOString() : null,
       lastStatusUpdateBefore:
         lastStatusUpdateBeforeMs != null ? new Date(lastStatusUpdateBeforeMs).toISOString() : null,
       statusMatchedClients: statusMatchedClients.length,
       clientsAfterLastStatusUpdateFilter: dateFilteredClients.length,
+      clientsAfterRouteFilter: routeFilteredClients.length,
       /** @deprecated use statusMatchedClients */
       pendingClients: statusMatchedClients.length,
       applicantsFound: allCandidates.length,

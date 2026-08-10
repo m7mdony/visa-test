@@ -50,41 +50,14 @@ export default function RootLayout({
                   Approved videos
                 </Link>
                 <Link
-                  href="/unrecovered-denied-jobs"
+                  href="/booking-jobs"
                   className="hover:text-zinc-950 transition-colors"
                 >
-                  Unrecovered DENIED
+                  Booking jobs
                 </Link>
-                <Link
-                  href="/session-videos"
-                  className="hover:text-zinc-950 transition-colors"
-                >
-                  Session videos
-                </Link>
-                <Link
-                  href="/clients-missing-videos"
-                  className="hover:text-zinc-950 transition-colors"
-                >
-                  Missing videos
-                </Link>
-                <Link
-                  href="/vfs-logs"
-                  className="hover:text-zinc-950 transition-colors"
-                >
-                  VFS logs
-                </Link>
-                <Link
-                  href="/unexpected-server-errors"
-                  className="hover:text-zinc-950 transition-colors"
-                >
-                  Unexpected errors
-                </Link>
-                <Link
-                  href="/passport-number-extractor"
-                  className="hover:text-zinc-950 transition-colors"
-                >
-                  Passport extractor
-                </Link>
+                {/* Hidden from nav (2026-08-06) — pages still live, re-add Link here to restore:
+                    /session-videos, /clients-missing-videos, /vfs-logs,
+                    /unexpected-server-errors, /passport-number-extractor, /unrecovered-denied-jobs */}
                 <Link
                   href="/processing-applicant-videos"
                   className="hover:text-zinc-950 transition-colors"

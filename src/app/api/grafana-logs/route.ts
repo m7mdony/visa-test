@@ -107,7 +107,7 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  let body: { interval?: string; from?: number | string; to?: number | string; query?: string; target?: string; cookie?: string; additionalFilter?: string };
+  let body: { interval?: string; from?: number | string; to?: number | string; query?: string; target?: string; cookie?: string; additionalFilter?: string; additionalFilters?: string[] };
   try {
     body = await req.json();
   } catch {
@@ -120,6 +120,15 @@ export async function POST(req: NextRequest) {
   const target =
     typeof body.target === "string" ? body.target.trim() || "azure-liveness-bot" : "azure-liveness-bot";
   const additionalFilter = typeof body.additionalFilter === "string" ? body.additionalFilter.trim() : "";
+  const additionalFilters: string[] = [];
+  if (Array.isArray(body.additionalFilters)) {
+    for (const f of body.additionalFilters) {
+      if (typeof f === "string" && f.trim()) additionalFilters.push(f.trim());
+    }
+  }
+  if (additionalFilters.length === 0 && additionalFilter) {
+    additionalFilters.push(additionalFilter);
+  }
 
   function parseTime(v: number | string | undefined): number | null {
     if (v == null) return null;
@@ -195,8 +204,8 @@ export async function POST(req: NextRequest) {
   let expr = query
     ? `{app="${target}"} |= \`${query.replace(/`/g, "\\`")}\``
     : `{app="${target}"}`;
-  if (additionalFilter) {
-    expr += ` |= \`${additionalFilter.replace(/`/g, "\\`")}\``;
+  for (const filter of additionalFilters) {
+    expr += ` |= \`${filter.replace(/`/g, "\\`")}\``;
   }
 
   const queryUrl = `${base}/api/ds/query?ds_type=loki&requestId=logs_1`;
