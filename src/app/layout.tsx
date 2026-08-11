@@ -64,6 +64,12 @@ export default function RootLayout({
                 >
                   Processing videos
                 </Link>
+                <Link
+                  href="/bot-notable-errors"
+                  className="hover:text-zinc-950 transition-colors"
+                >
+                  Bot errors
+                </Link>
               </nav>
             </div>
           </header>

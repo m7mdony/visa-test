@@ -21,6 +21,11 @@ const ANSI_FG: Record<string, string> = {
 
 const ANSI_RE = /(?:\u001b|\x1b)?\[([0-9;]*)m/g;
 
+/** Remove ANSI SGR sequences for plain-text parsing / grouping keys. */
+export function stripAnsiCodes(text: string): string {
+  return text.replace(ANSI_RE, "");
+}
+
 function applyCodes(style: CSSProperties, codes: string[]): CSSProperties {
   if (codes.length === 0 || codes.includes("0")) return {};
   const next = { ...style };
