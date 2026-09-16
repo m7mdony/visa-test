@@ -70,6 +70,30 @@ export default function RootLayout({
                 >
                   Bot errors
                 </Link>
+                <Link
+                  href="/max-upload"
+                  className="hover:text-zinc-950 transition-colors"
+                >
+                  Max upload
+                </Link>
+                <Link
+                  href="/in-house-ver-videos"
+                  className="hover:text-zinc-950 transition-colors"
+                >
+                  In-house videos
+                </Link>
+                <Link
+                  href="/idnfy-never-failed"
+                  className="hover:text-zinc-950 transition-colors"
+                >
+                  Idnfy never
+                </Link>
+                <Link
+                  href="/we-couldnt-detect-face"
+                  className="hover:text-zinc-950 transition-colors"
+                >
+                  We couldn&apos;t
+                </Link>
               </nav>
             </div>
           </header>

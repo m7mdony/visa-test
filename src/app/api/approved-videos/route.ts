@@ -168,8 +168,8 @@ function normalizeFailureReasonKey(raw: string): string {
 
 /** Returns one or more normalized failure reason keys (concurrent warning => multiple entries). */
 function extractFailureReasonKeys(line: string): string[] {
-  if (isIdnfyStatusNeverFailure(line)) {
-    return ["/idnfystatus never"];
+  if (isIdentityVerificationFailedErrorLine(line)) {
+    return ["Identity verification failed"];
   }
   if (/Attempt\s+\d+(?:\/\d+)?\s*:\s*failed/i.test(line)) {
     const dash = line.match(/Attempt\s+\d+(?:\/\d+)?\s*:\s*failed\s*\([^)]*\)\s*-\s*(.+)$/i);
@@ -198,8 +198,8 @@ function extractFailureReasonKeys(line: string): string[] {
 }
 
 function extractFailureReasonKey(line: string): string | null {
-  if (isIdnfyStatusNeverFailure(line)) {
-    return "/idnfystatus never";
+  if (isIdentityVerificationFailedErrorLine(line)) {
+    return "Identity verification failed";
   }
   if (isNewInHouseIdentityTerminalFailure(line)) {
     const inner = line.match(/in-house verification failed\s*(\[[^\]]+\])/i);
@@ -482,9 +482,9 @@ function isConcurrentAttemptsWarnFailure(line: string): boolean {
   return true;
 }
 
-/** New terminal-fail shape as one phrase: `/idnfystatus never` */
-function isIdnfyStatusNeverFailure(line: string): boolean {
-  return /\/idnfystatus\s+never\b/i.test(line);
+/** Terminal fail: `error: Identity verification failed:` */
+function isIdentityVerificationFailedErrorLine(line: string): boolean {
+  return /error:\s*Identity verification failed:/i.test(line);
 }
 
 /** New log shape: terminal failure in one line (e.g. not approved after in-house solves). */
@@ -520,7 +520,7 @@ function parseInHouseVerificationPassedMs(line: string): number | null {
 
 /** vfs-global-bot prose: contains `status not approved` (e.g. Identity verification failed (status not approved)). */
 function isNotAcceptedStyleFailure(line: string): boolean {
-  if (isIdnfyStatusNeverFailure(line)) return true;
+  if (isIdentityVerificationFailedErrorLine(line)) return true;
   if (isNewInHouseIdentityTerminalFailure(line)) return true;
   if (
     line.includes("In-house identity verification attempt failed") &&
@@ -803,7 +803,7 @@ function classifyVfsVerificationLine(
   if (isNewInHouseIdentityTerminalFailure(line)) {
     return { kind: "fail", failN: 1, failM: 1 };
   }
-  if (isIdnfyStatusNeverFailure(line)) {
+  if (isIdentityVerificationFailedErrorLine(line)) {
     return { kind: "fail", failN: 1, failM: 1 };
   }
   if (isConcurrentAttemptsWarnFailure(line)) {
@@ -1097,7 +1097,7 @@ function lokiLabelValue(v: string): string {
 const LOKI_DEBUG_REQUEST_IDS = new Set([
   "approved_vfs_idnfystatus_all",
   "approved_vfs_idnfystatus_response",
-  "approved_vfs_idnfystatus_never",
+  "approved_vfs_identity_verification_failed",
   "approved_vfs_inhouse_ver",
   "approved_vfs_attempt",
 ]);
@@ -1364,8 +1364,8 @@ export async function POST(req: NextRequest) {
         to,
         app: target,
         lokiNamespace: vfsLokiNamespace,
-        query: "/idnfystatus never",
-        requestId: "approved_vfs_idnfystatus_never",
+        query: "Identity verification failed:",
+        requestId: "approved_vfs_identity_verification_failed",
       }),
     () =>
       queryLogs({
@@ -1522,7 +1522,7 @@ export async function POST(req: NextRequest) {
       : null;
 
   let deniedApplicantLogs = dedupeLogEntries(
-    idnfyStatusLogs.filter((entry) => isIdnfyStatusNeverFailure(entry.line))
+    idnfyStatusLogs.filter((entry) => isIdentityVerificationFailedErrorLine(entry.line))
   );
   let deniedApplicantCount = deniedApplicantLogs.length;
 
@@ -1543,7 +1543,7 @@ export async function POST(req: NextRequest) {
       (entry) => !entry.line.includes("Solving in-house identity verification")
     ),
     ...identityFailTerminalLogs,
-    ...idnfyStatusLogs.filter((entry) => isIdnfyStatusNeverFailure(entry.line)),
+    ...idnfyStatusLogs.filter((entry) => isIdentityVerificationFailedErrorLine(entry.line)),
   ]);
   const identitySuccessLogs = dedupeLogEntries([
     ...identityOutcomeLogs.filter((entry) => isInHouseVerificationPassedLine(entry.line)),
