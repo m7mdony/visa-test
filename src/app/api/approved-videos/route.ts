@@ -482,9 +482,11 @@ function isConcurrentAttemptsWarnFailure(line: string): boolean {
   return true;
 }
 
-/** Terminal fail: `error: Identity verification failed:` */
+/** Terminal fail: `Identity verification failed:` at error level (exclude paired warn lines). */
 function isIdentityVerificationFailedErrorLine(line: string): boolean {
-  return /error:\s*Identity verification failed:/i.test(line);
+  if (!/Identity verification failed:/i.test(line)) return false;
+  if (/\bwarn:\s*Identity verification failed:/i.test(line)) return false;
+  return /\berror:\s*Identity verification failed:/i.test(line);
 }
 
 /** New log shape: terminal failure in one line (e.g. not approved after in-house solves). */

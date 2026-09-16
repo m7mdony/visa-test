@@ -789,7 +789,8 @@ export default function ApprovedVideosClient() {
                 {filtered?.deniedApplicantCount ?? 0}
               </div>
               <div className="mt-1 text-xs text-rose-800">
-                <code className="text-[10px]">error: Identity verification failed:</code>
+                <code className="text-[10px]">Identity verification failed:</code>
+                <span className="text-rose-700/80"> · error only</span>
               </div>
               <div className="mt-4 pt-3 border-t border-rose-200/80">
                 <div className="text-xs font-medium text-rose-900">Errored video attempts</div>
