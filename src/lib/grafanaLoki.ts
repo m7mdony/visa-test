@@ -123,9 +123,26 @@ export function formatLogLineValue(raw: unknown): string {
   if (raw == null) return "";
   if (typeof raw === "object") {
     const o = raw as Record<string, unknown>;
-    if (typeof o.message === "string") return o.message;
-    if (typeof o.msg === "string") return o.msg;
-    if (typeof o.line === "string") return o.line;
+    const body =
+      typeof o.message === "string"
+        ? o.message
+        : typeof o.msg === "string"
+          ? o.msg
+          : typeof o.line === "string"
+            ? o.line
+            : null;
+    const levelRaw =
+      typeof o.level === "string"
+        ? o.level
+        : typeof o.severity === "string"
+          ? o.severity
+          : null;
+    const level = levelRaw?.trim().toLowerCase();
+    if (body && level && /^(error|warn|info|debug|trace|fatal)$/.test(level)) {
+      if (new RegExp(`^${level}\\s*:`, "i").test(body.trim())) return body;
+      return `${level}: ${body}`;
+    }
+    if (body) return body;
     try {
       return JSON.stringify(raw);
     } catch {

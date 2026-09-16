@@ -14,6 +14,7 @@ import {
   isIdnfyStatusResponseLine,
   parseIdnfyStatusFromLine,
   parseLogsFromResponse,
+  logLineHaystack,
 } from "@/lib/grafanaLoki";
 import { buildDeniedPassportRows, type DeniedPassportRow } from "@/lib/deniedPassports";
 import { computeDeniedRecoveryByEmail } from "@/lib/deniedRecovery";
@@ -28,6 +29,7 @@ import {
   type ErroredAttemptEvent,
   type StatusVideoEvent,
 } from "@/lib/reportEvents";
+import { stripAnsiCodes } from "@/components/AnsiLogLine";
 
 const GRAFANA_URL = process.env.GRAFANA_URL ?? "";
 const GRAFANA_USER = process.env.GRAFANA_USER ?? "admin";
@@ -482,11 +484,56 @@ function isConcurrentAttemptsWarnFailure(line: string): boolean {
   return true;
 }
 
-/** Terminal fail: `Identity verification failed:` at error level (exclude paired warn lines). */
+function vfsLogHaystack(line: string): string {
+  return logLineHaystack(stripAnsiCodes(line));
+}
+
+function isHttpTraceLogLine(line: string): boolean {
+  const hay = vfsLogHaystack(line);
+  return (
+    /\[(?:GET|POST|PUT|PATCH|DELETE)\s+https?:/i.test(hay) ||
+    /\]\s*Response:\s*\{/i.test(hay) ||
+    /\]\s*Request:\s*\{/i.test(hay)
+  );
+}
+
+function isIdentityVerificationFailedWarnLine(line: string): boolean {
+  return /\bwarn:\s*Identity verification failed:/i.test(vfsLogHaystack(line));
+}
+
+/** Terminal fail: `error: Identity verification failed:` (not warn, not HTTP JSON traces). */
 function isIdentityVerificationFailedErrorLine(line: string): boolean {
-  if (!/Identity verification failed:/i.test(line)) return false;
-  if (/\bwarn:\s*Identity verification failed:/i.test(line)) return false;
-  return /\berror:\s*Identity verification failed:/i.test(line);
+  const hay = vfsLogHaystack(line);
+  if (!/Identity verification failed:/i.test(hay)) return false;
+  if (isHttpTraceLogLine(line)) return false;
+  if (isIdentityVerificationFailedWarnLine(line)) return false;
+  return /\berror:\s*Identity verification failed:/i.test(hay);
+}
+
+function identityVerificationFailedBodyKey(line: string): string {
+  const hay = vfsLogHaystack(line);
+  const m = hay.match(/Identity verification failed:(.+)$/i);
+  return m?.[1]?.trim() ?? hay.trim();
+}
+
+/** Collapse warn+error pairs that share timestamp + message body. */
+function dedupeDeniedApplicantLogs(entries: LogEntry[]): LogEntry[] {
+  const byKey = new Map<string, LogEntry>();
+  for (const entry of entries) {
+    if (!isIdentityVerificationFailedErrorLine(entry.line)) continue;
+    const key = `${entry.time}\0${identityVerificationFailedBodyKey(entry.line)}`;
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, entry);
+      continue;
+    }
+    const entryHasError = /\berror:\s*Identity verification failed:/i.test(entry.line);
+    const existingHasError = /\berror:\s*Identity verification failed:/i.test(existing.line);
+    if (entryHasError && !existingHasError) byKey.set(key, entry);
+  }
+  const out = [...byKey.values()];
+  out.sort((a, b) => a.time.localeCompare(b.time));
+  return out;
 }
 
 /** New log shape: terminal failure in one line (e.g. not approved after in-house solves). */
@@ -545,9 +592,11 @@ function taskIdToSessionPrefix(taskId: string): string {
   return first;
 }
 
-/** `Activated in-house identity verification token [ReferenceNumber: uuid]` */
+/** Session ref from `[ReferenceNumber: uuid]` or `RequestRefNumber: uuid`. */
 function extractActivatedReferenceNumber(line: string): string | undefined {
-  const m = line.match(/\[ReferenceNumber:\s*([a-f0-9-]+)\]/i);
+  const m =
+    line.match(/\[ReferenceNumber:\s*([a-f0-9-]+)\]/i) ??
+    line.match(/\bRequestRefNumber:\s*([a-f0-9-]+)/i);
   return m?.[1]?.trim();
 }
 
@@ -1523,10 +1572,27 @@ export async function POST(req: NextRequest) {
       ? Math.round(inHousePassedMs.reduce((a, b) => a + b, 0) / inHousePassedMs.length)
       : null;
 
-  let deniedApplicantLogs = dedupeLogEntries(
-    idnfyStatusLogs.filter((entry) => isIdentityVerificationFailedErrorLine(entry.line))
-  );
+  const deniedApplicantWarnCount = idnfyStatusLogs.filter((entry) =>
+    isIdentityVerificationFailedWarnLine(entry.line)
+  ).length;
+  let deniedApplicantLogs = dedupeDeniedApplicantLogs(dedupeLogEntries(idnfyStatusLogs));
   let deniedApplicantCount = deniedApplicantLogs.length;
+  console.log("\n[approved-videos][denied-applicants] summary");
+  console.log(`  loki lines (Identity verification failed:): ${idnfyStatusLogs.length}`);
+  console.log(`  warn lines (excluded): ${deniedApplicantWarnCount}`);
+  console.log(`  counted (error or message-only, deduped): ${deniedApplicantCount}`);
+  if (idnfyStatusLogs.length > 0 && deniedApplicantCount === 0) {
+    console.log("  samples (first 3 raw):");
+    for (let i = 0; i < Math.min(3, idnfyStatusLogs.length); i++) {
+      const preview =
+        idnfyStatusLogs[i].line.length > 400
+          ? `${idnfyStatusLogs[i].line.slice(0, 400)}…`
+          : idnfyStatusLogs[i].line;
+      console.log(
+        `    [${i}] match=${isIdentityVerificationFailedErrorLine(idnfyStatusLogs[i].line)} warn=${isIdentityVerificationFailedWarnLine(idnfyStatusLogs[i].line)} | ${preview}`
+      );
+    }
+  }
 
   let erroredVideoAttemptLogs = dedupeLogEntries(
     vfsAttemptLogs.filter((entry) => isErroredVideoAttemptLine(entry.line))
@@ -1631,14 +1697,18 @@ export async function POST(req: NextRequest) {
       ? Math.round(inHousePassedMs.reduce((a, b) => a + b, 0) / inHousePassedMs.length)
       : null;
 
+  // Denied applicants: count all error-level lines in window (not solveKind-scoped — many fail before activation).
   const deniedApplicantKind = filterLogsBySolveKind(
     deniedApplicantLogs,
     allowedSessionRefs,
     urnToRef,
     windowsByEmail
   );
-  deniedApplicantLogs = deniedApplicantKind.matched;
-  deniedApplicantCount = deniedApplicantLogs.length;
+  if (deniedApplicantKind.unmatched > 0) {
+    console.log(
+      `  solveKind cohort would exclude ${deniedApplicantKind.unmatched} (counting all ${deniedApplicantCount} anyway)`
+    );
+  }
 
   const erroredKind = filterLogsBySolveKind(
     erroredVideoAttemptLogs,
