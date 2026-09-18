@@ -526,13 +526,18 @@ function isIdentityVerificationFailedErrorLine(line: string): boolean {
   return /\berror:\s*Identity verification failed:/i.test(hay);
 }
 
-/** Drop-solve terminal fail: `/idnfystatus never returned` (error only, not warn / HTTP traces). */
+/**
+ * Drop-solve terminal fail: bare `error: /idnfystatus never returned APPROVED …`.
+ * Excludes verification-solve shape:
+ * `error: Identity verification failed: … (/idnfystatus never returned APPROVED)`.
+ */
 function isIdnfyStatusNeverReturnedErrorLine(line: string): boolean {
   const hay = vfsLogHaystack(line);
   if (!/\/idnfystatus never returned/i.test(hay)) return false;
+  if (/Identity verification failed:/i.test(hay)) return false;
   if (isHttpTraceLogLine(line)) return false;
   if (isIdnfyStatusNeverReturnedWarnLine(line)) return false;
-  return /\berror:/i.test(hay);
+  return /\berror:\s*\/idnfystatus never returned/i.test(hay);
 }
 
 function isDeniedApplicantErrorLine(line: string, kind: SolveKind): boolean {
