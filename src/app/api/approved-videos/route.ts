@@ -56,6 +56,11 @@ type DeploymentEnv = "prod" | "staging";
 
 type SolveKind = "drop" | "verification";
 
+const DENIED_APPLICANT_LOKI_QUERY: Record<SolveKind, string> = {
+  verification: "Identity verification failed:",
+  drop: "/idnfystatus never returned",
+};
+
 type EmailTimelineEvent = {
   timeMs: number;
   email: string;
@@ -173,6 +178,9 @@ function extractFailureReasonKeys(line: string): string[] {
   if (isIdentityVerificationFailedErrorLine(line)) {
     return ["Identity verification failed"];
   }
+  if (isIdnfyStatusNeverReturnedErrorLine(line)) {
+    return ["/idnfystatus never returned APPROVED"];
+  }
   if (/Attempt\s+\d+(?:\/\d+)?\s*:\s*failed/i.test(line)) {
     const dash = line.match(/Attempt\s+\d+(?:\/\d+)?\s*:\s*failed\s*\([^)]*\)\s*-\s*(.+)$/i);
     const payload = dash?.[1]?.trim();
@@ -202,6 +210,9 @@ function extractFailureReasonKeys(line: string): string[] {
 function extractFailureReasonKey(line: string): string | null {
   if (isIdentityVerificationFailedErrorLine(line)) {
     return "Identity verification failed";
+  }
+  if (isIdnfyStatusNeverReturnedErrorLine(line)) {
+    return "/idnfystatus never returned APPROVED";
   }
   if (isNewInHouseIdentityTerminalFailure(line)) {
     const inner = line.match(/in-house verification failed\s*(\[[^\]]+\])/i);
@@ -501,6 +512,11 @@ function isIdentityVerificationFailedWarnLine(line: string): boolean {
   return /\bwarn:\s*Identity verification failed:/i.test(vfsLogHaystack(line));
 }
 
+function isIdnfyStatusNeverReturnedWarnLine(line: string): boolean {
+  const hay = vfsLogHaystack(line);
+  return /\bwarn:/i.test(hay) && /\/idnfystatus never returned/i.test(hay);
+}
+
 /** Terminal fail: `error: Identity verification failed:` (not warn, not HTTP JSON traces). */
 function isIdentityVerificationFailedErrorLine(line: string): boolean {
   const hay = vfsLogHaystack(line);
@@ -510,25 +526,64 @@ function isIdentityVerificationFailedErrorLine(line: string): boolean {
   return /\berror:\s*Identity verification failed:/i.test(hay);
 }
 
+/** Drop-solve terminal fail: `/idnfystatus never returned` (error only, not warn / HTTP traces). */
+function isIdnfyStatusNeverReturnedErrorLine(line: string): boolean {
+  const hay = vfsLogHaystack(line);
+  if (!/\/idnfystatus never returned/i.test(hay)) return false;
+  if (isHttpTraceLogLine(line)) return false;
+  if (isIdnfyStatusNeverReturnedWarnLine(line)) return false;
+  return /\berror:/i.test(hay);
+}
+
+function isDeniedApplicantErrorLine(line: string, kind: SolveKind): boolean {
+  return kind === "verification"
+    ? isIdentityVerificationFailedErrorLine(line)
+    : isIdnfyStatusNeverReturnedErrorLine(line);
+}
+
+function isDeniedApplicantWarnLine(line: string, kind: SolveKind): boolean {
+  return kind === "verification"
+    ? isIdentityVerificationFailedWarnLine(line)
+    : isIdnfyStatusNeverReturnedWarnLine(line);
+}
+
 function identityVerificationFailedBodyKey(line: string): string {
   const hay = vfsLogHaystack(line);
   const m = hay.match(/Identity verification failed:(.+)$/i);
   return m?.[1]?.trim() ?? hay.trim();
 }
 
+function idnfyStatusNeverReturnedBodyKey(line: string): string {
+  const hay = vfsLogHaystack(line);
+  const m = hay.match(/\/idnfystatus never returned(.+)$/i);
+  return m?.[1]?.trim() ?? hay.trim();
+}
+
+function deniedApplicantBodyKey(line: string, kind: SolveKind): string {
+  return kind === "verification"
+    ? identityVerificationFailedBodyKey(line)
+    : idnfyStatusNeverReturnedBodyKey(line);
+}
+
 /** Collapse warn+error pairs that share timestamp + message body. */
-function dedupeDeniedApplicantLogs(entries: LogEntry[]): LogEntry[] {
+function dedupeDeniedApplicantLogs(entries: LogEntry[], kind: SolveKind): LogEntry[] {
   const byKey = new Map<string, LogEntry>();
   for (const entry of entries) {
-    if (!isIdentityVerificationFailedErrorLine(entry.line)) continue;
-    const key = `${entry.time}\0${identityVerificationFailedBodyKey(entry.line)}`;
+    if (!isDeniedApplicantErrorLine(entry.line, kind)) continue;
+    const key = `${entry.time}\0${deniedApplicantBodyKey(entry.line, kind)}`;
     const existing = byKey.get(key);
     if (!existing) {
       byKey.set(key, entry);
       continue;
     }
-    const entryHasError = /\berror:\s*Identity verification failed:/i.test(entry.line);
-    const existingHasError = /\berror:\s*Identity verification failed:/i.test(existing.line);
+    const entryHasError =
+      kind === "verification"
+        ? /\berror:\s*Identity verification failed:/i.test(entry.line)
+        : isIdnfyStatusNeverReturnedErrorLine(entry.line);
+    const existingHasError =
+      kind === "verification"
+        ? /\berror:\s*Identity verification failed:/i.test(existing.line)
+        : isIdnfyStatusNeverReturnedErrorLine(existing.line);
     if (entryHasError && !existingHasError) byKey.set(key, entry);
   }
   const out = [...byKey.values()];
@@ -570,6 +625,7 @@ function parseInHouseVerificationPassedMs(line: string): number | null {
 /** vfs-global-bot prose: contains `status not approved` (e.g. Identity verification failed (status not approved)). */
 function isNotAcceptedStyleFailure(line: string): boolean {
   if (isIdentityVerificationFailedErrorLine(line)) return true;
+  if (isIdnfyStatusNeverReturnedErrorLine(line)) return true;
   if (isNewInHouseIdentityTerminalFailure(line)) return true;
   if (
     line.includes("In-house identity verification attempt failed") &&
@@ -855,6 +911,9 @@ function classifyVfsVerificationLine(
     return { kind: "fail", failN: 1, failM: 1 };
   }
   if (isIdentityVerificationFailedErrorLine(line)) {
+    return { kind: "fail", failN: 1, failM: 1 };
+  }
+  if (isIdnfyStatusNeverReturnedErrorLine(line)) {
     return { kind: "fail", failN: 1, failM: 1 };
   }
   if (isConcurrentAttemptsWarnFailure(line)) {
@@ -1415,8 +1474,11 @@ export async function POST(req: NextRequest) {
         to,
         app: target,
         lokiNamespace: vfsLokiNamespace,
-        query: "Identity verification failed:",
-        requestId: "approved_vfs_identity_verification_failed",
+        query: DENIED_APPLICANT_LOKI_QUERY[solveKind],
+        requestId:
+          solveKind === "verification"
+            ? "approved_vfs_identity_verification_failed"
+            : "approved_vfs_idnfystatus_never",
       }),
     () =>
       queryLogs({
@@ -1572,15 +1634,18 @@ export async function POST(req: NextRequest) {
       ? Math.round(inHousePassedMs.reduce((a, b) => a + b, 0) / inHousePassedMs.length)
       : null;
 
+  const deniedApplicantLokiQuery = DENIED_APPLICANT_LOKI_QUERY[solveKind];
   const deniedApplicantWarnCount = idnfyStatusLogs.filter((entry) =>
-    isIdentityVerificationFailedWarnLine(entry.line)
+    isDeniedApplicantWarnLine(entry.line, solveKind)
   ).length;
-  let deniedApplicantLogs = dedupeDeniedApplicantLogs(dedupeLogEntries(idnfyStatusLogs));
+  let deniedApplicantLogs = dedupeDeniedApplicantLogs(dedupeLogEntries(idnfyStatusLogs), solveKind);
   let deniedApplicantCount = deniedApplicantLogs.length;
   console.log("\n[approved-videos][denied-applicants] summary");
-  console.log(`  loki lines (Identity verification failed:): ${idnfyStatusLogs.length}`);
+  console.log(`  solveKind: ${solveKind}`);
+  console.log(`  loki query: ${deniedApplicantLokiQuery}`);
+  console.log(`  loki lines: ${idnfyStatusLogs.length}`);
   console.log(`  warn lines (excluded): ${deniedApplicantWarnCount}`);
-  console.log(`  counted (error or message-only, deduped): ${deniedApplicantCount}`);
+  console.log(`  counted (error only, deduped): ${deniedApplicantCount}`);
   if (idnfyStatusLogs.length > 0 && deniedApplicantCount === 0) {
     console.log("  samples (first 3 raw):");
     for (let i = 0; i < Math.min(3, idnfyStatusLogs.length); i++) {
@@ -1589,7 +1654,7 @@ export async function POST(req: NextRequest) {
           ? `${idnfyStatusLogs[i].line.slice(0, 400)}…`
           : idnfyStatusLogs[i].line;
       console.log(
-        `    [${i}] match=${isIdentityVerificationFailedErrorLine(idnfyStatusLogs[i].line)} warn=${isIdentityVerificationFailedWarnLine(idnfyStatusLogs[i].line)} | ${preview}`
+        `    [${i}] match=${isDeniedApplicantErrorLine(idnfyStatusLogs[i].line, solveKind)} warn=${isDeniedApplicantWarnLine(idnfyStatusLogs[i].line, solveKind)} | ${preview}`
       );
     }
   }
@@ -1611,7 +1676,7 @@ export async function POST(req: NextRequest) {
       (entry) => !entry.line.includes("Solving in-house identity verification")
     ),
     ...identityFailTerminalLogs,
-    ...idnfyStatusLogs.filter((entry) => isIdentityVerificationFailedErrorLine(entry.line)),
+    ...idnfyStatusLogs.filter((entry) => isDeniedApplicantErrorLine(entry.line, solveKind)),
   ]);
   const identitySuccessLogs = dedupeLogEntries([
     ...identityOutcomeLogs.filter((entry) => isInHouseVerificationPassedLine(entry.line)),
