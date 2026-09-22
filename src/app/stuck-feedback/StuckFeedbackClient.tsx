@@ -1,11 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import type { StuckFeedbackEpisode } from "@/lib/stuckFeedback";
-import {
-  findGestureClipUrl,
-  type GestureClipEntry,
-} from "@/lib/visaflowDashboardPassports";
+import { episodeKey, type StuckFeedbackEpisode } from "@/lib/stuckFeedback";
 import VisaflowDashboardLoginPanel from "@/components/VisaflowDashboardLoginPanel";
 import {
   applyRefreshedBearerJwt,
@@ -20,8 +16,6 @@ const INTERVAL_MS: Record<string, number> = {
   "6h": 6 * 60 * 60 * 1000,
   "24h": 24 * 60 * 60 * 1000,
 };
-
-const DASHBOARD_BATCH_SIZE = 5;
 
 type DeploymentEnvUi = "prod" | "staging";
 
@@ -41,9 +35,12 @@ type ApiResponse = {
   error?: string;
 };
 
-type DashboardMediaEntry = {
-  passportImages?: Array<{ url: string }>;
-  gestureClips?: GestureClipEntry[];
+type EpisodeDashboardRow = {
+  key: string;
+  passportNumber: string | null;
+  applicantId: string | null;
+  passportImageUrl: string | null;
+  gestureClipUrl: string | null;
   error?: string;
 };
 
@@ -86,15 +83,14 @@ export default function StuckFeedbackClient() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [data, setData] = useState<ApiResponse | null>(null);
-  const [dashByPassport, setDashByPassport] = useState<Record<string, DashboardMediaEntry>>({});
+  const [byEpisode, setByEpisode] = useState<Record<string, EpisodeDashboardRow>>({});
   const [dashError, setDashError] = useState<string | null>(null);
   const [dashLoading, setDashLoading] = useState(false);
-  const [dashProgress, setDashProgress] = useState<string | null>(null);
   const { authenticated: dashboardJwtSaved } = useVisaflowDashboardAuth();
 
-  async function fetchDashboardBatch(
-    passportNumbers: string[],
-  ): Promise<{ ok: boolean; byPassport: Record<string, DashboardMediaEntry>; topError?: string }> {
+  async function loadDashboardClips() {
+    if (!data) return;
+
     await ensureFreshBearerJwt();
     const { bearerJwt: bearerFromStorage, clerkSessionId: refreshSid, clerkCookie: refreshJar } =
       buildDashboardAuthBody();
@@ -102,65 +98,50 @@ export default function StuckFeedbackClient() {
       (!bearerFromStorage || bearerFromStorage.split(".").length < 2) &&
       !(refreshSid?.startsWith("sess_") && refreshJar)
     ) {
-      return { ok: false, byPassport: {}, topError: "Sign in with Visaflow dashboard OTP first." };
-    }
-
-    const res = await fetch("/api/dashboard-passport-images", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        passportNumbers,
-        bearerJwt: bearerFromStorage,
-        ...(refreshSid?.startsWith("sess_") ? { clerkSessionId: refreshSid } : {}),
-        ...(refreshJar ? { clerkCookie: refreshJar } : {}),
-      }),
-    });
-    const json = (await res.json().catch(() => ({}))) as {
-      error?: string;
-      byPassport?: Record<string, DashboardMediaEntry>;
-      refreshedBearerJwt?: string;
-    };
-    applyRefreshedBearerJwt(json.refreshedBearerJwt);
-    return {
-      ok: res.ok,
-      byPassport: json.byPassport ?? {},
-      topError: json.error,
-    };
-  }
-
-  async function loadDashboardClips() {
-    if (!data) return;
-    const passports = [
-      ...new Set(
-        data.episodes.map((e) => e.passportNumber?.trim()).filter((p): p is string => Boolean(p)),
-      ),
-    ];
-    if (passports.length === 0) {
-      setDashError("No passport numbers in log results to look up.");
+      setDashError("Sign in with Visaflow dashboard OTP first.");
       return;
     }
 
     setDashLoading(true);
     setDashError(null);
-    setDashProgress(null);
-    const merged: Record<string, DashboardMediaEntry> = { ...dashByPassport };
-    let topError: string | null = null;
+    setByEpisode({});
 
     try {
-      for (let i = 0; i < passports.length; i += DASHBOARD_BATCH_SIZE) {
-        const batch = passports.slice(i, i + DASHBOARD_BATCH_SIZE);
-        setDashProgress(`Loading dashboard ${i + 1}–${i + batch.length} of ${passports.length}…`);
-        const result = await fetchDashboardBatch(batch);
-        Object.assign(merged, result.byPassport);
-        if (!result.ok && result.topError) topError = result.topError;
+      const res = await fetch("/api/stuck-feedback/dashboard", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: data.from,
+          to: data.to,
+          deploymentEnv: data.deploymentEnv,
+          episodes: data.episodes.map((ep) => ({
+            jobId: ep.jobId,
+            clip: ep.clip,
+            startedAt: ep.startedAt,
+            passportNumber: ep.passportNumber,
+          })),
+          bearerJwt: bearerFromStorage,
+          ...(refreshSid?.startsWith("sess_") ? { clerkSessionId: refreshSid } : {}),
+          ...(refreshJar ? { clerkCookie: refreshJar } : {}),
+        }),
+      });
+      const json = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        warning?: string;
+        byEpisode?: Record<string, EpisodeDashboardRow>;
+        refreshedBearerJwt?: string;
+      };
+      if (!res.ok) {
+        setDashError(json.error ?? `HTTP ${res.status}`);
+        return;
       }
-      setDashByPassport(merged);
-      if (topError) setDashError(topError);
+      applyRefreshedBearerJwt(json.refreshedBearerJwt);
+      setByEpisode(json.byEpisode ?? {});
+      if (json.warning) setDashError(json.warning);
     } catch (e: unknown) {
       setDashError(e instanceof Error ? e.message : "Dashboard fetch failed");
     } finally {
       setDashLoading(false);
-      setDashProgress(null);
     }
   }
 
@@ -169,7 +150,7 @@ export default function StuckFeedbackClient() {
     setDashError(null);
     setLoading(true);
     setData(null);
-    setDashByPassport({});
+    setByEpisode({});
 
     const from = new Date(fromStr).getTime();
     const to = new Date(toStr).getTime();
@@ -199,13 +180,6 @@ export default function StuckFeedbackClient() {
   }
 
   const episodes = data?.episodes ?? [];
-  const passportCount = useMemo(
-    () =>
-      new Set(
-        episodes.map((e) => e.passportNumber?.trim()).filter((p): p is string => Boolean(p)),
-      ).size,
-    [episodes],
-  );
 
   const sortedClipCounts = useMemo(() => {
     if (!data?.clipCounts) return [];
@@ -222,23 +196,19 @@ export default function StuckFeedbackClient() {
   }, [data?.clipCounts]);
 
   const withGestureClipCount = useMemo(() => {
-    if (!data) return 0;
-    return data.episodes.filter((ep) => {
-      const passport = ep.passportNumber?.trim();
-      if (!passport) return false;
-      const dash = dashByPassport[passport];
-      return Boolean(findGestureClipUrl(dash?.gestureClips, ep.clip));
-    }).length;
-  }, [data, dashByPassport]);
+    return Object.values(byEpisode).filter((r) => r.gestureClipUrl).length;
+  }, [byEpisode]);
+
+  const dashLoaded = Object.keys(byEpisode).length > 0;
 
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-lg font-semibold text-zinc-900">Stuck feedback</h1>
         <p className="mt-1 text-sm text-zinc-600">
-          Step 1: search solver logs for <code className="text-zinc-800">[STUCK-FEEDBACK]</code>. Step 2:
-          load passport images + gesture clips from dashboard{" "}
-          <code className="text-zinc-800">/applicants/images</code>.
+          Step 1: search solver <code className="text-zinc-800">[STUCK-FEEDBACK]</code> logs. Step 2: load dashboard{" "}
+          <code className="text-zinc-800">/applicants/images</code> (passport +{" "}
+          <code className="text-zinc-800">images.gestureClips</code>).
         </p>
       </div>
 
@@ -316,17 +286,8 @@ export default function StuckFeedbackClient() {
             <StatCard label="Episodes" value={data.totals.episodeCount} />
             <StatCard label="Distinct clips" value={data.totals.distinctClips} />
             <StatCard label="With passport" value={data.totals.withPassport} />
-            <StatCard
-              label="With gesture clip"
-              value={Object.keys(dashByPassport).length > 0 ? withGestureClipCount : "—"}
-            />
+            <StatCard label="With gesture clip" value={dashLoaded ? withGestureClipCount : "—"} />
           </div>
-
-          {data.totals.stuckQueryLines > 0 && data.totals.episodeCount === 0 && (
-            <p className="text-sm text-amber-800">
-              Found {data.totals.stuckQueryLines} STUCK log lines but no parsed episodes — check log format.
-            </p>
-          )}
 
           {sortedClipCounts.length > 0 && (
             <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-4">
@@ -350,8 +311,7 @@ export default function StuckFeedbackClient() {
           {episodes.length > 0 && (
             <div className="flex flex-wrap items-center gap-3 rounded-xl border border-zinc-200 bg-zinc-50 px-4 py-3">
               <div className="text-sm text-zinc-700">
-                <span className="font-medium">Step 2:</span> load dashboard data for {passportCount} passport
-                {passportCount === 1 ? "" : "s"}
+                <span className="font-medium">Step 2:</span> resolve passport from solver payload + load gesture clips
               </div>
               <button
                 type="button"
@@ -359,7 +319,7 @@ export default function StuckFeedbackClient() {
                 disabled={dashLoading || !dashboardJwtSaved}
                 className="rounded-lg border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-900 hover:bg-zinc-100 disabled:opacity-50"
               >
-                {dashLoading ? (dashProgress ?? "Loading dashboard…") : "Load passport & gesture clips"}
+                {dashLoading ? "Loading dashboard…" : "Load passport & gesture clips"}
               </button>
               {!dashboardJwtSaved && (
                 <span className="text-xs text-zinc-500">Sign in above first.</span>
@@ -392,10 +352,10 @@ export default function StuckFeedbackClient() {
             <tbody className="divide-y divide-zinc-100">
               {episodes.map((ep) => (
                 <EpisodeRow
-                  key={`${ep.jobId}|${ep.clip}|${ep.startedAt}`}
+                  key={episodeKey(ep.jobId, ep.clip, ep.startedAt)}
                   ep={ep}
-                  dashByPassport={dashByPassport}
-                  dashLoaded={Object.keys(dashByPassport).length > 0}
+                  dash={byEpisode[episodeKey(ep.jobId, ep.clip, ep.startedAt)]}
+                  dashLoaded={dashLoaded}
                 />
               ))}
             </tbody>
@@ -421,17 +381,16 @@ function StatCard({ label, value }: { label: string; value: string | number }) {
 
 function EpisodeRow({
   ep,
-  dashByPassport,
+  dash,
   dashLoaded,
 }: {
   ep: StuckFeedbackEpisode;
-  dashByPassport: Record<string, DashboardMediaEntry>;
+  dash?: EpisodeDashboardRow;
   dashLoaded: boolean;
 }) {
-  const passport = ep.passportNumber?.trim() ?? "";
-  const dash = passport ? dashByPassport[passport] : undefined;
-  const passportImg = dash?.passportImages?.find((p) => p.url?.trim())?.url?.trim();
-  const gestureClipUrl = findGestureClipUrl(dash?.gestureClips, ep.clip);
+  const passport = dash?.passportNumber ?? ep.passportNumber?.trim() ?? "";
+  const passportImg = dash?.passportImageUrl ?? null;
+  const gestureClipUrl = dash?.gestureClipUrl ?? null;
   const jobShort = ep.jobId.includes("|") ? ep.jobId.split("|")[0] : ep.sessionPrefix;
 
   return (
@@ -479,12 +438,12 @@ function EpisodeRow({
           >
             {gestureClipUrl}
           </a>
-        ) : passport ? (
-          <span className="text-xs text-amber-700">
-            {dashLoaded ? `No ${ep.clip} clip on dashboard` : "Load dashboard"}
+        ) : dashLoaded ? (
+          <span className="text-xs text-amber-700" title={dash?.error}>
+            {dash?.error ?? `No ${ep.clip} in gestureClips`}
           </span>
         ) : (
-          <span className="text-xs text-zinc-400">Need passport</span>
+          <span className="text-xs text-zinc-400">Load dashboard</span>
         )}
       </td>
       <td className="px-3 py-2 font-mono text-xs text-zinc-600" title={ep.jobId}>

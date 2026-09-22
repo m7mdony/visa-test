@@ -41,16 +41,42 @@ export function collectApplicantsFromPayload(json: unknown): DashboardApplicantR
   return out;
 }
 
+function loosePassportKey(s: string): string {
+  return normalizePassportKey(s).replace(/[^a-z0-9]/g, "");
+}
+
 export function findApplicantIdByPassport(
   applicants: DashboardApplicantRef[],
   passportQuery: string,
 ): string | null {
   const want = normalizePassportKey(passportQuery);
+  const wantLoose = loosePassportKey(passportQuery);
   if (!want) return null;
   for (const a of applicants) {
-    if (normalizePassportKey(a.passportNumber) === want) return a.id;
+    const key = normalizePassportKey(a.passportNumber);
+    if (key === want) return a.id;
+    if (wantLoose && loosePassportKey(a.passportNumber) === wantLoose) return a.id;
   }
   return null;
+}
+
+/** Store + lookup dashboard media by normalized passport key. */
+export function indexByNormalizedPassport<T extends { passportNumber?: string | null }>(
+  items: Array<{ passport: string; value: T }>,
+): Record<string, T & { passportNumber: string }> {
+  const out: Record<string, T & { passportNumber: string }> = {};
+  for (const { passport, value } of items) {
+    const key = normalizePassportKey(passport);
+    if (!key) continue;
+    out[key] = { ...value, passportNumber: passport.trim() };
+  }
+  return out;
+}
+
+export function lookupByPassportKey<T>(map: Record<string, T>, passport: string): T | undefined {
+  const key = normalizePassportKey(passport);
+  if (!key) return undefined;
+  return map[key] ?? map[passport.trim()];
 }
 
 export type PassportImageEntry = { id: string; url: string };

@@ -1,5 +1,4 @@
-import { NextRequest, NextResponse } from "next/server";
-import { cookies } from "next/headers";
+import { stripCookieHeaderPrefix } from "@/lib/clerkVisaflowFapi";
 import {
   collectApplicantsFromPayload,
   findApplicantIdByPassport,
@@ -10,7 +9,6 @@ import {
   type GestureClipEntry,
   type PassportImageEntry,
 } from "@/lib/visaflowDashboardPassports";
-import { stripCookieHeaderPrefix } from "@/lib/clerkVisaflowFapi";
 
 const ENV_CLERK_BASE = process.env.VISAFLOW_CLERK_BASE ?? "https://clerk.visaflow.devflexi.com";
 const ENV_BACKEND_URL = process.env.VISAFLOW_BACKEND_URL ?? "https://visaflow-backend.fastjourney.shop";
@@ -26,14 +24,14 @@ const UA =
 
 const BACKEND_FETCH_TIMEOUT_MS = 25_000;
 
-function backendFetchTimeoutSignal(): AbortSignal {
-  return AbortSignal.timeout(BACKEND_FETCH_TIMEOUT_MS);
-}
-
-function fetchErrorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  return String(err);
-}
+export type DashboardMediaResult = {
+  applicantId: string | null;
+  applicant?: ApplicantImagesPayload["applicant"];
+  passportImages: PassportImageEntry[];
+  videos: string[];
+  gestureClips: GestureClipEntry[];
+  error?: string;
+};
 
 type FetchCtx = {
   clerkBase: string;
@@ -46,14 +44,18 @@ type FetchCtx = {
   clerkJsVersion: string;
 };
 
-type PerPassportResult = {
-  applicantId: string | null;
-  applicant?: ApplicantImagesPayload["applicant"];
-  passportImages: PassportImageEntry[];
-  videos: string[];
-  gestureClips: GestureClipEntry[];
-  error?: string;
-};
+function backendFetchTimeoutSignal(): AbortSignal {
+  return AbortSignal.timeout(BACKEND_FETCH_TIMEOUT_MS);
+}
+
+function fetchErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+function str(v: unknown): string {
+  return typeof v === "string" ? v.trim() : "";
+}
 
 function clerkTokenUrl(ctx: FetchCtx): string {
   const q = new URLSearchParams({
@@ -63,13 +65,12 @@ function clerkTokenUrl(ctx: FetchCtx): string {
   return `${ctx.clerkBase.replace(/\/$/, "")}/v1/client/sessions/${ctx.sessionId}/tokens?${q.toString()}`;
 }
 
-/** Clerk `__client` JWT payload often includes `sid` — must match `/sessions/{id}/tokens` path. */
 function extractSidFromClientCookie(cookieHeader: string): string | null {
   const parts = cookieHeader.split(";");
   for (const part of parts) {
     const trimmed = part.trim();
     if (!trimmed.toLowerCase().startsWith("__client=")) continue;
-    let val = trimmed.slice("__client=".length).trim();
+    const val = trimmed.slice("__client=".length).trim();
     if (!val || val === "deleted") continue;
     const seg = val.split(".");
     if (seg.length < 2) continue;
@@ -111,11 +112,13 @@ function clerkErrorsToString(json: unknown): string {
   if (typeof o.message === "string" && o.message.trim()) return o.message.trim();
   const errors = o.errors;
   if (Array.isArray(errors)) {
-    const parts = errors.map((e) => {
-      if (!e || typeof e !== "object") return "";
-      const er = e as Record<string, unknown>;
-      return String(er.long_message ?? er.message ?? "").trim();
-    }).filter(Boolean);
+    const parts = errors
+      .map((e) => {
+        if (!e || typeof e !== "object") return "";
+        const er = e as Record<string, unknown>;
+        return String(er.long_message ?? er.message ?? "").trim();
+      })
+      .filter(Boolean);
     if (parts.length) return parts.join("; ");
   }
   try {
@@ -165,35 +168,21 @@ async function fetchClerkJwt(
     return {
       ok: false,
       error:
-        "Missing Clerk session: set VISAFLOW_CLERK_SESSION_ID + VISAFLOW_CLERK_COOKIE on the server, or send clerkSessionId + clerkCookie in the JSON body.",
+        "Missing Clerk session: sign in with Visaflow dashboard OTP or send clerkSessionId + clerkCookie.",
     };
   }
-
   const referers = [`${ctx.appOrigin.replace(/\/$/, "")}/`, `${ctx.clerkBase.replace(/\/$/, "")}/`];
-  const uniqueReferers = [...new Set(referers)];
-
   const sidFromCookie = extractSidFromClientCookie(ctx.clerkCookie);
   const sessionIds = [ctx.sessionId, ...(sidFromCookie && sidFromCookie !== ctx.sessionId ? [sidFromCookie] : [])];
-
   let last: { ok: false; error: string; status: number } | null = null;
   for (const sid of sessionIds) {
-    const ctxSid: FetchCtx = { ...ctx, sessionId: sid };
-    for (const referer of uniqueReferers) {
-      const r = await fetchClerkJwtOnce(ctxSid, referer);
+    for (const referer of referers) {
+      const r = await fetchClerkJwtOnce({ ...ctx, sessionId: sid }, referer);
       if (r.ok) return r;
       last = r;
     }
   }
-
-  const hint401 =
-    last?.status === 401
-      ? " For 401: use the sess_ id from the same Network row as the cookie (tokens URL), or ensure __client matches that session; remove stale __cf_bm / re-login if needed."
-      : "";
-  return {
-    ok: false,
-    error: `${last?.error ?? "Clerk token failed"}${hint401}`,
-    status: last?.status,
-  };
+  return { ok: false, error: last?.error ?? "Clerk token failed", status: last?.status };
 }
 
 async function fetchClients(
@@ -241,13 +230,7 @@ async function fetchApplicantImages(
     });
     const text = await res.text();
     if (!res.ok) return { ok: false, status: res.status, body: text.slice(0, 500) };
-    let data: ApplicantImagesPayload;
-    try {
-      data = JSON.parse(text) as ApplicantImagesPayload;
-    } catch {
-      return { ok: false, status: res.status, body: text.slice(0, 500) };
-    }
-    return { ok: true, data };
+    return { ok: true, data: JSON.parse(text) as ApplicantImagesPayload };
   } catch (err) {
     return { ok: false, status: 0, body: fetchErrorMessage(err).slice(0, 500) };
   }
@@ -257,96 +240,48 @@ function isAuthFailure(status: number): boolean {
   return status === 401 || status === 403;
 }
 
-function str(v: unknown): string {
-  return typeof v === "string" ? v.trim() : "";
+export function buildDashboardFetchCtx(body: Record<string, unknown>): FetchCtx {
+  return {
+    clerkBase: str(body.clerkBase) || ENV_CLERK_BASE,
+    backendUrl: str(body.backendUrl) || ENV_BACKEND_URL,
+    appOrigin: str(body.appOrigin) || ENV_APP_ORIGIN,
+    sessionId: str(body.clerkSessionId) || ENV_SESSION_ID,
+    clerkCookie: stripCookieHeaderPrefix(str(body.clerkCookie) || ENV_CLERK_COOKIE),
+    organizationId: str(body.organizationId) || ENV_ORGANIZATION_ID,
+    clerkApiVersion: str(body.clerkApiVersion) || ENV_CLERK_API_VERSION,
+    clerkJsVersion: str(body.clerkJsVersion) || ENV_CLERK_JS_VERSION,
+  };
 }
 
-export async function POST(req: NextRequest) {
-  const cookieStore = await cookies();
-  if (cookieStore.get("admin_auth")?.value !== "true") {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
-  let body: {
-    passportNumbers?: unknown;
-    /** Clerk session JWT from email OTP verify (`client.sessions[0].last_active_token.jwt`) — skips tokens endpoint. */
-    bearerJwt?: unknown;
-    clerkSessionId?: unknown;
-    clerkCookie?: unknown;
-    organizationId?: unknown;
-    clerkBase?: unknown;
-    backendUrl?: unknown;
-    appOrigin?: unknown;
-    clerkApiVersion?: unknown;
-    clerkJsVersion?: unknown;
-  };
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
-  }
-
+export async function fetchDashboardMediaForPassports(params: {
+  body: Record<string, unknown>;
+  passportNumbers: string[];
+}): Promise<{
+  byPassport: Record<string, DashboardMediaResult>;
+  refreshedBearerJwt?: string;
+  error?: string;
+}> {
+  const { body, passportNumbers } = params;
+  const ctx = buildDashboardFetchCtx(body);
   const bearerJwtRaw = str(body.bearerJwt);
-  const sessionId = str(body.clerkSessionId) || ENV_SESSION_ID;
-  const clerkCookie = stripCookieHeaderPrefix(str(body.clerkCookie) || ENV_CLERK_COOKIE);
-  const organizationId = str(body.organizationId) || ENV_ORGANIZATION_ID;
-  const clerkBase = str(body.clerkBase) || ENV_CLERK_BASE;
-  const backendUrl = str(body.backendUrl) || ENV_BACKEND_URL;
-  const appOrigin = str(body.appOrigin) || ENV_APP_ORIGIN;
-  const clerkApiVersion = str(body.clerkApiVersion) || ENV_CLERK_API_VERSION;
-  const clerkJsVersion = str(body.clerkJsVersion) || ENV_CLERK_JS_VERSION;
-
   const hasBearer = Boolean(bearerJwtRaw && bearerJwtRaw.split(".").length >= 2);
-  if (!hasBearer && (!sessionId || !clerkCookie)) {
-    return NextResponse.json(
-      {
-        error:
-          "Use email OTP sign-in (stores JWT) or paste Clerk session id + cookie / env VISAFLOW_CLERK_*.",
-      },
-      { status: 400 },
-    );
-  }
-
-  const ctx: FetchCtx = {
-    clerkBase,
-    backendUrl,
-    appOrigin,
-    sessionId,
-    clerkCookie,
-    organizationId,
-    clerkApiVersion,
-    clerkJsVersion,
-  };
-
-  const rawList = body.passportNumbers;
-  if (!Array.isArray(rawList) || rawList.length === 0) {
-    return NextResponse.json({ error: "passportNumbers must be a non-empty array" }, { status: 400 });
-  }
-  const passportNumbers = [...new Set(rawList.map((x) => String(x ?? "").trim()).filter(Boolean))].slice(0, 80);
-
   const initialBearerJwt = hasBearer ? bearerJwtRaw : "";
+
   let jwt: string;
   if (hasBearer) {
     jwt = bearerJwtRaw;
   } else {
     const clerk1 = await fetchClerkJwt(ctx);
-    if (!clerk1.ok) {
-      return NextResponse.json(
-        { error: clerk1.error, byPassport: {} as Record<string, PerPassportResult> },
-        { status: clerk1.status && clerk1.status >= 400 ? clerk1.status : 502 },
-      );
-    }
+    if (!clerk1.ok) return { byPassport: {}, error: clerk1.error };
     jwt = clerk1.jwt;
   }
 
   let clientsRes = await fetchClients(jwt, ctx);
-  if (!clientsRes.ok && isAuthFailure(clientsRes.status)) {
-    if (ctx.sessionId && ctx.clerkCookie) {
-      const clerk2 = await fetchClerkJwt(ctx);
-      if (clerk2.ok) {
-        jwt = clerk2.jwt;
-        clientsRes = await fetchClients(jwt, ctx);
-      }
+  if (!clientsRes.ok && isAuthFailure(clientsRes.status) && ctx.sessionId && ctx.clerkCookie) {
+    const clerk2 = await fetchClerkJwt(ctx);
+    if (clerk2.ok) {
+      jwt = clerk2.jwt;
+      clientsRes = await fetchClients(jwt, ctx);
     }
   }
   if (!clientsRes.ok) {
@@ -354,64 +289,70 @@ export async function POST(req: NextRequest) {
       "error" in clientsRes && clientsRes.error
         ? clientsRes.error
         : `GET /clients failed (${clientsRes.status})`;
-    return NextResponse.json({
-      error: detail,
-      byPassport: {} as Record<string, PerPassportResult>,
-    });
+    return { byPassport: {}, error: detail };
   }
 
   const applicants = collectApplicantsFromPayload(clientsRes.json);
-  const byPassport: Record<string, PerPassportResult> = {};
+  const byPassport: Record<string, DashboardMediaResult> = {};
+  const seenApplicantIds = new Map<string, DashboardMediaResult>();
 
   for (const pn of passportNumbers) {
     const applicantId = findApplicantIdByPassport(applicants, pn);
     if (!applicantId) {
-      byPassport[pn] = {
+      const miss: DashboardMediaResult = {
         applicantId: null,
         passportImages: [],
         videos: [],
         gestureClips: [],
         error: "Applicant not found for passport",
       };
+      byPassport[pn] = miss;
+      const norm = normalizePassportKey(pn);
+      if (norm) byPassport[norm] = miss;
       continue;
     }
 
-    let img = await fetchApplicantImages(jwt, applicantId, ctx);
-    if (!img.ok && isAuthFailure(img.status) && ctx.sessionId && ctx.clerkCookie) {
-      const clerkR = await fetchClerkJwt(ctx);
-      if (clerkR.ok) {
-        jwt = clerkR.jwt;
-        img = await fetchApplicantImages(jwt, applicantId, ctx);
+    let cached = seenApplicantIds.get(applicantId);
+    if (!cached) {
+      let img = await fetchApplicantImages(jwt, applicantId, ctx);
+      if (!img.ok && isAuthFailure(img.status) && ctx.sessionId && ctx.clerkCookie) {
+        const clerkR = await fetchClerkJwt(ctx);
+        if (clerkR.ok) {
+          jwt = clerkR.jwt;
+          img = await fetchApplicantImages(jwt, applicantId, ctx);
+        }
       }
+      if (!img.ok) {
+        cached = {
+          applicantId,
+          passportImages: [],
+          videos: [],
+          gestureClips: [],
+          error:
+            img.status > 0
+              ? `GET /applicants/images failed (${img.status})`
+              : img.body || "GET /applicants/images failed",
+        };
+      } else {
+        const imgs = img.data.images?.passportImages ?? [];
+        cached = {
+          applicantId,
+          applicant: img.data.applicant,
+          passportImages: imgs.filter((p) => p && typeof p.url === "string" && p.url),
+          videos: parseVideosFromApplicantImages(img.data),
+          gestureClips: parseGestureClipsFromApplicantImages(img.data),
+        };
+      }
+      seenApplicantIds.set(applicantId, cached);
     }
-    if (!img.ok) {
-      byPassport[pn] = {
-        applicantId,
-        passportImages: [],
-        videos: [],
-        gestureClips: [],
-        error:
-          img.status > 0
-            ? `GET /applicants/images failed (${img.status})`
-            : img.body || "GET /applicants/images failed",
-      };
-      continue;
-    }
-    const imgs = img.data.images?.passportImages ?? [];
-    const entry: PerPassportResult = {
-      applicantId,
-      applicant: img.data.applicant,
-      passportImages: imgs.filter((p) => p && typeof p.url === "string" && p.url),
-      videos: parseVideosFromApplicantImages(img.data),
-      gestureClips: parseGestureClipsFromApplicantImages(img.data),
-    };
-    byPassport[pn] = entry;
+
+    byPassport[pn] = cached;
     const norm = normalizePassportKey(pn);
-    if (norm && norm !== pn) byPassport[norm] = entry;
+    if (norm) byPassport[norm] = cached;
   }
 
-  return NextResponse.json({
+  return {
     byPassport,
     ...(hasBearer && initialBearerJwt && jwt !== initialBearerJwt ? { refreshedBearerJwt: jwt } : {}),
-  });
+  };
 }

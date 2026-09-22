@@ -120,6 +120,20 @@ function parseJobReceivedLine(line: string): { sessionPrefix: string; passportNu
   };
 }
 
+export function episodeKey(jobId: string, clip: string, startedAt: string): string {
+  return `${jobId}|${clip}|${startedAt}`;
+}
+
+export function resolvePassportForJob(
+  jobId: string,
+  fromJobIdPassport: string | null,
+  byPrefix: Map<string, JobMeta>,
+): string | null {
+  if (fromJobIdPassport?.trim()) return fromJobIdPassport.trim();
+  const prefix = sessionPrefixFromJobId(jobId);
+  return byPrefix.get(prefix)?.passportNumber?.trim() ?? null;
+}
+
 export function buildJobMetaMap(enrichmentLogs: LogEntry[]): Map<string, JobMeta> {
   const byPrefix = new Map<string, JobMeta>();
 
