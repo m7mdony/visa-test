@@ -19,7 +19,13 @@ import {
 import { buildDeniedPassportRows, type DeniedPassportRow } from "@/lib/deniedPassports";
 import { computeDeniedRecoveryByEmail } from "@/lib/deniedRecovery";
 import { lookupPassportsByEmailBatch } from "@/lib/enrichPassportsByEmail";
-import { buildBotTimingReport, isAttemptPassedTimingLine, parseInHouseVerificationTotalMs } from "@/lib/botTimingStats";
+import {
+  buildBotTimingReport,
+  isAttemptPassedTimingLine,
+  isWasmPoolJobDoneLine,
+  parseInHouseVerificationTotalMs,
+} from "@/lib/botTimingStats";
+import { extractJobIdFromLine, extractPassportFromJobId } from "@/lib/stuckFeedback";
 import {
   buildEmailToPassportMap,
   extractEmailFromIdnfyOrVfsLine,
@@ -863,6 +869,35 @@ function entryMatchesSolveKind(
   return wins.some((w) => t >= w.startMs && t < w.endMsExclusive);
 }
 
+function wasmEntryMatchesSolveKind(entry: LogEntry, allowedSessionRefs: Set<string>): boolean {
+  const jobId = extractJobIdFromLine(entry.line);
+  if (!jobId) return false;
+  const prefix = taskIdToSessionPrefix(jobId.includes("|") ? jobId.slice(jobId.indexOf("|") + 1) : jobId);
+  if (!prefix) return false;
+  for (const ref of allowedSessionRefs) {
+    const refLower = ref.toLowerCase();
+    if (refLower.startsWith(prefix)) return true;
+    if (taskIdToSessionPrefix(refLower) === prefix) return true;
+  }
+  return false;
+}
+
+function filterWasmLogsBySolveKind(
+  logs: LogEntry[],
+  allowedSessionRefs: Set<string>
+): { matched: LogEntry[]; unmatched: number } {
+  const matched: LogEntry[] = [];
+  let unmatched = 0;
+  for (const entry of logs) {
+    if (wasmEntryMatchesSolveKind(entry, allowedSessionRefs)) {
+      matched.push(entry);
+    } else {
+      unmatched += 1;
+    }
+  }
+  return { matched, unmatched };
+}
+
 function filterLogsBySolveKind(
   logs: LogEntry[],
   allowedRefs: Set<string>,
@@ -1583,6 +1618,16 @@ export async function POST(req: NextRequest) {
         query: "Uploaded",
         requestId: "approved_azure_recording",
       }),
+    () =>
+      queryLogs({
+        base,
+        cookieHeader,
+        from,
+        to,
+        app: azureLivenessApp,
+        query: "[WASM] Pool job done",
+        requestId: "approved_azure_wasm_pool_done",
+      }),
   ];
 
   const [
@@ -1599,6 +1644,7 @@ export async function POST(req: NextRequest) {
     azurePayloadLogs,
     azureResultFailedLogs,
     azureRecordingLogs,
+    wasmPoolJobDoneLogsRaw,
   ] = await runInBatches(lokiQueryTasks, LOKI_QUERY_BATCH_SIZE);
 
   const idnfyStatusMergedRaw = dedupeLogEntries([
@@ -1799,6 +1845,11 @@ export async function POST(req: NextRequest) {
     urnToRef,
     windowsByEmail
   );
+
+  const wasmPoolJobDoneRaw = dedupeLogEntries(
+    wasmPoolJobDoneLogsRaw.filter((e) => isWasmPoolJobDoneLine(e.line))
+  );
+  const wasmPoolJobDoneKind = filterWasmLogsBySolveKind(wasmPoolJobDoneRaw, allowedSessionRefs);
 
   const timelinesBySessionRef = mergeSessionRefTimelines(urnToRef, [
     activationLogs,
@@ -2195,9 +2246,20 @@ export async function POST(req: NextRequest) {
       at: entry.time,
     };
   });
+  const wasmPoolJobDoneTimings = wasmPoolJobDoneKind.matched.map((entry) => {
+    const jobId = extractJobIdFromLine(entry.line);
+    const passportNumber = jobId ? extractPassportFromJobId(jobId) : null;
+    return {
+      email: "",
+      passportNumber,
+      line: entry.line,
+      at: entry.time,
+    };
+  });
   const botTimingReport = buildBotTimingReport(
     attemptPassedTimings.map((e) => e.line),
-    inHouseTimingLogs.map((e) => e.line)
+    inHouseTimingLogs.map((e) => e.line),
+    wasmPoolJobDoneTimings.map((e) => e.line)
   );
 
   const erroredAttempts: ErroredAttemptEvent[] = [];
@@ -2250,6 +2312,7 @@ export async function POST(req: NextRequest) {
       erroredAttempts,
       attemptPassedTimings,
       inHouseTimingLogs,
+      wasmPoolJobDoneTimings,
     },
     botTimingReport,
     totals: {
@@ -2290,6 +2353,8 @@ export async function POST(req: NextRequest) {
       solveKindUnmatchedDeniedApplicants: deniedApplicantKind.unmatched,
       solveKindUnmatchedErroredAttempts: erroredKind.unmatched,
       solveKindUnmatchedAttemptPassed: attemptPassedKind.unmatched,
+      wasmPoolJobDoneLogLines: wasmPoolJobDoneKind.matched.length,
+      solveKindUnmatchedWasmPoolJobDone: wasmPoolJobDoneKind.unmatched,
       azurePayloadLogLines: azurePayloadLogs.length,
       azureResultFailedLogLines: azureResultFailedLogs.length,
       taskPayloadRows: taskPayloadIatRows.length,

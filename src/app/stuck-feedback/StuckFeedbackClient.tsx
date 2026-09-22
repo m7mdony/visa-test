@@ -2,6 +2,11 @@
 
 import { useMemo, useState } from "react";
 import { episodeKey, type StuckFeedbackEpisode } from "@/lib/stuckFeedback";
+import {
+  buildStuckFeedbackExportPayload,
+  exportStuckFeedbackCsv,
+  exportStuckFeedbackJson,
+} from "@/lib/stuckFeedbackExport";
 import VisaflowDashboardLoginPanel from "@/components/VisaflowDashboardLoginPanel";
 import type { DashboardFetchDebug } from "@/lib/visaflowDashboardDebug";
 import {
@@ -241,6 +246,32 @@ export default function StuckFeedbackClient() {
 
   const dashLoaded = Object.keys(byEpisode).length > 0;
 
+  function buildExportPayload() {
+    if (!data) return null;
+    return buildStuckFeedbackExportPayload({
+      from: data.from,
+      to: data.to,
+      deploymentEnv: data.deploymentEnv,
+      solverApp: data.solverApp,
+      totals: data.totals,
+      clipCounts: data.clipCounts,
+      episodes: data.episodes,
+      byEpisode,
+    });
+  }
+
+  function handleExportCsv() {
+    const payload = buildExportPayload();
+    if (!payload) return;
+    exportStuckFeedbackCsv(payload);
+  }
+
+  function handleExportJson() {
+    const payload = buildExportPayload();
+    if (!payload) return;
+    exportStuckFeedbackJson(payload);
+  }
+
   return (
     <div className="space-y-6">
       <div>
@@ -382,6 +413,21 @@ export default function StuckFeedbackClient() {
               {!dashboardJwtSaved && (
                 <span className="text-xs text-zinc-500">Sign in above first.</span>
               )}
+              <span className="hidden sm:inline text-zinc-300">|</span>
+              <button
+                type="button"
+                onClick={handleExportCsv}
+                className="rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm font-medium text-zinc-800 hover:bg-zinc-100"
+              >
+                Export CSV
+              </button>
+              <button
+                type="button"
+                onClick={handleExportJson}
+                className="rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm font-medium text-zinc-800 hover:bg-zinc-100"
+              >
+                Export JSON
+              </button>
             </div>
           )}
         </>
