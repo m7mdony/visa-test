@@ -11,6 +11,7 @@ const KEYS = {
   bearerJwt: "ui-test-visaflow-dashboard-bearer-jwt",
   clerkSessionId: "ui-test-visaflow-clerk-refresh-session-id",
   clerkCookieJar: "ui-test-visaflow-clerk-cookie-jar",
+  organizationId: "ui-test-visaflow-organization-id",
   otpSia: "ui-test-clerk-sign-in-attempt-id",
 } as const;
 
@@ -134,6 +135,14 @@ export function getClerkCookieJar(): string {
   return readKey(KEYS.clerkCookieJar);
 }
 
+export function getOrganizationId(): string {
+  return readKey(KEYS.organizationId);
+}
+
+export function setOrganizationId(orgId: string): void {
+  writeKey(KEYS.organizationId, orgId.trim());
+}
+
 export function setClerkCookieJar(cookieJar: string): void {
   writeKey(KEYS.clerkCookieJar, cookieJar);
 }
@@ -192,16 +201,19 @@ export function buildDashboardAuthBody(): {
   bearerJwt: string;
   clerkSessionId?: string;
   clerkCookie?: string;
+  organizationId?: string;
 } {
   const bearerJwt = getBearerJwt();
   const sid = getClerkSessionId();
   const jar = getClerkCookieJar();
+  const orgId = getOrganizationId();
   const sidFromJar = jar ? extractSidFromCookieJar(jar) : null;
   const sessionId = sid.startsWith("sess_") ? sid : sidFromJar ?? "";
   return {
     bearerJwt,
     ...(sessionId.startsWith("sess_") ? { clerkSessionId: sessionId } : {}),
     ...(jar ? { clerkCookie: jar } : {}),
+    ...(orgId ? { organizationId: orgId } : {}),
   };
 }
 
@@ -213,14 +225,18 @@ export async function ensureFreshBearerJwt(): Promise<string | null> {
   if (isAccessJwtFresh()) return getBearerJwt();
   if (!hasClerkRefreshSession()) return null;
 
-  const { clerkSessionId, clerkCookie } = buildDashboardAuthBody();
+  const { clerkSessionId, clerkCookie, organizationId } = buildDashboardAuthBody();
   if (!clerkCookie || !clerkSessionId?.startsWith("sess_")) return null;
 
   try {
     const res = await fetch("/api/clerk-session-refresh", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ clerkSessionId, clerkCookie }),
+      body: JSON.stringify({
+        clerkSessionId,
+        clerkCookie,
+        ...(organizationId ? { organizationId } : {}),
+      }),
     });
     const json = (await res.json().catch(() => ({}))) as {
       jwt?: string;

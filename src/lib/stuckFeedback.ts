@@ -26,10 +26,12 @@ export function extractJobIdFromLine(line: string): string | null {
   return m?.[1]?.trim() ?? null;
 }
 
+/** JOB_ID tag is passport, or `passport|redis_message_id` (see solver `logger.py`). */
 export function extractPassportFromJobId(jobId: string): string | null {
-  const pipe = jobId.indexOf("|");
-  if (pipe <= 0) return null;
-  const passport = jobId.slice(0, pipe).trim();
+  const raw = jobId.trim();
+  if (!raw) return null;
+  const pipe = raw.indexOf("|");
+  const passport = (pipe > 0 ? raw.slice(0, pipe) : raw).trim();
   if (!passport || passport === "VERIFICATION") return null;
   if (/^[a-f0-9-]{8,}$/i.test(passport)) return null;
   return passport;
@@ -62,13 +64,27 @@ function parseStuckStopClip(line: string): string | null {
   return m?.[1]?.trim() ?? null;
 }
 
-type JobMeta = {
+export type JobMeta = {
   passportNumber: string | null;
   videoUrl: string | null;
+  /** Reserved — Redis `payload.id` is client correlation id, not dashboard applicant uuid. */
+  applicantId: string | null;
+  messageId: string | null;
+  sessionPrefix: string | null;
 };
 
-function parseRedisPayloadLine(line: string): { sessionPrefix: string; passportNumber: string | null; videoUrl: string | null } | null {
+/** `[JOB_ID:passport|redis_message_id]` — second part is Redis stream message id, not Azure sessionId. */
+export function extractMessageIdFromJobId(jobId: string): string | null {
+  const pipe = jobId.indexOf("|");
+  if (pipe <= 0) return null;
+  const messageId = jobId.slice(pipe + 1).trim();
+  return messageId || null;
+}
+
+function parseRedisPayloadLine(line: string): JobMeta | null {
   if (!line.includes("[REDIS][PAYLOAD]")) return null;
+  const messageIdM = line.match(/message_id=([^\s]+)/i);
+  const messageId = messageIdM?.[1]?.trim() ?? null;
   const payloadMatch = line.match(/payload=(\{.+\})\s*$/);
   if (!payloadMatch?.[1]) return null;
   let payload: Record<string, unknown>;
@@ -78,20 +94,20 @@ function parseRedisPayloadLine(line: string): { sessionPrefix: string; passportN
     return null;
   }
   const sessionId =
-    typeof payload.sessionId === "string" && payload.sessionId.trim()
-      ? payload.sessionId.trim()
-      : typeof payload.id === "string" && payload.id.trim()
-        ? payload.id.trim()
-        : "";
-  if (!sessionId) return null;
+    typeof payload.sessionId === "string" && payload.sessionId.trim() ? payload.sessionId.trim() : "";
+  // payload.id is Redis client correlation id (sessionId-suffix), NOT dashboard applicant uuid
+  const applicantId = null;
   const passportNumber =
     typeof payload.passportNumber === "string" && payload.passportNumber.trim()
       ? payload.passportNumber.trim()
       : null;
   const videoUrl =
     typeof payload.videoUrl === "string" && payload.videoUrl.trim() ? payload.videoUrl.trim() : null;
+  if (!messageId && !sessionId && !applicantId) return null;
   return {
-    sessionPrefix: sessionPrefixFromJobId(sessionId),
+    messageId,
+    sessionPrefix: sessionId ? sessionPrefixFromJobId(sessionId) : null,
+    applicantId,
     passportNumber,
     videoUrl,
   };
@@ -124,59 +140,114 @@ export function episodeKey(jobId: string, clip: string, startedAt: string): stri
   return `${jobId}|${clip}|${startedAt}`;
 }
 
+const EMPTY_META: JobMeta = {
+  passportNumber: null,
+  videoUrl: null,
+  applicantId: null,
+  messageId: null,
+  sessionPrefix: null,
+};
+
+function mergeMeta(prev: JobMeta, next: Partial<JobMeta>): JobMeta {
+  return {
+    passportNumber: next.passportNumber ?? prev.passportNumber,
+    videoUrl: next.videoUrl ?? prev.videoUrl,
+    applicantId: next.applicantId ?? prev.applicantId,
+    messageId: next.messageId ?? prev.messageId,
+    sessionPrefix: next.sessionPrefix ?? prev.sessionPrefix,
+  };
+}
+
 export function resolvePassportForJob(
   jobId: string,
   fromJobIdPassport: string | null,
-  byPrefix: Map<string, JobMeta>,
+  byMessageId: Map<string, JobMeta>,
+  bySessionPrefix: Map<string, JobMeta>,
 ): string | null {
-  if (fromJobIdPassport?.trim()) return fromJobIdPassport.trim();
-  const prefix = sessionPrefixFromJobId(jobId);
-  return byPrefix.get(prefix)?.passportNumber?.trim() ?? null;
+  const meta = resolveJobMetaForDashboard(jobId, fromJobIdPassport, byMessageId, bySessionPrefix);
+  return meta.passportNumber?.trim() ?? null;
 }
 
-export function buildJobMetaMap(enrichmentLogs: LogEntry[]): Map<string, JobMeta> {
-  const byPrefix = new Map<string, JobMeta>();
+/** Resolve dashboard applicant id + passport for a solver JOB_ID tag. */
+export function resolveJobMetaForDashboard(
+  jobId: string,
+  fromJobIdPassport: string | null,
+  byMessageId: Map<string, JobMeta>,
+  bySessionPrefix: Map<string, JobMeta>,
+): JobMeta {
+  const messageId = extractMessageIdFromJobId(jobId);
+  if (messageId && byMessageId.has(messageId)) {
+    return mergeMeta(EMPTY_META, byMessageId.get(messageId)!);
+  }
+  if (messageId) {
+    const msgPrefix = sessionPrefixFromJobId(messageId);
+    if (bySessionPrefix.has(msgPrefix)) {
+      return mergeMeta(EMPTY_META, bySessionPrefix.get(msgPrefix)!);
+    }
+  }
+  const azurePrefix = sessionPrefixFromJobId(jobId);
+  if (bySessionPrefix.has(azurePrefix)) {
+    return mergeMeta(EMPTY_META, bySessionPrefix.get(azurePrefix)!);
+  }
+  return mergeMeta(EMPTY_META, {
+    passportNumber: fromJobIdPassport?.trim() ?? extractPassportFromJobId(jobId),
+  });
+}
+
+export function buildJobMetaMaps(enrichmentLogs: LogEntry[]): {
+  byMessageId: Map<string, JobMeta>;
+  bySessionPrefix: Map<string, JobMeta>;
+} {
+  const byMessageId = new Map<string, JobMeta>();
+  const bySessionPrefix = new Map<string, JobMeta>();
 
   const sorted = [...enrichmentLogs].sort((a, b) => a.time.localeCompare(b.time));
   for (const entry of sorted) {
     const payload = parseRedisPayloadLine(entry.line);
     if (payload) {
-      const prev = byPrefix.get(payload.sessionPrefix) ?? { passportNumber: null, videoUrl: null };
-      byPrefix.set(payload.sessionPrefix, {
-        passportNumber: payload.passportNumber ?? prev.passportNumber,
-        videoUrl: payload.videoUrl ?? prev.videoUrl,
-      });
+      if (payload.messageId) {
+        byMessageId.set(
+          payload.messageId,
+          mergeMeta(byMessageId.get(payload.messageId) ?? EMPTY_META, payload),
+        );
+      }
+      if (payload.sessionPrefix) {
+        bySessionPrefix.set(
+          payload.sessionPrefix,
+          mergeMeta(bySessionPrefix.get(payload.sessionPrefix) ?? EMPTY_META, payload),
+        );
+      }
     }
     const solving = parseSolvingFaceLine(entry.line);
     if (solving) {
-      const prev = byPrefix.get(solving.sessionPrefix) ?? { passportNumber: null, videoUrl: null };
-      byPrefix.set(solving.sessionPrefix, {
-        passportNumber: solving.passportNumber ?? prev.passportNumber,
-        videoUrl: prev.videoUrl,
-      });
+      bySessionPrefix.set(
+        solving.sessionPrefix,
+        mergeMeta(bySessionPrefix.get(solving.sessionPrefix) ?? EMPTY_META, {
+          passportNumber: solving.passportNumber,
+          sessionPrefix: solving.sessionPrefix,
+        }),
+      );
     }
     const received = parseJobReceivedLine(entry.line);
     if (received) {
-      const prev = byPrefix.get(received.sessionPrefix) ?? { passportNumber: null, videoUrl: null };
-      byPrefix.set(received.sessionPrefix, {
-        passportNumber: received.passportNumber ?? prev.passportNumber,
-        videoUrl: prev.videoUrl,
-      });
+      bySessionPrefix.set(
+        received.sessionPrefix,
+        mergeMeta(bySessionPrefix.get(received.sessionPrefix) ?? EMPTY_META, {
+          passportNumber: received.passportNumber,
+          sessionPrefix: received.sessionPrefix,
+        }),
+      );
     }
   }
 
-  return byPrefix;
+  return { byMessageId, bySessionPrefix };
 }
 
-function resolveJobMeta(jobId: string, byPrefix: Map<string, JobMeta>): JobMeta {
-  const fromJobId = extractPassportFromJobId(jobId);
-  const prefix = sessionPrefixFromJobId(jobId);
-  const meta = byPrefix.get(prefix);
-  return {
-    passportNumber: fromJobId ?? meta?.passportNumber ?? null,
-    videoUrl: meta?.videoUrl ?? null,
-  };
+/** @deprecated use buildJobMetaMaps */
+export function buildJobMetaMap(enrichmentLogs: LogEntry[]): Map<string, JobMeta> {
+  return buildJobMetaMaps(enrichmentLogs).bySessionPrefix;
 }
+
 
 type OpenEpisode = {
   jobId: string;
@@ -192,7 +263,7 @@ export function buildStuckFeedbackReport(params: {
   enrichmentLogs: LogEntry[];
 }): StuckFeedbackBuildResult {
   const { stuckLogs, enrichmentLogs } = params;
-  const byPrefix = buildJobMetaMap(enrichmentLogs);
+  const { byMessageId, bySessionPrefix } = buildJobMetaMaps(enrichmentLogs);
   const sorted = [...stuckLogs]
     .filter((e) => STUCK_RE.test(e.line))
     .sort((a, b) => a.time.localeCompare(b.time));
@@ -209,7 +280,12 @@ export function buildStuckFeedbackReport(params: {
     const ep = open.get(key);
     if (!ep) return;
     open.delete(key);
-    const meta = resolveJobMeta(ep.jobId, byPrefix);
+    const meta = resolveJobMetaForDashboard(
+      ep.jobId,
+      extractPassportFromJobId(ep.jobId),
+      byMessageId,
+      bySessionPrefix,
+    );
     episodes.push({
       jobId: ep.jobId,
       sessionPrefix: sessionPrefixFromJobId(ep.jobId),
@@ -281,7 +357,12 @@ export function buildStuckFeedbackReport(params: {
   }
 
   for (const [key, ep] of open.entries()) {
-    const meta = resolveJobMeta(ep.jobId, byPrefix);
+    const meta = resolveJobMetaForDashboard(
+      ep.jobId,
+      extractPassportFromJobId(ep.jobId),
+      byMessageId,
+      bySessionPrefix,
+    );
     episodes.push({
       jobId: ep.jobId,
       sessionPrefix: sessionPrefixFromJobId(ep.jobId),

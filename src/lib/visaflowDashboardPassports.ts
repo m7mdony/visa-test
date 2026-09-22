@@ -8,8 +8,40 @@ export function normalizePassportKey(s: string): string {
 
 export type DashboardApplicantRef = { id: string; passportNumber: string };
 
-/** Deep-walk JSON (e.g. `GET /clients`) and collect `{ id, passportNumber }` from any `applicants` arrays. */
+function applicantPassportField(ap: Record<string, unknown>): string {
+  for (const k of ["passportNumber", "passport", "PassportNumber", "passportNo"]) {
+    const v = ap[k];
+    if (v != null && String(v).trim()) return String(v).trim();
+  }
+  return "";
+}
+
+/** Dashboard `GET /applicants/images/{id}` expects a single UUID — not Redis `payload.id` (client correlation id). */
+export function isDashboardApplicantId(id: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id.trim());
+}
+
+/** Parse `GET /clients` → `{ success, data: [{ applicants: [{ id, passportNumber }] }] }`. */
 export function collectApplicantsFromPayload(json: unknown): DashboardApplicantRef[] {
+  const root = json as Record<string, unknown>;
+  const data = root?.data;
+  if (Array.isArray(data)) {
+    const out: DashboardApplicantRef[] = [];
+    for (const item of data) {
+      if (!item || typeof item !== "object") continue;
+      const applicants = (item as Record<string, unknown>).applicants;
+      if (!Array.isArray(applicants)) continue;
+      for (const a of applicants) {
+        if (!a || typeof a !== "object") continue;
+        const ap = a as Record<string, unknown>;
+        const id = ap.id;
+        if (typeof id !== "string" || !id.trim()) continue;
+        out.push({ id: id.trim(), passportNumber: applicantPassportField(ap) });
+      }
+    }
+    if (out.length > 0) return out;
+  }
+
   const out: DashboardApplicantRef[] = [];
 
   const visit = (node: unknown): void => {
@@ -26,9 +58,8 @@ export function collectApplicantsFromPayload(json: unknown): DashboardApplicantR
         if (!a || typeof a !== "object") continue;
         const ap = a as Record<string, unknown>;
         const id = ap.id;
-        if (typeof id !== "string" || !id) continue;
-        const pn = ap.passportNumber;
-        out.push({ id, passportNumber: pn != null && pn !== "" ? String(pn) : "" });
+        if (typeof id !== "string" || !id.trim()) continue;
+        out.push({ id: id.trim(), passportNumber: applicantPassportField(ap) });
       }
     }
     for (const k of Object.keys(o)) {
@@ -54,10 +85,25 @@ export function findApplicantIdByPassport(
   if (!want) return null;
   for (const a of applicants) {
     const key = normalizePassportKey(a.passportNumber);
+    if (!key) continue;
     if (key === want) return a.id;
     if (wantLoose && loosePassportKey(a.passportNumber) === wantLoose) return a.id;
+    if (key.endsWith(want) || want.endsWith(key)) return a.id;
   }
   return null;
+}
+
+/** Normalized passport → applicant id from `GET /clients`. */
+export function indexApplicantIdsByPassport(
+  applicants: DashboardApplicantRef[],
+): Map<string, string> {
+  const m = new Map<string, string>();
+  for (const a of applicants) {
+    const key = normalizePassportKey(a.passportNumber);
+    if (!key || m.has(key)) continue;
+    m.set(key, a.id);
+  }
+  return m;
 }
 
 /** Store + lookup dashboard media by normalized passport key. */

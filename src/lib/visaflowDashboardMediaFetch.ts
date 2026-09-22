@@ -1,7 +1,19 @@
 import { stripCookieHeaderPrefix } from "@/lib/clerkVisaflowFapi";
 import {
+  collectPassportRoutesFromClientsPayload,
+  indexPassportRoutes,
+} from "@/lib/visaflowDashboardClients";
+import {
+  emptyDashboardFetchDebug,
+  summarizeClientsJson,
+  summarizeJwt,
+  type DashboardFetchDebug,
+} from "@/lib/visaflowDashboardDebug";
+import {
   collectApplicantsFromPayload,
   findApplicantIdByPassport,
+  indexApplicantIdsByPassport,
+  isDashboardApplicantId,
   normalizePassportKey,
   parseGestureClipsFromApplicantImages,
   parseVideosFromApplicantImages,
@@ -9,6 +21,8 @@ import {
   type GestureClipEntry,
   type PassportImageEntry,
 } from "@/lib/visaflowDashboardPassports";
+
+export type { DashboardFetchDebug };
 
 const ENV_CLERK_BASE = process.env.VISAFLOW_CLERK_BASE ?? "https://clerk.visaflow.devflexi.com";
 const ENV_BACKEND_URL = process.env.VISAFLOW_BACKEND_URL ?? "https://visaflow-backend.fastjourney.shop";
@@ -22,7 +36,9 @@ const ENV_CLERK_JS_VERSION = process.env.VISAFLOW_CLERK_JS_VERSION ?? "5.125.7";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
 
-const BACKEND_FETCH_TIMEOUT_MS = 25_000;
+const BACKEND_FETCH_TIMEOUT_MS = 45_000;
+const CLIENTS_FETCH_TIMEOUT_MS = 120_000;
+const APPLICANT_IMAGES_CONCURRENCY = 8;
 
 export type DashboardMediaResult = {
   applicantId: string | null;
@@ -44,8 +60,29 @@ type FetchCtx = {
   clerkJsVersion: string;
 };
 
-function backendFetchTimeoutSignal(): AbortSignal {
-  return AbortSignal.timeout(BACKEND_FETCH_TIMEOUT_MS);
+function backendFetchTimeoutSignal(ms = BACKEND_FETCH_TIMEOUT_MS): AbortSignal {
+  return AbortSignal.timeout(ms);
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const safeLimit = Math.max(1, Math.min(limit, items.length));
+  const out = new Array<R>(items.length);
+  let cursor = 0;
+  async function runOne() {
+    while (true) {
+      const idx = cursor;
+      cursor += 1;
+      if (idx >= items.length) return;
+      out[idx] = await worker(items[idx], idx);
+    }
+  }
+  await Promise.all(Array.from({ length: safeLimit }, () => runOne()));
+  return out;
 }
 
 function fetchErrorMessage(err: unknown): string {
@@ -188,7 +225,10 @@ async function fetchClerkJwt(
 async function fetchClients(
   jwt: string,
   ctx: FetchCtx,
-): Promise<{ ok: true; json: unknown } | { ok: false; status: number; error?: string }> {
+): Promise<
+  | { ok: true; json: unknown; status: number; rawText: string; parseError: string | null }
+  | { ok: false; status: number; error?: string; json?: unknown; rawText?: string; parseError?: string | null }
+> {
   try {
     const res = await fetch(`${ctx.backendUrl.replace(/\/$/, "")}/clients`, {
       method: "GET",
@@ -200,14 +240,50 @@ async function fetchClients(
         referer: `${ctx.appOrigin}/`,
         "user-agent": UA,
       },
-      signal: backendFetchTimeoutSignal(),
+      signal: backendFetchTimeoutSignal(CLIENTS_FETCH_TIMEOUT_MS),
     });
-    const json = (await res.json().catch(() => ({}))) as unknown;
-    if (!res.ok) return { ok: false, status: res.status };
-    return { ok: true, json };
+    const rawText = await res.text();
+    let json: unknown = null;
+    let parseError: string | null = null;
+    if (!rawText.trim()) {
+      parseError = "empty response body";
+      json = {};
+    } else {
+      try {
+        json = JSON.parse(rawText) as unknown;
+      } catch (e) {
+        parseError = e instanceof Error ? e.message : "JSON parse failed";
+        json = {};
+      }
+    }
+    if (!res.ok) {
+      const root = json as Record<string, unknown>;
+      const msg =
+        typeof root?.error === "string"
+          ? root.error
+          : typeof root?.message === "string"
+            ? root.message
+            : parseError ?? undefined;
+      return { ok: false, status: res.status, error: msg, json, rawText, parseError };
+    }
+    return { ok: true, json, status: res.status, rawText, parseError };
   } catch (err) {
     return { ok: false, status: 0, error: fetchErrorMessage(err) };
   }
+}
+
+function clientsResponseEmpty(summary: ReturnType<typeof summarizeClientsJson>): boolean {
+  if (summary.parseError === "empty response body") return true;
+  if (summary.rawTextLength === 0) return true;
+  if (summary.clientsCount === 0 && summary.topKeys.length === 0) return true;
+  if (summary.success === true && summary.clientsCount === 0 && !summary.dataIsArray) return true;
+  return false;
+}
+
+function summarizeClientsRes(
+  res: { ok: true; json: unknown; status: number; rawText: string; parseError: string | null },
+): ReturnType<typeof summarizeClientsJson> {
+  return summarizeClientsJson(res.json, res.status, res.rawText.length, res.parseError);
 }
 
 async function fetchApplicantImages(
@@ -258,10 +334,263 @@ export async function fetchDashboardMediaForPassports(params: {
   passportNumbers: string[];
 }): Promise<{
   byPassport: Record<string, DashboardMediaResult>;
+  clientsApplicantsScanned?: number;
+  clientsCount?: number;
+  refreshedBearerJwt?: string;
+  error?: string;
+  debug?: DashboardFetchDebug;
+}> {
+  const { body, passportNumbers } = params;
+  const ctx = buildDashboardFetchCtx(body);
+  const debug = emptyDashboardFetchDebug();
+  debug.auth.backendUrl = ctx.backendUrl;
+  debug.auth.hasBearerFromRequest = Boolean(str(body.bearerJwt));
+  debug.auth.bearerSegmentCount = str(body.bearerJwt).split(".").length;
+  debug.auth.hasClerkSession = Boolean(ctx.sessionId?.startsWith("sess_"));
+  debug.auth.hasClerkCookie = Boolean(ctx.clerkCookie);
+  debug.auth.organizationIdSet = Boolean(ctx.organizationId);
+
+  const bearerJwtRaw = str(body.bearerJwt);
+  const hasBearer = Boolean(bearerJwtRaw && bearerJwtRaw.split(".").length >= 2);
+  const initialBearerJwt = hasBearer ? bearerJwtRaw : "";
+
+  let jwt = "";
+  let jwtSource: DashboardFetchDebug["auth"]["jwtSource"] = "none";
+  let clerkMintJwt = "";
+
+  const bearerSummary = hasBearer ? summarizeJwt(bearerJwtRaw) : null;
+
+  // OTP verify JWT works with GET /clients; Clerk /tokens mint without org often returns empty {}.
+  if (hasBearer && bearerSummary && !bearerSummary.expired) {
+    debug.steps.push("bearer-otp-first");
+    jwt = bearerJwtRaw;
+    jwtSource = "bearer-otp";
+  } else if (ctx.sessionId && ctx.clerkCookie) {
+    debug.steps.push("clerk-mint-no-fresh-bearer");
+    const clerk1 = await fetchClerkJwt(ctx);
+    if (clerk1.ok) {
+      clerkMintJwt = clerk1.jwt;
+      jwt = clerk1.jwt;
+      jwtSource = "clerk-mint";
+      debug.auth.jwtAfterRefresh = summarizeJwt(jwt);
+    } else {
+      debug.clerkMintError = clerk1.error;
+      debug.steps.push(`clerk-mint-failed:${clerk1.error.slice(0, 80)}`);
+    }
+  }
+
+  if (!jwt && hasBearer) {
+    debug.steps.push("fallback-bearer-cache");
+    jwt = bearerJwtRaw;
+    jwtSource = "bearer-cache";
+  }
+
+  if (!jwt) {
+    debug.auth.jwtSource = "none";
+    return {
+      byPassport: {},
+      error: debug.clerkMintError ?? "No JWT — sign in with Visaflow dashboard OTP",
+      debug,
+    };
+  }
+
+  debug.auth.jwtSource = jwtSource;
+  debug.auth.jwtBeforeClients = summarizeJwt(jwt);
+
+  let clientsRes = await fetchClients(jwt, ctx);
+
+  async function tryClerkMint(): Promise<boolean> {
+    if (!ctx.sessionId || !ctx.clerkCookie) return false;
+    const clerk = await fetchClerkJwt(ctx);
+    if (!clerk.ok) {
+      debug.clerkRetryError = clerk.error;
+      return false;
+    }
+    clerkMintJwt = clerk.jwt;
+    jwt = clerk.jwt;
+    jwtSource = "clerk-retry-after-empty";
+    debug.auth.jwtSource = jwtSource;
+    debug.auth.jwtAfterRefresh = summarizeJwt(jwt);
+    clientsRes = await fetchClients(jwt, ctx);
+    return clientsRes.ok;
+  }
+
+  if (!clientsRes.ok && isAuthFailure(clientsRes.status)) {
+    debug.steps.push(`clients-auth-fail-${clientsRes.status}`);
+    if (jwtSource === "bearer-otp" || jwtSource === "bearer-cache") {
+      debug.steps.push("retry-clerk-after-auth-fail");
+      await tryClerkMint();
+    } else if (hasBearer) {
+      debug.steps.push("retry-bearer-after-auth-fail");
+      jwt = bearerJwtRaw;
+      jwtSource = "bearer-retry-after-empty";
+      debug.auth.jwtSource = jwtSource;
+      clientsRes = await fetchClients(jwt, ctx);
+    }
+  }
+
+  if (!clientsRes.ok) {
+    const detail =
+      "error" in clientsRes && clientsRes.error
+        ? clientsRes.error
+        : `GET /clients failed (${clientsRes.status})`;
+    const failRaw = "rawText" in clientsRes ? clientsRes.rawText ?? "" : "";
+    debug.clients = {
+      httpStatus: clientsRes.status,
+      ...summarizeClientsJson(
+        "json" in clientsRes ? clientsRes.json : {},
+        clientsRes.status,
+        failRaw.length,
+        "parseError" in clientsRes ? (clientsRes.parseError ?? null) : null,
+      ),
+    };
+    debug.steps.push(`clients-http-${clientsRes.status}`);
+    console.log("[dashboard-fetch] clients failed", JSON.stringify(debug));
+    return { byPassport: {}, error: detail, debug };
+  }
+
+  let clientsSummary = summarizeClientsRes(clientsRes);
+  debug.clients = { httpStatus: clientsRes.status, ...clientsSummary };
+  debug.steps.push(`clients-ok:${clientsSummary.clientsCount}c/${clientsSummary.applicantsCount}a`);
+
+  if (clientsResponseEmpty(clientsSummary)) {
+    if (jwtSource === "clerk-mint" && hasBearer) {
+      debug.steps.push("clients-empty-retry-bearer-otp");
+      jwt = bearerJwtRaw;
+      jwtSource = "bearer-retry-after-empty";
+      debug.auth.jwtSource = jwtSource;
+      debug.auth.jwtBeforeClients = summarizeJwt(jwt);
+      clientsRes = await fetchClients(jwt, ctx);
+      if (clientsRes.ok) {
+        clientsSummary = summarizeClientsRes(clientsRes);
+        debug.clients = { httpStatus: clientsRes.status, ...clientsSummary };
+        debug.steps.push(`bearer-retry-ok:${clientsSummary.clientsCount}c/${clientsSummary.applicantsCount}a`);
+      }
+    } else if (
+      (jwtSource === "bearer-otp" || jwtSource === "bearer-cache") &&
+      ctx.sessionId &&
+      ctx.clerkCookie &&
+      !clerkMintJwt
+    ) {
+      debug.steps.push("clients-empty-retry-clerk");
+      if (await tryClerkMint()) {
+        clientsSummary = summarizeClientsRes(clientsRes);
+        debug.clients = { httpStatus: clientsRes.status, ...clientsSummary };
+        debug.steps.push(`clerk-retry-ok:${clientsSummary.clientsCount}c/${clientsSummary.applicantsCount}a`);
+      }
+    }
+  }
+
+  const clientsCount = clientsSummary.clientsCount;
+  const applicants = collectApplicantsFromPayload(clientsRes.json);
+  const routesByPassport = indexPassportRoutes(collectPassportRoutesFromClientsPayload(clientsRes.json));
+  const applicantsByPassport = indexApplicantIdsByPassport(applicants);
+  const byPassport: Record<string, DashboardMediaResult> = {};
+  const lookupHint =
+    applicants.length === 0
+      ? `GET /clients returned 0 applicants (${clientsCount} clients) — re-sign in to dashboard`
+      : `scanned ${applicants.length} applicants in ${clientsCount} clients`;
+
+  const passportToApplicantId = new Map<string, string>();
+  for (const pn of passportNumbers) {
+    const norm = normalizePassportKey(pn);
+    const routeHit = norm ? routesByPassport.get(norm) : undefined;
+    const applicantId =
+      routeHit?.applicantId ??
+      (norm ? applicantsByPassport.get(norm) : undefined) ??
+      findApplicantIdByPassport(applicants, pn);
+    if (applicantId && isDashboardApplicantId(applicantId)) {
+      passportToApplicantId.set(pn, applicantId);
+    } else {
+      const miss: DashboardMediaResult = {
+        applicantId: null,
+        passportImages: [],
+        videos: [],
+        gestureClips: [],
+        error: `Applicant not found for passport ${pn.trim()} (${lookupHint})`,
+      };
+      byPassport[pn] = miss;
+      if (norm) byPassport[norm] = miss;
+    }
+  }
+
+  const uniqueApplicantIds = [...new Set(passportToApplicantId.values())];
+  debug.steps.push(`fetch-images:${uniqueApplicantIds.length}ids`);
+
+  async function loadApplicantImages(applicantId: string): Promise<DashboardMediaResult> {
+    let img = await fetchApplicantImages(jwt, applicantId, ctx);
+    if (!img.ok && isAuthFailure(img.status) && ctx.sessionId && ctx.clerkCookie) {
+      const clerkR = await fetchClerkJwt(ctx);
+      if (clerkR.ok) {
+        jwt = clerkR.jwt;
+        img = await fetchApplicantImages(jwt, applicantId, ctx);
+      }
+    }
+    if (!img.ok) {
+      const detail =
+        img.status > 0
+          ? `GET /applicants/images failed (${img.status})${img.body ? `: ${img.body.slice(0, 120)}` : ""}`
+          : img.body || "GET /applicants/images failed";
+      return {
+        applicantId,
+        passportImages: [],
+        videos: [],
+        gestureClips: [],
+        error: detail,
+      };
+    }
+    const imgs = img.data.images?.passportImages ?? [];
+    return {
+      applicantId,
+      applicant: img.data.applicant,
+      passportImages: imgs.filter((p) => p && typeof p.url === "string" && p.url),
+      videos: parseVideosFromApplicantImages(img.data),
+      gestureClips: parseGestureClipsFromApplicantImages(img.data),
+    };
+  }
+
+  const imageResults = await mapWithConcurrency(
+    uniqueApplicantIds,
+    APPLICANT_IMAGES_CONCURRENCY,
+    (applicantId) => loadApplicantImages(applicantId),
+  );
+  const imageByApplicantId = new Map<string, DashboardMediaResult>();
+  for (let i = 0; i < uniqueApplicantIds.length; i++) {
+    imageByApplicantId.set(uniqueApplicantIds[i], imageResults[i]);
+  }
+
+  for (const pn of passportNumbers) {
+    const applicantId = passportToApplicantId.get(pn);
+    if (!applicantId) continue;
+    const cached = imageByApplicantId.get(applicantId);
+    if (!cached) continue;
+    byPassport[pn] = cached;
+    const norm = normalizePassportKey(pn);
+    if (norm) byPassport[norm] = cached;
+  }
+
+  if (clientsCount === 0 || applicants.length === 0) {
+    console.log("[dashboard-fetch] empty clients/applicants", JSON.stringify(debug));
+  }
+
+  return {
+    byPassport,
+    clientsApplicantsScanned: applicants.length,
+    clientsCount,
+    debug,
+    ...(jwt && jwt !== initialBearerJwt ? { refreshedBearerJwt: jwt } : {}),
+  };
+}
+
+export async function fetchDashboardMediaForApplicantIds(params: {
+  body: Record<string, unknown>;
+  applicantIds: string[];
+}): Promise<{
+  byApplicantId: Record<string, DashboardMediaResult>;
   refreshedBearerJwt?: string;
   error?: string;
 }> {
-  const { body, passportNumbers } = params;
+  const { body, applicantIds } = params;
   const ctx = buildDashboardFetchCtx(body);
   const bearerJwtRaw = str(body.bearerJwt);
   const hasBearer = Boolean(bearerJwtRaw && bearerJwtRaw.split(".").length >= 2);
@@ -272,87 +601,58 @@ export async function fetchDashboardMediaForPassports(params: {
     jwt = bearerJwtRaw;
   } else {
     const clerk1 = await fetchClerkJwt(ctx);
-    if (!clerk1.ok) return { byPassport: {}, error: clerk1.error };
+    if (!clerk1.ok) return { byApplicantId: {}, error: clerk1.error };
     jwt = clerk1.jwt;
   }
 
-  let clientsRes = await fetchClients(jwt, ctx);
-  if (!clientsRes.ok && isAuthFailure(clientsRes.status) && ctx.sessionId && ctx.clerkCookie) {
-    const clerk2 = await fetchClerkJwt(ctx);
-    if (clerk2.ok) {
-      jwt = clerk2.jwt;
-      clientsRes = await fetchClients(jwt, ctx);
-    }
-  }
-  if (!clientsRes.ok) {
-    const detail =
-      "error" in clientsRes && clientsRes.error
-        ? clientsRes.error
-        : `GET /clients failed (${clientsRes.status})`;
-    return { byPassport: {}, error: detail };
-  }
+  const uniqueIds = [...new Set(applicantIds.map((id) => id.trim()).filter(Boolean))];
+  const byApplicantId: Record<string, DashboardMediaResult> = {};
 
-  const applicants = collectApplicantsFromPayload(clientsRes.json);
-  const byPassport: Record<string, DashboardMediaResult> = {};
-  const seenApplicantIds = new Map<string, DashboardMediaResult>();
-
-  for (const pn of passportNumbers) {
-    const applicantId = findApplicantIdByPassport(applicants, pn);
-    if (!applicantId) {
-      const miss: DashboardMediaResult = {
-        applicantId: null,
+  for (const applicantId of uniqueIds) {
+    if (!isDashboardApplicantId(applicantId)) {
+      byApplicantId[applicantId] = {
+        applicantId,
         passportImages: [],
         videos: [],
         gestureClips: [],
-        error: "Applicant not found for passport",
+        error: "Invalid applicant id (Redis clientId, not dashboard UUID)",
       };
-      byPassport[pn] = miss;
-      const norm = normalizePassportKey(pn);
-      if (norm) byPassport[norm] = miss;
       continue;
     }
-
-    let cached = seenApplicantIds.get(applicantId);
-    if (!cached) {
-      let img = await fetchApplicantImages(jwt, applicantId, ctx);
-      if (!img.ok && isAuthFailure(img.status) && ctx.sessionId && ctx.clerkCookie) {
-        const clerkR = await fetchClerkJwt(ctx);
-        if (clerkR.ok) {
-          jwt = clerkR.jwt;
-          img = await fetchApplicantImages(jwt, applicantId, ctx);
-        }
+    let img = await fetchApplicantImages(jwt, applicantId, ctx);
+    if (!img.ok && isAuthFailure(img.status) && ctx.sessionId && ctx.clerkCookie) {
+      const clerkR = await fetchClerkJwt(ctx);
+      if (clerkR.ok) {
+        jwt = clerkR.jwt;
+        img = await fetchApplicantImages(jwt, applicantId, ctx);
       }
-      if (!img.ok) {
-        cached = {
-          applicantId,
-          passportImages: [],
-          videos: [],
-          gestureClips: [],
-          error:
-            img.status > 0
-              ? `GET /applicants/images failed (${img.status})`
-              : img.body || "GET /applicants/images failed",
-        };
-      } else {
-        const imgs = img.data.images?.passportImages ?? [];
-        cached = {
-          applicantId,
-          applicant: img.data.applicant,
-          passportImages: imgs.filter((p) => p && typeof p.url === "string" && p.url),
-          videos: parseVideosFromApplicantImages(img.data),
-          gestureClips: parseGestureClipsFromApplicantImages(img.data),
-        };
-      }
-      seenApplicantIds.set(applicantId, cached);
     }
-
-    byPassport[pn] = cached;
-    const norm = normalizePassportKey(pn);
-    if (norm) byPassport[norm] = cached;
+    if (!img.ok) {
+      const detail =
+        img.status > 0
+          ? `GET /applicants/images failed (${img.status})${img.body ? `: ${img.body.slice(0, 120)}` : ""}`
+          : img.body || "GET /applicants/images failed";
+      byApplicantId[applicantId] = {
+        applicantId,
+        passportImages: [],
+        videos: [],
+        gestureClips: [],
+        error: detail,
+      };
+      continue;
+    }
+    const imgs = img.data.images?.passportImages ?? [];
+    byApplicantId[applicantId] = {
+      applicantId,
+      applicant: img.data.applicant,
+      passportImages: imgs.filter((p) => p && typeof p.url === "string" && p.url),
+      videos: parseVideosFromApplicantImages(img.data),
+      gestureClips: parseGestureClipsFromApplicantImages(img.data),
+    };
   }
 
   return {
-    byPassport,
+    byApplicantId,
     ...(hasBearer && initialBearerJwt && jwt !== initialBearerJwt ? { refreshedBearerJwt: jwt } : {}),
   };
 }
