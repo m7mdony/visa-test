@@ -3,8 +3,10 @@ import { cookies } from "next/headers";
 import {
   collectApplicantsFromPayload,
   findApplicantIdByPassport,
+  parseGestureClipsFromApplicantImages,
   parseVideosFromApplicantImages,
   type ApplicantImagesPayload,
+  type GestureClipEntry,
   type PassportImageEntry,
 } from "@/lib/visaflowDashboardPassports";
 import { stripCookieHeaderPrefix } from "@/lib/clerkVisaflowFapi";
@@ -20,6 +22,17 @@ const ENV_CLERK_JS_VERSION = process.env.VISAFLOW_CLERK_JS_VERSION ?? "5.125.7";
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+
+const BACKEND_FETCH_TIMEOUT_MS = 25_000;
+
+function backendFetchTimeoutSignal(): AbortSignal {
+  return AbortSignal.timeout(BACKEND_FETCH_TIMEOUT_MS);
+}
+
+function fetchErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
 
 type FetchCtx = {
   clerkBase: string;
@@ -37,6 +50,7 @@ type PerPassportResult = {
   applicant?: ApplicantImagesPayload["applicant"];
   passportImages: PassportImageEntry[];
   videos: string[];
+  gestureClips: GestureClipEntry[];
   error?: string;
 };
 
@@ -184,21 +198,26 @@ async function fetchClerkJwt(
 async function fetchClients(
   jwt: string,
   ctx: FetchCtx,
-): Promise<{ ok: true; json: unknown } | { ok: false; status: number }> {
-  const res = await fetch(`${ctx.backendUrl.replace(/\/$/, "")}/clients`, {
-    method: "GET",
-    headers: {
-      accept: "*/*",
-      authorization: `Bearer ${jwt}`,
-      "content-type": "application/json",
-      origin: ctx.appOrigin,
-      referer: `${ctx.appOrigin}/`,
-      "user-agent": UA,
-    },
-  });
-  const json = (await res.json().catch(() => ({}))) as unknown;
-  if (!res.ok) return { ok: false, status: res.status };
-  return { ok: true, json };
+): Promise<{ ok: true; json: unknown } | { ok: false; status: number; error?: string }> {
+  try {
+    const res = await fetch(`${ctx.backendUrl.replace(/\/$/, "")}/clients`, {
+      method: "GET",
+      headers: {
+        accept: "*/*",
+        authorization: `Bearer ${jwt}`,
+        "content-type": "application/json",
+        origin: ctx.appOrigin,
+        referer: `${ctx.appOrigin}/`,
+        "user-agent": UA,
+      },
+      signal: backendFetchTimeoutSignal(),
+    });
+    const json = (await res.json().catch(() => ({}))) as unknown;
+    if (!res.ok) return { ok: false, status: res.status };
+    return { ok: true, json };
+  } catch (err) {
+    return { ok: false, status: 0, error: fetchErrorMessage(err) };
+  }
 }
 
 async function fetchApplicantImages(
@@ -206,26 +225,31 @@ async function fetchApplicantImages(
   applicantId: string,
   ctx: FetchCtx,
 ): Promise<{ ok: true; data: ApplicantImagesPayload } | { ok: false; status: number; body: string }> {
-  const res = await fetch(`${ctx.backendUrl.replace(/\/$/, "")}/applicants/images/${applicantId}`, {
-    method: "GET",
-    headers: {
-      accept: "*/*",
-      authorization: `Bearer ${jwt}`,
-      "content-type": "application/json",
-      origin: ctx.appOrigin,
-      referer: `${ctx.appOrigin}/`,
-      "user-agent": UA,
-    },
-  });
-  const text = await res.text();
-  if (!res.ok) return { ok: false, status: res.status, body: text.slice(0, 500) };
-  let data: ApplicantImagesPayload;
   try {
-    data = JSON.parse(text) as ApplicantImagesPayload;
-  } catch {
-    return { ok: false, status: res.status, body: text.slice(0, 500) };
+    const res = await fetch(`${ctx.backendUrl.replace(/\/$/, "")}/applicants/images/${applicantId}`, {
+      method: "GET",
+      headers: {
+        accept: "*/*",
+        authorization: `Bearer ${jwt}`,
+        "content-type": "application/json",
+        origin: ctx.appOrigin,
+        referer: `${ctx.appOrigin}/`,
+        "user-agent": UA,
+      },
+      signal: backendFetchTimeoutSignal(),
+    });
+    const text = await res.text();
+    if (!res.ok) return { ok: false, status: res.status, body: text.slice(0, 500) };
+    let data: ApplicantImagesPayload;
+    try {
+      data = JSON.parse(text) as ApplicantImagesPayload;
+    } catch {
+      return { ok: false, status: res.status, body: text.slice(0, 500) };
+    }
+    return { ok: true, data };
+  } catch (err) {
+    return { ok: false, status: 0, body: fetchErrorMessage(err).slice(0, 500) };
   }
-  return { ok: true, data };
 }
 
 function isAuthFailure(status: number): boolean {
@@ -325,13 +349,14 @@ export async function POST(req: NextRequest) {
     }
   }
   if (!clientsRes.ok) {
-    return NextResponse.json(
-      {
-        error: `GET /clients failed (${clientsRes.status})`,
-        byPassport: {} as Record<string, PerPassportResult>,
-      },
-      { status: 502 },
-    );
+    const detail =
+      "error" in clientsRes && clientsRes.error
+        ? clientsRes.error
+        : `GET /clients failed (${clientsRes.status})`;
+    return NextResponse.json({
+      error: detail,
+      byPassport: {} as Record<string, PerPassportResult>,
+    });
   }
 
   const applicants = collectApplicantsFromPayload(clientsRes.json);
@@ -344,6 +369,7 @@ export async function POST(req: NextRequest) {
         applicantId: null,
         passportImages: [],
         videos: [],
+        gestureClips: [],
         error: "Applicant not found for passport",
       };
       continue;
@@ -362,7 +388,11 @@ export async function POST(req: NextRequest) {
         applicantId,
         passportImages: [],
         videos: [],
-        error: `GET /applicants/images failed (${img.status})`,
+        gestureClips: [],
+        error:
+          img.status > 0
+            ? `GET /applicants/images failed (${img.status})`
+            : img.body || "GET /applicants/images failed",
       };
       continue;
     }
@@ -372,6 +402,7 @@ export async function POST(req: NextRequest) {
       applicant: img.data.applicant,
       passportImages: imgs.filter((p) => p && typeof p.url === "string" && p.url),
       videos: parseVideosFromApplicantImages(img.data),
+      gestureClips: parseGestureClipsFromApplicantImages(img.data),
     };
   }
 

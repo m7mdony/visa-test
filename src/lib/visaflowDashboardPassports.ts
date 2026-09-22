@@ -55,13 +55,17 @@ export function findApplicantIdByPassport(
 
 export type PassportImageEntry = { id: string; url: string };
 
+export type GestureClipEntry = { gesture: string; clipUrl: string };
+
 export type ApplicantImagesPayload = {
   success?: boolean;
   applicant?: { firstName?: string; lastName?: string; status?: string };
   images?: {
     passportImages?: PassportImageEntry[];
     videos?: string[];
+    gestureClips?: Array<{ gesture?: string; clipUrl?: string }>;
   };
+  gestureClips?: Array<{ gesture?: string; clipUrl?: string }>;
   hasImages?: boolean;
   error?: string;
 };
@@ -72,4 +76,30 @@ export function parseVideosFromApplicantImages(data: ApplicantImagesPayload): st
   return raw
     .filter((v): v is string => typeof v === "string" && v.trim().length > 0)
     .map((v) => v.trim());
+}
+
+export function parseGestureClipsFromApplicantImages(data: ApplicantImagesPayload): GestureClipEntry[] {
+  const raw = data.images?.gestureClips ?? data.gestureClips;
+  if (!Array.isArray(raw)) return [];
+  const out: GestureClipEntry[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const gesture = typeof item.gesture === "string" ? item.gesture.trim() : "";
+    const clipUrl = typeof item.clipUrl === "string" ? item.clipUrl.trim() : "";
+    if (!gesture || !clipUrl) continue;
+    out.push({ gesture, clipUrl });
+  }
+  return out;
+}
+
+export function findGestureClipUrl(
+  clips: GestureClipEntry[] | undefined,
+  gesture: string,
+): string | null {
+  if (!clips?.length || !gesture.trim()) return null;
+  const want = gesture.trim();
+  const exact = clips.find((c) => c.gesture === want);
+  if (exact?.clipUrl) return exact.clipUrl;
+  const ci = clips.find((c) => c.gesture.toLowerCase() === want.toLowerCase());
+  return ci?.clipUrl ?? null;
 }

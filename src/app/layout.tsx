@@ -94,6 +94,12 @@ export default function RootLayout({
                 >
                   We couldn&apos;t
                 </Link>
+                <Link
+                  href="/stuck-feedback"
+                  className="hover:text-zinc-950 transition-colors"
+                >
+                  Stuck
+                </Link>
               </nav>
             </div>
           </header>
