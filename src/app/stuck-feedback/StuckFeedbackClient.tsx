@@ -7,6 +7,7 @@ import {
   exportStuckFeedbackCsv,
   exportStuckFeedbackJson,
 } from "@/lib/stuckFeedbackExport";
+import { formatSolverGestureLabel } from "@/lib/solverGestureClips";
 import VisaflowDashboardLoginPanel from "@/components/VisaflowDashboardLoginPanel";
 import type { DashboardFetchDebug } from "@/lib/visaflowDashboardDebug";
 import {
@@ -49,6 +50,9 @@ type EpisodeDashboardRow = {
   applicantId: string | null;
   passportImageUrl: string | null;
   gestureClipUrl: string | null;
+  gestureSourceClip?: string | null;
+  gestureTiltDeg?: number | null;
+  gestureSynthesized?: boolean;
   error?: string;
 };
 
@@ -504,6 +508,15 @@ function EpisodeRow({
   const passport = dash?.passportNumber ?? ep.passportNumber?.trim() ?? "";
   const passportImg = dash?.passportImageUrl ?? null;
   const gestureClipUrl = dash?.gestureClipUrl ?? null;
+  const solverGestureLabel =
+    dash?.gestureSourceClip != null
+      ? formatSolverGestureLabel({
+          feedbackClip: ep.clip,
+          sourceClip: dash.gestureSourceClip,
+          rotateDeg: dash.gestureTiltDeg ?? 0,
+          synthesized: Boolean(dash.gestureSynthesized),
+        })
+      : null;
   const jobShort = ep.jobId.includes("|") ? ep.jobId.split("|")[0] : ep.sessionPrefix;
 
   return (
@@ -542,6 +555,9 @@ function EpisodeRow({
         )}
       </td>
       <td className="px-3 py-2">
+        {solverGestureLabel && dash?.gestureSynthesized && (
+          <div className="mb-1 font-mono text-[10px] text-zinc-500">{solverGestureLabel}</div>
+        )}
         {gestureClipUrl ? (
           <a
             href={gestureClipUrl}
@@ -553,7 +569,10 @@ function EpisodeRow({
           </a>
         ) : dashLoaded ? (
           <span className="text-xs text-amber-700" title={dash?.error}>
-            {dash?.error ?? `No ${ep.clip} in gestureClips`}
+            {dash?.error ??
+              (solverGestureLabel
+                ? `No ${dash?.gestureSourceClip ?? ep.clip} in gestureClips`
+                : `No ${ep.clip} in gestureClips`)}
           </span>
         ) : (
           <span className="text-xs text-zinc-400">Load dashboard</span>

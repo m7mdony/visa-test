@@ -32,6 +32,7 @@ export type ReportEventsBundle = {
   attemptPassedTimings?: BotTimingLogEvent[];
   inHouseTimingLogs?: BotTimingLogEvent[];
   wasmPoolJobDoneTimings?: BotTimingLogEvent[];
+  singleModalDoneTimings?: BotTimingLogEvent[];
 };
 
 export function computeFilteredBotTimingReport(
@@ -57,13 +58,21 @@ export function computeFilteredBotTimingReport(
   const wasmLines = (events.wasmPoolJobDoneTimings ?? [])
     .filter((e) => matches(e.email, e.passportNumber))
     .map((e) => e.line);
+  const singleModalLines = (events.singleModalDoneTimings ?? [])
+    .filter((e) => matches(e.email, e.passportNumber))
+    .map((e) => e.line);
 
   // Older API payloads lack timing identity — keep full-window report.
-  if (!events.attemptPassedTimings && !events.inHouseTimingLogs && !events.wasmPoolJobDoneTimings) {
+  if (
+    !events.attemptPassedTimings &&
+    !events.inHouseTimingLogs &&
+    !events.wasmPoolJobDoneTimings &&
+    !events.singleModalDoneTimings
+  ) {
     return fallback;
   }
 
-  return buildBotTimingReport(attemptLines, inHouseLines, wasmLines);
+  return buildBotTimingReport(attemptLines, inHouseLines, wasmLines, singleModalLines);
 }
 
 export type FailureReasonRow = {

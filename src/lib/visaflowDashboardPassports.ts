@@ -164,6 +164,7 @@ export function parseGestureClipsFromApplicantImages(data: ApplicantImagesPayloa
   return out;
 }
 
+/** @deprecated use findSolverGestureClip for solver stuck-feedback clips */
 export function findGestureClipUrl(
   clips: GestureClipEntry[] | undefined,
   gesture: string,

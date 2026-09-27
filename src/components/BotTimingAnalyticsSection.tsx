@@ -11,11 +11,15 @@ function AttemptPassedTimingBreakdownBar({
   wasmAvgMs,
   singleModelAvgMs,
   wasmCount,
+  singleModelCount,
+  singleModelFromLogs,
 }: {
   totalAvgMs: number;
   wasmAvgMs: number;
   singleModelAvgMs: number;
   wasmCount: number;
+  singleModelCount: number;
+  singleModelFromLogs: boolean;
 }) {
   const wasmPct = Math.min(100, Math.max(0, (wasmAvgMs / totalAvgMs) * 100));
   const singleModelPct = Math.max(0, 100 - wasmPct);
@@ -24,8 +28,17 @@ function AttemptPassedTimingBreakdownBar({
     <div className="mt-3 rounded-lg border border-violet-200 bg-violet-50/40 px-3 py-3">
       <div className="text-xs font-medium text-violet-950 mb-1">Avg time breakdown</div>
       <p className="text-[11px] text-violet-800/90 mb-3">
-        WASM solve avg from <code className="text-[10px]">[WASM] Pool job done in …s</code> (n={wasmCount}) vs total{" "}
-        <code className="text-[10px]">Attempt … passed</code> avg ({fmtMs(totalAvgMs)}).
+        WASM solve from <code className="text-[10px]">[WASM] Pool job done in …s</code> (n={wasmCount}) +{" "}
+        {singleModelFromLogs ? (
+          <>
+            singleModel from <code className="text-[10px]">[SINGLEMODAL] … done in …s total</code> (n={singleModelCount})
+          </>
+        ) : (
+          <>
+            singleModel estimate from <code className="text-[10px]">Attempt … passed</code> − WASM (no done lines)
+          </>
+        )}{" "}
+        — combined avg {fmtMs(totalAvgMs)}.
       </p>
       <div className="flex h-7 w-full overflow-hidden rounded-md border border-violet-200 bg-white shadow-inner">
         <div
@@ -117,9 +130,14 @@ function TimingStatsTable({ stats, label }: { stats: TimingAnalytics | null; lab
 export default function BotTimingAnalyticsSection({ report }: { report: BotTimingReport }) {
   const bn = report.inHouseVerification.bottleneck;
   const breakdown = report.attemptPassed.breakdown;
-  const totalAvgMs = report.attemptPassed.overall?.avg ?? null;
   const wasmAvgMs = breakdown?.wasmSolve?.avg ?? null;
-  const singleModelAvgMs = breakdown?.singleModelOverheadAvgMs ?? null;
+  const singleModelFromLogs = (breakdown?.singleModel?.count ?? 0) > 0;
+  const singleModelAvgMs =
+    breakdown?.singleModel?.avg ?? breakdown?.singleModelOverheadAvgMs ?? null;
+  const totalAvgMs =
+    wasmAvgMs != null && singleModelAvgMs != null
+      ? wasmAvgMs + singleModelAvgMs
+      : report.attemptPassed.overall?.avg ?? null;
   const showBreakdownBar =
     totalAvgMs != null &&
     wasmAvgMs != null &&
@@ -143,11 +161,21 @@ export default function BotTimingAnalyticsSection({ report }: { report: BotTimin
             wasmAvgMs={wasmAvgMs}
             singleModelAvgMs={singleModelAvgMs}
             wasmCount={breakdown!.wasmSolve!.count}
+            singleModelCount={breakdown?.singleModel?.count ?? breakdown?.singleModelLogLineCount ?? 0}
+            singleModelFromLogs={singleModelFromLogs}
           />
         ) : breakdown?.wasmLogLineCount === 0 ? (
           <p className="mt-2 text-[11px] text-zinc-500">
             No <code className="text-[10px]">[WASM] Pool job done</code> lines in window for breakdown.
           </p>
+        ) : null}
+        {breakdown?.singleModel ? (
+          <div className="mt-3">
+            <TimingStatsTable
+              stats={breakdown.singleModel}
+              label="singleModel POST ([SINGLEMODAL] … done in …s total)"
+            />
+          </div>
         ) : null}
       </div>
 

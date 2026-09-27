@@ -1,4 +1,5 @@
 import { episodeKey, extractPassportFromJobId, type StuckFeedbackEpisode } from "@/lib/stuckFeedback";
+import { resolveSolverGestureSource } from "@/lib/solverGestureClips";
 
 export type StuckEpisodeExportRow = {
   startedAt: string;
@@ -10,6 +11,8 @@ export type StuckEpisodeExportRow = {
   applicantId: string;
   passportImageUrl: string;
   gestureClipUrl: string;
+  gestureSourceClip: string;
+  gestureTiltDeg: number | "";
   dashboardError: string;
   jobId: string;
   videoUrl: string;
@@ -37,6 +40,9 @@ type DashboardRow = {
   applicantId: string | null;
   passportImageUrl: string | null;
   gestureClipUrl: string | null;
+  gestureSourceClip?: string | null;
+  gestureTiltDeg?: number | null;
+  gestureSynthesized?: boolean;
   error?: string;
 };
 
@@ -67,6 +73,14 @@ export function buildStuckFeedbackExportRows(
       ep.passportNumber?.trim() ||
       extractPassportFromJobId(ep.jobId) ||
       "";
+    const solverSource =
+      dash?.gestureSourceClip != null
+        ? {
+            sourceClip: dash.gestureSourceClip,
+            rotateDeg: dash.gestureTiltDeg ?? 0,
+            synthesized: Boolean(dash.gestureSynthesized),
+          }
+        : resolveSolverGestureSource(ep.clip);
     return {
       startedAt: ep.startedAt,
       endedAt: ep.endedAt ?? "",
@@ -77,6 +91,8 @@ export function buildStuckFeedbackExportRows(
       applicantId: dash?.applicantId ?? "",
       passportImageUrl: dash?.passportImageUrl ?? "",
       gestureClipUrl: dash?.gestureClipUrl ?? "",
+      gestureSourceClip: solverSource.sourceClip,
+      gestureTiltDeg: solverSource.synthesized ? solverSource.rotateDeg : "",
       dashboardError: dash?.error ?? "",
       jobId: ep.jobId,
       videoUrl: ep.videoUrl ?? "",
@@ -117,6 +133,8 @@ const CSV_HEADERS: (keyof StuckEpisodeExportRow)[] = [
   "applicantId",
   "passportImageUrl",
   "gestureClipUrl",
+  "gestureSourceClip",
+  "gestureTiltDeg",
   "dashboardError",
   "jobId",
   "videoUrl",

@@ -5,7 +5,8 @@ import {
   extractPassportFromJobId,
 } from "@/lib/stuckFeedback";
 import { fetchDashboardMediaForPassports } from "@/lib/visaflowDashboardMediaFetch";
-import { findGestureClipUrl, lookupByPassportKey } from "@/lib/visaflowDashboardPassports";
+import { findSolverGestureClip } from "@/lib/solverGestureClips";
+import { lookupByPassportKey } from "@/lib/visaflowDashboardPassports";
 
 export const maxDuration = 300;
 
@@ -26,6 +27,10 @@ export type StuckEpisodeDashboardRow = {
   applicantId: string | null;
   passportImageUrl: string | null;
   gestureClipUrl: string | null;
+  /** Solver motion source clip (e.g. up for upLeft). */
+  gestureSourceClip: string | null;
+  gestureTiltDeg: number | null;
+  gestureSynthesized: boolean;
   error?: string;
 };
 
@@ -117,6 +122,9 @@ export async function POST(req: NextRequest) {
         applicantId: null,
         passportImageUrl: null,
         gestureClipUrl: null,
+        gestureSourceClip: null,
+        gestureTiltDeg: null,
+        gestureSynthesized: false,
         error: "No passport in JOB_ID",
       };
       continue;
@@ -130,18 +138,29 @@ export async function POST(req: NextRequest) {
         applicantId: null,
         passportImageUrl: null,
         gestureClipUrl: null,
+        gestureSourceClip: null,
+        gestureTiltDeg: null,
+        gestureSynthesized: false,
         error: dash.error ?? "Dashboard lookup failed",
       };
       continue;
     }
 
+    const gesture = findSolverGestureClip(media.gestureClips, ep.clip);
     byEpisode[key] = {
       key,
       passportNumber: passport,
       applicantId: media.applicantId,
       passportImageUrl: media.passportImages.find((p) => p.url?.trim())?.url?.trim() ?? null,
-      gestureClipUrl: findGestureClipUrl(media.gestureClips, ep.clip),
-      error: media.error,
+      gestureClipUrl: gesture.clipUrl,
+      gestureSourceClip: gesture.sourceClip,
+      gestureTiltDeg: gesture.rotateDeg,
+      gestureSynthesized: gesture.synthesized,
+      error:
+        media.error ??
+        (!gesture.clipUrl
+          ? `No dashboard clip for solver source "${gesture.sourceClip}" (${ep.clip}${gesture.synthesized ? ` = ${gesture.sourceClip} + tilt` : ""})`
+          : undefined),
     };
   }
 

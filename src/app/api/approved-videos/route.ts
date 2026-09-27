@@ -22,6 +22,7 @@ import { lookupPassportsByEmailBatch } from "@/lib/enrichPassportsByEmail";
 import {
   buildBotTimingReport,
   isAttemptPassedTimingLine,
+  isSingleModalDoneLine,
   isWasmPoolJobDoneLine,
   parseInHouseVerificationTotalMs,
 } from "@/lib/botTimingStats";
@@ -1628,6 +1629,16 @@ export async function POST(req: NextRequest) {
         query: "[WASM] Pool job done",
         requestId: "approved_azure_wasm_pool_done",
       }),
+    () =>
+      queryLogs({
+        base,
+        cookieHeader,
+        from,
+        to,
+        app: azureLivenessApp,
+        query: ["[SINGLEMODAL]", "done"],
+        requestId: "approved_azure_singlemodal_done",
+      }),
   ];
 
   const [
@@ -1645,6 +1656,7 @@ export async function POST(req: NextRequest) {
     azureResultFailedLogs,
     azureRecordingLogs,
     wasmPoolJobDoneLogsRaw,
+    singleModalDoneLogsRaw,
   ] = await runInBatches(lokiQueryTasks, LOKI_QUERY_BATCH_SIZE);
 
   const idnfyStatusMergedRaw = dedupeLogEntries([
@@ -1850,6 +1862,10 @@ export async function POST(req: NextRequest) {
     wasmPoolJobDoneLogsRaw.filter((e) => isWasmPoolJobDoneLine(e.line))
   );
   const wasmPoolJobDoneKind = filterWasmLogsBySolveKind(wasmPoolJobDoneRaw, allowedSessionRefs);
+  const singleModalDoneRaw = dedupeLogEntries(
+    singleModalDoneLogsRaw.filter((e) => isSingleModalDoneLine(e.line))
+  );
+  const singleModalDoneKind = filterWasmLogsBySolveKind(singleModalDoneRaw, allowedSessionRefs);
 
   const timelinesBySessionRef = mergeSessionRefTimelines(urnToRef, [
     activationLogs,
@@ -2256,10 +2272,21 @@ export async function POST(req: NextRequest) {
       at: entry.time,
     };
   });
+  const singleModalDoneTimings = singleModalDoneKind.matched.map((entry) => {
+    const jobId = extractJobIdFromLine(entry.line);
+    const passportNumber = jobId ? extractPassportFromJobId(jobId) : null;
+    return {
+      email: "",
+      passportNumber,
+      line: entry.line,
+      at: entry.time,
+    };
+  });
   const botTimingReport = buildBotTimingReport(
     attemptPassedTimings.map((e) => e.line),
     inHouseTimingLogs.map((e) => e.line),
-    wasmPoolJobDoneTimings.map((e) => e.line)
+    wasmPoolJobDoneTimings.map((e) => e.line),
+    singleModalDoneTimings.map((e) => e.line)
   );
 
   const erroredAttempts: ErroredAttemptEvent[] = [];
@@ -2313,6 +2340,7 @@ export async function POST(req: NextRequest) {
       attemptPassedTimings,
       inHouseTimingLogs,
       wasmPoolJobDoneTimings,
+      singleModalDoneTimings,
     },
     botTimingReport,
     totals: {
@@ -2355,6 +2383,8 @@ export async function POST(req: NextRequest) {
       solveKindUnmatchedAttemptPassed: attemptPassedKind.unmatched,
       wasmPoolJobDoneLogLines: wasmPoolJobDoneKind.matched.length,
       solveKindUnmatchedWasmPoolJobDone: wasmPoolJobDoneKind.unmatched,
+      singleModalDoneLogLines: singleModalDoneKind.matched.length,
+      solveKindUnmatchedSingleModalDone: singleModalDoneKind.unmatched,
       azurePayloadLogLines: azurePayloadLogs.length,
       azureResultFailedLogLines: azureResultFailedLogs.length,
       taskPayloadRows: taskPayloadIatRows.length,

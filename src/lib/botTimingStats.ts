@@ -14,9 +14,12 @@ export type BottleneckStats = {
 export type AttemptPassedTimingBreakdown = {
   /** `[WASM] Pool job done in …s` — actual WASM solve time. */
   wasmSolve: TimingAnalytics | null;
-  /** `Attempt … passed` avg minus WASM solve avg (singleModel / request overhead). */
+  /** `[SINGLEMODAL] … done in …s total` — actual Azure POST timing (incl. retries). */
+  singleModel: TimingAnalytics | null;
+  /** Prefer `singleModel.avg`; fallback = `Attempt … passed` avg − WASM solve avg. */
   singleModelOverheadAvgMs: number | null;
   wasmLogLineCount: number;
+  singleModelLogLineCount: number;
 };
 
 export type BotTimingReport = {
@@ -46,6 +49,9 @@ const IN_HOUSE_LEGACY_RE =
 
 /** `[WASM] Pool job done in 3.77s` */
 const WASM_POOL_JOB_DONE_RE = /\[WASM\]\s*Pool job done in\s+([\d.]+)\s*s\b/i;
+
+/** `[SINGLEMODAL] ecaf13e3 done in 4.43s total` */
+const SINGLEMODAL_DONE_RE = /\[SINGLEMODAL\][^\n]*\bdone in\s+([\d.]+)\s*s\s+total\b/i;
 
 export function isAttemptPassedTimingLine(line: string): boolean {
   return ATTEMPT_PASSED_MS_RE.test(line);
@@ -87,34 +93,58 @@ export function parseWasmPoolJobDoneMs(line: string): number | null {
   return Math.round(seconds * 1000);
 }
 
+export function isSingleModalDoneLine(line: string): boolean {
+  return SINGLEMODAL_DONE_RE.test(line);
+}
+
+export function parseSingleModalDoneMs(line: string): number | null {
+  const m = line.match(SINGLEMODAL_DONE_RE);
+  if (!m?.[1]) return null;
+  const seconds = parseFloat(m[1]);
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  return Math.round(seconds * 1000);
+}
+
 function buildAttemptPassedBreakdown(
   attemptOverall: TimingAnalytics | null,
-  wasmLines: string[]
+  wasmLines: string[],
+  singleModalLines: string[]
 ): AttemptPassedTimingBreakdown | null {
   const wasmMs: number[] = [];
   for (const line of wasmLines) {
     const ms = parseWasmPoolJobDoneMs(line);
     if (ms != null) wasmMs.push(ms);
   }
+  const singleModalMs: number[] = [];
+  for (const line of singleModalLines) {
+    const ms = parseSingleModalDoneMs(line);
+    if (ms != null) singleModalMs.push(ms);
+  }
   const wasmSolve = computeTimingAnalytics(wasmMs);
-  if (!attemptOverall && !wasmSolve) return null;
+  const singleModel = computeTimingAnalytics(singleModalMs);
+  if (!attemptOverall && !wasmSolve && !singleModel) return null;
 
   let singleModelOverheadAvgMs: number | null = null;
-  if (attemptOverall?.avg != null && wasmSolve?.avg != null) {
+  if (singleModel?.avg != null) {
+    singleModelOverheadAvgMs = singleModel.avg;
+  } else if (attemptOverall?.avg != null && wasmSolve?.avg != null) {
     singleModelOverheadAvgMs = Math.max(0, attemptOverall.avg - wasmSolve.avg);
   }
 
   return {
     wasmSolve,
+    singleModel,
     singleModelOverheadAvgMs,
     wasmLogLineCount: wasmLines.length,
+    singleModelLogLineCount: singleModalLines.length,
   };
 }
 
 export function buildBotTimingReport(
   attemptLines: string[],
   inHouseLines: string[],
-  wasmPoolJobDoneLines: string[] = []
+  wasmPoolJobDoneLines: string[] = [],
+  singleModalDoneLines: string[] = []
 ): BotTimingReport {
   const attemptMs: number[] = [];
   for (const line of attemptLines) {
@@ -139,7 +169,7 @@ export function buildBotTimingReport(
     attemptPassed: {
       logLineCount: attemptLines.length,
       overall: attemptOverall,
-      breakdown: buildAttemptPassedBreakdown(attemptOverall, wasmPoolJobDoneLines),
+      breakdown: buildAttemptPassedBreakdown(attemptOverall, wasmPoolJobDoneLines, singleModalDoneLines),
     },
     inHouseVerification: {
       logLineCount: inHouseLines.length,
