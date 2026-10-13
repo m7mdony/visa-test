@@ -65,8 +65,11 @@ type SolveKind = "drop" | "verification";
 
 const DENIED_APPLICANT_LOKI_QUERY: Record<SolveKind, string> = {
   verification: "Identity verification failed:",
-  drop: "/idnfystatus never returned",
+  drop: "Face verification denied",
 };
+
+/** Legacy drop terminal fail (pre–face-denied rotation logs). */
+const DENIED_APPLICANT_DROP_LEGACY_LOKI_QUERY = "/idnfystatus never returned";
 
 type EmailTimelineEvent = {
   timeMs: number;
@@ -185,6 +188,9 @@ function extractFailureReasonKeys(line: string): string[] {
   if (isIdentityVerificationFailedErrorLine(line)) {
     return ["Identity verification failed"];
   }
+  if (isFaceVerificationDeniedDropLine(line)) {
+    return ["Face verification denied (drop rotation)"];
+  }
   if (isIdnfyStatusNeverReturnedErrorLine(line)) {
     return ["/idnfystatus never returned APPROVED"];
   }
@@ -217,6 +223,9 @@ function extractFailureReasonKeys(line: string): string[] {
 function extractFailureReasonKey(line: string): string | null {
   if (isIdentityVerificationFailedErrorLine(line)) {
     return "Identity verification failed";
+  }
+  if (isFaceVerificationDeniedDropLine(line)) {
+    return "Face verification denied (drop rotation)";
   }
   if (isIdnfyStatusNeverReturnedErrorLine(line)) {
     return "/idnfystatus never returned APPROVED";
@@ -547,10 +556,23 @@ function isIdnfyStatusNeverReturnedErrorLine(line: string): boolean {
   return /\berror:\s*\/idnfystatus never returned/i.test(hay);
 }
 
+/** Drop-solve: `info: Face verification denied [PassportNumber=…], rotated to a new client …`. */
+function isFaceVerificationDeniedDropLine(line: string): boolean {
+  const hay = vfsLogHaystack(line);
+  if (!/Face verification denied/i.test(hay)) return false;
+  if (!/rotated to a new client/i.test(hay)) return false;
+  if (isHttpTraceLogLine(line)) return false;
+  return true;
+}
+
+function isDropDeniedApplicantErrorLine(line: string): boolean {
+  return isIdnfyStatusNeverReturnedErrorLine(line) || isFaceVerificationDeniedDropLine(line);
+}
+
 function isDeniedApplicantErrorLine(line: string, kind: SolveKind): boolean {
   return kind === "verification"
     ? isIdentityVerificationFailedErrorLine(line)
-    : isIdnfyStatusNeverReturnedErrorLine(line);
+    : isDropDeniedApplicantErrorLine(line);
 }
 
 function isDeniedApplicantWarnLine(line: string, kind: SolveKind): boolean {
@@ -571,10 +593,16 @@ function idnfyStatusNeverReturnedBodyKey(line: string): string {
   return m?.[1]?.trim() ?? hay.trim();
 }
 
+function faceVerificationDeniedDropBodyKey(line: string): string {
+  const hay = vfsLogHaystack(line);
+  const m = hay.match(/Face verification denied(.+)$/i);
+  return m?.[1]?.trim() ?? hay.trim();
+}
+
 function deniedApplicantBodyKey(line: string, kind: SolveKind): string {
-  return kind === "verification"
-    ? identityVerificationFailedBodyKey(line)
-    : idnfyStatusNeverReturnedBodyKey(line);
+  if (kind === "verification") return identityVerificationFailedBodyKey(line);
+  if (isFaceVerificationDeniedDropLine(line)) return faceVerificationDeniedDropBodyKey(line);
+  return idnfyStatusNeverReturnedBodyKey(line);
 }
 
 /** Collapse warn+error pairs that share timestamp + message body. */
@@ -591,11 +619,11 @@ function dedupeDeniedApplicantLogs(entries: LogEntry[], kind: SolveKind): LogEnt
     const entryHasError =
       kind === "verification"
         ? /\berror:\s*Identity verification failed:/i.test(entry.line)
-        : isIdnfyStatusNeverReturnedErrorLine(entry.line);
+        : isDropDeniedApplicantErrorLine(entry.line);
     const existingHasError =
       kind === "verification"
         ? /\berror:\s*Identity verification failed:/i.test(existing.line)
-        : isIdnfyStatusNeverReturnedErrorLine(existing.line);
+        : isDropDeniedApplicantErrorLine(existing.line);
     if (entryHasError && !existingHasError) byKey.set(key, entry);
   }
   const out = [...byKey.values()];
@@ -955,6 +983,9 @@ function classifyVfsVerificationLine(
     return { kind: "fail", failN: 1, failM: 1 };
   }
   if (isIdnfyStatusNeverReturnedErrorLine(line)) {
+    return { kind: "fail", failN: 1, failM: 1 };
+  }
+  if (isFaceVerificationDeniedDropLine(line)) {
     return { kind: "fail", failN: 1, failM: 1 };
   }
   if (isConcurrentAttemptsWarnFailure(line)) {
@@ -1508,19 +1539,39 @@ export async function POST(req: NextRequest) {
         requestId: "approved_vfs_identity_failed",
       }),
     () =>
-      queryLogs({
-        base,
-        cookieHeader,
-        from,
-        to,
-        app: target,
-        lokiNamespace: vfsLokiNamespace,
-        query: DENIED_APPLICANT_LOKI_QUERY[solveKind],
-        requestId:
-          solveKind === "verification"
-            ? "approved_vfs_identity_verification_failed"
-            : "approved_vfs_idnfystatus_never",
-      }),
+      solveKind === "drop"
+        ? Promise.all([
+            queryLogs({
+              base,
+              cookieHeader,
+              from,
+              to,
+              app: target,
+              lokiNamespace: vfsLokiNamespace,
+              query: DENIED_APPLICANT_LOKI_QUERY.drop,
+              requestId: "approved_vfs_face_verification_denied",
+            }),
+            queryLogs({
+              base,
+              cookieHeader,
+              from,
+              to,
+              app: target,
+              lokiNamespace: vfsLokiNamespace,
+              query: DENIED_APPLICANT_DROP_LEGACY_LOKI_QUERY,
+              requestId: "approved_vfs_idnfystatus_never",
+            }),
+          ]).then(([faceDenied, legacyNever]) => dedupeLogEntries([...faceDenied, ...legacyNever]))
+        : queryLogs({
+            base,
+            cookieHeader,
+            from,
+            to,
+            app: target,
+            lokiNamespace: vfsLokiNamespace,
+            query: DENIED_APPLICANT_LOKI_QUERY.verification,
+            requestId: "approved_vfs_identity_verification_failed",
+          }),
     () =>
       queryLogs({
         base,
@@ -1708,7 +1759,9 @@ export async function POST(req: NextRequest) {
   console.log(`  loki query: ${deniedApplicantLokiQuery}`);
   console.log(`  loki lines: ${idnfyStatusLogs.length}`);
   console.log(`  warn lines (excluded): ${deniedApplicantWarnCount}`);
-  console.log(`  counted (error only, deduped): ${deniedApplicantCount}`);
+  console.log(
+    `  counted (${solveKind === "drop" ? "info/error" : "error only"}, deduped): ${deniedApplicantCount}`
+  );
   if (idnfyStatusLogs.length > 0 && deniedApplicantCount === 0) {
     console.log("  samples (first 3 raw):");
     for (let i = 0; i < Math.min(3, idnfyStatusLogs.length); i++) {

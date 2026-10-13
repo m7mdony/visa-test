@@ -47,6 +47,7 @@ export function resolvePassportForLog(
   emailToPassport: Map<string, string>
 ): string | null {
   const passportFromLine =
+    extractLogField(line, "passportNumber") ??
     extractLogField(line, "PassportNumber") ??
     extractLogField(line, "passport") ??
     extractBracketPassport(line);

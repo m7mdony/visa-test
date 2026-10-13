@@ -7,7 +7,6 @@ import {
   exportStuckFeedbackCsv,
   exportStuckFeedbackJson,
 } from "@/lib/stuckFeedbackExport";
-import { formatSolverGestureLabel } from "@/lib/solverGestureClips";
 import VisaflowDashboardLoginPanel from "@/components/VisaflowDashboardLoginPanel";
 import type { DashboardFetchDebug } from "@/lib/visaflowDashboardDebug";
 import {
@@ -508,15 +507,6 @@ function EpisodeRow({
   const passport = dash?.passportNumber ?? ep.passportNumber?.trim() ?? "";
   const passportImg = dash?.passportImageUrl ?? null;
   const gestureClipUrl = dash?.gestureClipUrl ?? null;
-  const solverGestureLabel =
-    dash?.gestureSourceClip != null
-      ? formatSolverGestureLabel({
-          feedbackClip: ep.clip,
-          sourceClip: dash.gestureSourceClip,
-          rotateDeg: dash.gestureTiltDeg ?? 0,
-          synthesized: Boolean(dash.gestureSynthesized),
-        })
-      : null;
   const jobShort = ep.jobId.includes("|") ? ep.jobId.split("|")[0] : ep.sessionPrefix;
 
   return (
@@ -555,24 +545,26 @@ function EpisodeRow({
         )}
       </td>
       <td className="px-3 py-2">
-        {solverGestureLabel && dash?.gestureSynthesized && (
-          <div className="mb-1 font-mono text-[10px] text-zinc-500">{solverGestureLabel}</div>
-        )}
         {gestureClipUrl ? (
-          <a
-            href={gestureClipUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="break-all text-xs text-blue-600 hover:underline"
-          >
-            {gestureClipUrl}
-          </a>
+          <div className="space-y-2">
+            <video
+              src={gestureClipUrl}
+              controls
+              preload="metadata"
+              className="max-h-28 max-w-[200px] rounded border border-zinc-200 bg-black"
+            />
+            <a
+              href={gestureClipUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="block break-all text-xs text-blue-600 hover:underline"
+            >
+              Open clip
+            </a>
+          </div>
         ) : dashLoaded ? (
           <span className="text-xs text-amber-700" title={dash?.error}>
-            {dash?.error ??
-              (solverGestureLabel
-                ? `No ${dash?.gestureSourceClip ?? ep.clip} in gestureClips`
-                : `No ${ep.clip} in gestureClips`)}
+            {dash?.error ?? `No ${ep.clip} in gestureClips`}
           </span>
         ) : (
           <span className="text-xs text-zinc-400">Load dashboard</span>

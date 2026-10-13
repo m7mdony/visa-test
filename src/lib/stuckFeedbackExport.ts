@@ -73,14 +73,7 @@ export function buildStuckFeedbackExportRows(
       ep.passportNumber?.trim() ||
       extractPassportFromJobId(ep.jobId) ||
       "";
-    const solverSource =
-      dash?.gestureSourceClip != null
-        ? {
-            sourceClip: dash.gestureSourceClip,
-            rotateDeg: dash.gestureTiltDeg ?? 0,
-            synthesized: Boolean(dash.gestureSynthesized),
-          }
-        : resolveSolverGestureSource(ep.clip);
+    const solverSource = resolveSolverGestureSource(ep.clip);
     return {
       startedAt: ep.startedAt,
       endedAt: ep.endedAt ?? "",
@@ -92,7 +85,7 @@ export function buildStuckFeedbackExportRows(
       passportImageUrl: dash?.passportImageUrl ?? "",
       gestureClipUrl: dash?.gestureClipUrl ?? "",
       gestureSourceClip: solverSource.sourceClip,
-      gestureTiltDeg: solverSource.synthesized ? solverSource.rotateDeg : "",
+      gestureTiltDeg: "",
       dashboardError: dash?.error ?? "",
       jobId: ep.jobId,
       videoUrl: ep.videoUrl ?? "",

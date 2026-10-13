@@ -158,9 +158,7 @@ export async function POST(req: NextRequest) {
       gestureSynthesized: gesture.synthesized,
       error:
         media.error ??
-        (!gesture.clipUrl
-          ? `No dashboard clip for solver source "${gesture.sourceClip}" (${ep.clip}${gesture.synthesized ? ` = ${gesture.sourceClip} + tilt` : ""})`
-          : undefined),
+        (!gesture.clipUrl ? `No "${ep.clip}" in gestureClips` : undefined),
     };
   }
 

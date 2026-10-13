@@ -792,9 +792,11 @@ export default function ApprovedVideosClient() {
                 <code className="text-[10px]">
                   {data.solveKind === "verification"
                     ? "Identity verification failed:"
-                    : "/idnfystatus never returned"}
+                    : "Face verification denied"}
                 </code>
-                <span className="text-rose-700/80"> · error only</span>
+                <span className="text-rose-700/80">
+                  {data.solveKind === "verification" ? " · error only" : " · rotation logs"}
+                </span>
               </div>
               <div className="mt-4 pt-3 border-t border-rose-200/80">
                 <div className="text-xs font-medium text-rose-900">Errored video attempts</div>

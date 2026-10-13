@@ -100,6 +100,12 @@ export default function RootLayout({
                 >
                   Stuck
                 </Link>
+                <Link
+                  href="/processing-clients-last-week"
+                  className="hover:text-zinc-950 transition-colors"
+                >
+                  Processing week
+                </Link>
               </nav>
             </div>
           </header>
