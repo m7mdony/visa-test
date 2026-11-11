@@ -15,6 +15,10 @@ function sleep(ms: number): Promise<void> {
 
 export function extractLokiQueryError(raw: unknown): string | null {
   const o = raw as Record<string, unknown>;
+  if (o?.status === "error") {
+    const err = o.error;
+    if (typeof err === "string" && err.trim()) return err.trim();
+  }
   const results = o?.results as Record<string, { error?: string }> | undefined;
   if (!results || typeof results !== "object") return null;
   for (const refId of Object.keys(results)) {
@@ -22,6 +26,56 @@ export function extractLokiQueryError(raw: unknown): string | null {
     if (typeof err === "string" && err.trim()) return err.trim();
   }
   return null;
+}
+
+function hasBearerAuth(headers: Record<string, string>): boolean {
+  const auth = headers.Authorization ?? headers.authorization;
+  return typeof auth === "string" && auth.toLowerCase().startsWith("bearer ");
+}
+
+export function lokiDatasourceProxyQueryRangeUrl(
+  base: string,
+  uid = process.env.LOKI_DATASOURCE_UID ?? "P8E80F9AEF21F6940"
+): string {
+  const b = base.replace(/\/$/, "");
+  return `${b}/api/datasources/proxy/uid/${uid}/loki/api/v1/query_range`;
+}
+
+type DsQueryBodyParsed = {
+  expr: string;
+  fromMs: number;
+  toMs: number;
+  limit: number;
+  direction: string;
+};
+
+function parseDsQueryBody(body: unknown): DsQueryBodyParsed | null {
+  const o = body as {
+    queries?: Array<{ expr?: string; maxLines?: number; direction?: string }>;
+    from?: string;
+    to?: string;
+  };
+  const q = o?.queries?.[0];
+  if (!q?.expr?.trim()) return null;
+  const fromMs = parseInt(String(o?.from ?? ""), 10);
+  const toMs = parseInt(String(o?.to ?? ""), 10);
+  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || fromMs >= toMs) return null;
+  return {
+    expr: q.expr.trim(),
+    fromMs,
+    toMs,
+    limit: Math.min(
+      typeof q.maxLines === "number" && q.maxLines > 0 ? q.maxLines : LOKI_MAX_LINES_PER_QUERY,
+      LOKI_MAX_LINES_PER_QUERY
+    ),
+    direction: typeof q.direction === "string" && q.direction.trim() ? q.direction.trim() : "backward",
+  };
+}
+
+function grafanaBaseFromDsQueryUrl(url: string): string | null {
+  const idx = url.indexOf("/api/ds/query");
+  if (idx <= 0) return null;
+  return url.slice(0, idx);
 }
 
 export function isRetryableLokiError(httpStatus: number, lokiError: string | null): boolean {
@@ -44,14 +98,49 @@ export async function fetchLokiQueryWithRetry(params: {
   let lastStatus = 0;
   let lastRaw: unknown = {};
 
+  const dsParsed = parseDsQueryBody(params.body);
+  const useProxy = hasBearerAuth(params.headers) && dsParsed != null;
+  const proxyBase = useProxy ? grafanaBaseFromDsQueryUrl(params.url) : null;
+  const proxyUrl =
+    useProxy && proxyBase
+      ? lokiDatasourceProxyQueryRangeUrl(proxyBase)
+      : null;
+
+  const queryHeaders: Record<string, string> = { ...params.headers };
+  if (useProxy) {
+    delete queryHeaders["Content-Type"];
+    delete queryHeaders["content-type"];
+    delete queryHeaders["x-datasource-uid"];
+    delete queryHeaders["x-grafana-org-id"];
+    delete queryHeaders["x-plugin-id"];
+    delete queryHeaders["x-query-group-id"];
+  }
+
   for (let attempt = 1; attempt <= LOKI_RETRY_MAX_ATTEMPTS; attempt++) {
-    const res = await fetch(params.url, {
-      method: "POST",
-      headers: params.headers,
-      body: JSON.stringify(params.body),
-      // @ts-expect-error Node fetch may accept this for self-signed certs
-      rejectUnauthorized: false,
-    });
+    let res: Response;
+    if (useProxy && proxyUrl && dsParsed) {
+      const qs = new URLSearchParams({
+        query: dsParsed.expr,
+        start: String(Math.floor(dsParsed.fromMs * 1e6)),
+        end: String(Math.floor(dsParsed.toMs * 1e6)),
+        limit: String(dsParsed.limit),
+        direction: dsParsed.direction,
+      });
+      res = await fetch(`${proxyUrl}?${qs}`, {
+        method: "GET",
+        headers: queryHeaders,
+        // @ts-expect-error Node fetch may accept this for self-signed certs
+        rejectUnauthorized: false,
+      });
+    } else {
+      res = await fetch(params.url, {
+        method: "POST",
+        headers: params.headers,
+        body: JSON.stringify(params.body),
+        // @ts-expect-error Node fetch may accept this for self-signed certs
+        rejectUnauthorized: false,
+      });
+    }
     lastStatus = res.status;
     lastRaw = await res.json().catch(() => ({}));
     const lokiErr = extractLokiQueryError(lastRaw);
@@ -97,20 +186,21 @@ export const IDNFY_STATUS_LOKI_FILTER = "appointment/idnfystatus";
 /** Response lines only. */
 export const IDNFY_STATUS_RESPONSE_LOKI_FILTER = "idnfystatus] Response";
 
-const GRAFANA_URL = process.env.GRAFANA_URL ?? "";
-const GRAFANA_USER = process.env.GRAFANA_USER ?? "admin";
-const GRAFANA_PASSWORD = process.env.GRAFANA_PASSWORD ?? "";
 export const LOKI_DATASOURCE_UID = process.env.LOKI_DATASOURCE_UID ?? "P8E80F9AEF21F6940";
 
+function grafanaUrlEnv(): string {
+  return (process.env.GRAFANA_URL ?? "").trim();
+}
+
 export function getGrafanaBase(): string {
-  return GRAFANA_URL.replace(/\/$/, "");
+  return grafanaUrlEnv().replace(/\/$/, "");
 }
 
 export function isGrafanaConfigured(): boolean {
-  return Boolean(GRAFANA_URL);
+  return Boolean(grafanaUrlEnv());
 }
 
-function getCookieHeader(setCookie: string[]): string {
+export function getCookieHeader(setCookie: string[]): string {
   return setCookie
     .map((c) => c.split(";")[0].trim())
     .filter(Boolean)
@@ -276,36 +366,14 @@ export function buildLokiLineFilterExpr(
 }
 
 export async function loginGrafanaCookie(base: string): Promise<string> {
-  const loginUrl = `${base}/login`;
-  const loginRes = await fetch(loginUrl, {
-    method: "POST",
-    headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; UiTest-Loki/1.0)",
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      Referer: loginUrl,
-    },
-    body: JSON.stringify({
-      user: GRAFANA_USER,
-      password: GRAFANA_PASSWORD,
-    }),
-    redirect: "manual",
-    // @ts-expect-error Node fetch may accept this for self-signed
-    rejectUnauthorized: false,
-  });
-  let setCookie: string[] = [];
-  if (typeof loginRes.headers.getSetCookie === "function") {
-    setCookie = loginRes.headers.getSetCookie();
-  } else {
-    const sc = loginRes.headers.get("set-cookie");
-    if (sc) setCookie = [sc];
-  }
-  return getCookieHeader(setCookie);
+  const { fetchGrafanaCookieSession } = await import("@/lib/grafanaAuth");
+  return fetchGrafanaCookieSession(base);
 }
 
 export async function queryVfsGlobalBotLogs(params: {
   base: string;
-  cookieHeader: string;
+  /** Full auth headers from `resolveGrafanaDsQueryHeaders` (Bearer or Cookie). */
+  grafanaRequestHeaders: Record<string, string>;
   from: number;
   to: number;
   query: string | string[];
@@ -315,7 +383,7 @@ export async function queryVfsGlobalBotLogs(params: {
 }): Promise<LogEntry[]> {
   const {
     base,
-    cookieHeader,
+    grafanaRequestHeaders,
     from,
     to,
     query,
@@ -344,11 +412,7 @@ export async function queryVfsGlobalBotLogs(params: {
   const { logs } = await fetchLokiQueryWithRetry({
     url: `${base}/api/ds/query?ds_type=loki&requestId=${encodeURIComponent(requestId)}`,
     headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; UiTest-Loki/1.0)",
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      Cookie: cookieHeader,
-      Origin: base,
+      ...grafanaRequestHeaders,
       "x-datasource-uid": LOKI_DATASOURCE_UID,
       "x-grafana-org-id": "1",
       "x-plugin-id": "loki",

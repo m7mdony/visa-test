@@ -55,32 +55,16 @@ export default function RootLayout({
                 >
                   Booking jobs
                 </Link>
-                {/* Hidden from nav (2026-08-06) — pages still live, re-add Link here to restore:
+                {/* Hidden from nav — pages still live, re-add Link here to restore:
                     /session-videos, /clients-missing-videos, /vfs-logs,
-                    /unexpected-server-errors, /passport-number-extractor, /unrecovered-denied-jobs */}
-                <Link
-                  href="/processing-applicant-videos"
-                  className="hover:text-zinc-950 transition-colors"
-                >
-                  Processing videos
-                </Link>
+                    /unexpected-server-errors, /passport-number-extractor, /unrecovered-denied-jobs,
+                    /processing-applicant-videos, /max-upload, /in-house-ver-videos,
+                    /exposure-check, /stuck-feedback, /processing-clients-last-week, /passport-from-log */}
                 <Link
                   href="/bot-notable-errors"
                   className="hover:text-zinc-950 transition-colors"
                 >
                   Bot errors
-                </Link>
-                <Link
-                  href="/max-upload"
-                  className="hover:text-zinc-950 transition-colors"
-                >
-                  Max upload
-                </Link>
-                <Link
-                  href="/in-house-ver-videos"
-                  className="hover:text-zinc-950 transition-colors"
-                >
-                  In-house videos
                 </Link>
                 <Link
                   href="/idnfy-never-failed"
@@ -95,16 +79,16 @@ export default function RootLayout({
                   We couldn&apos;t
                 </Link>
                 <Link
-                  href="/stuck-feedback"
+                  href="/document-verification-failed"
                   className="hover:text-zinc-950 transition-colors"
                 >
-                  Stuck
+                  Doc verify fail
                 </Link>
                 <Link
-                  href="/processing-clients-last-week"
+                  href="/captured-image-not-clear"
                   className="hover:text-zinc-950 transition-colors"
                 >
-                  Processing week
+                  Image not clear
                 </Link>
               </nav>
             </div>

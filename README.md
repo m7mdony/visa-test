@@ -1,5 +1,14 @@
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
+## Grafana / Loki (server-side)
+
+If Grafana sign-in is **Google OAuth** (or anything other than username/password), `POST /login` no longer returns a session cookie for automation. Configure a **long-lived token** instead:
+
+- `GRAFANA_API` (or `GRAFANA_TOKEN` / `GRAFANA_SERVICE_ACCOUNT_TOKEN` / `GRAFANA_API_TOKEN`) — `Authorization: Bearer …`; Loki is read via Grafana’s datasource proxy `…/loki/api/v1/query_range` (same as `pull_loki.py`).
+- Fallback when unset: `GRAFANA_USER` + `GRAFANA_PASSWORD` — cookie session from `POST /login` (only if that still works on your instance).
+
+Also set `GRAFANA_URL` and (when applicable) `LOKI_DATASOURCE_UID`.
+
 ## Getting Started
 
 First, run the development server:

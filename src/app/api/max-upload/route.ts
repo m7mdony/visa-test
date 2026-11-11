@@ -3,10 +3,10 @@ import { cookies } from "next/headers";
 import {
   getGrafanaBase,
   isGrafanaConfigured,
-  loginGrafanaCookie,
   queryVfsGlobalBotLogs,
   type LogEntry,
 } from "@/lib/grafanaLoki";
+import { resolveGrafanaDsQueryHeaders } from "@/lib/grafanaAuth";
 
 export const maxDuration = 300;
 
@@ -95,10 +95,11 @@ export async function POST(req: NextRequest) {
 
   const mode = body.mode === "docs" ? "docs" : "emails";
   const base = getGrafanaBase();
-  const cookieHeader = await loginGrafanaCookie(base);
-  if (!cookieHeader) {
-    return NextResponse.json({ error: "Grafana login failed (no session cookie)" }, { status: 502 });
+  const grafanaAuth = await resolveGrafanaDsQueryHeaders(base);
+  if (!grafanaAuth.ok) {
+    return NextResponse.json({ error: grafanaAuth.error }, { status: 502 });
   }
+  const grafanaRequestHeaders = grafanaAuth.headers;
 
   if (mode === "emails") {
     const maxFrom = parseTime(body.maxFrom);
@@ -109,7 +110,7 @@ export async function POST(req: NextRequest) {
     }
     const logs = await queryVfsGlobalBotLogs({
       base,
-      cookieHeader,
+      grafanaRequestHeaders,
       from: maxFrom,
       to: maxTo,
       query: "Max upload",
@@ -155,7 +156,7 @@ export async function POST(req: NextRequest) {
     if (start >= end) break;
     const chunkLogs = await queryVfsGlobalBotLogs({
       base,
-      cookieHeader,
+      grafanaRequestHeaders,
       from: start,
       to: end,
       query: [email, UPLOAD_RESPONSE_FILTER],

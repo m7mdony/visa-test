@@ -25,7 +25,7 @@ function lokiLabelValue(v: string): string {
 
 async function queryVfsLogs(params: {
   base: string;
-  cookieHeader: string;
+  grafanaRequestHeaders: Record<string, string>;
   from: number;
   to: number;
   query: string;
@@ -36,7 +36,7 @@ async function queryVfsLogs(params: {
 }): Promise<LogEntry[]> {
   const {
     base,
-    cookieHeader,
+    grafanaRequestHeaders,
     from,
     to,
     query,
@@ -71,11 +71,7 @@ async function queryVfsLogs(params: {
   const { logs } = await fetchLokiQueryWithRetry({
     url: `${base}/api/ds/query?ds_type=loki&requestId=${encodeURIComponent(requestId)}`,
     headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; UiTest-DeniedPassports/1.0)",
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      Cookie: cookieHeader,
-      Origin: base,
+      ...grafanaRequestHeaders,
       "x-datasource-uid": LOKI_DATASOURCE_UID,
       "x-grafana-org-id": "1",
       "x-plugin-id": "loki",
@@ -122,7 +118,7 @@ export function parseDeniedEventsFromLogs(
 
 export async function buildDeniedPassportRows(params: {
   base: string;
-  cookieHeader: string;
+  grafanaRequestHeaders: Record<string, string>;
   from: number;
   to: number;
   app?: string;
@@ -130,7 +126,7 @@ export async function buildDeniedPassportRows(params: {
   deniedLogs: LogEntry[];
   maxEmails?: number;
 }): Promise<{ rows: DeniedPassportRow[]; errors: string[] }> {
-  const { base, cookieHeader, from, to, app, lokiNamespace, deniedLogs, maxEmails = 80 } = params;
+  const { base, grafanaRequestHeaders, from, to, app, lokiNamespace, deniedLogs, maxEmails = 80 } = params;
   const deniedEvents = parseDeniedEventsFromLogs(deniedLogs);
   const uniqueEmails = [...new Set(deniedEvents.map((e) => e.email))].slice(0, maxEmails);
   const errors: string[] = [];
@@ -139,7 +135,7 @@ export async function buildDeniedPassportRows(params: {
     try {
       const emailLogs = await queryVfsLogs({
         base,
-        cookieHeader,
+        grafanaRequestHeaders,
         from,
         to,
         app,

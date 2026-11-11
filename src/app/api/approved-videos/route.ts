@@ -5,6 +5,8 @@ import {
   IDNFY_STATUS_LOKI_FILTER,
   IDNFY_STATUS_RESPONSE_LOKI_FILTER,
   fetchLokiQueryWithRetry,
+  getGrafanaBase,
+  isGrafanaConfigured,
   LOKI_MAX_LINES_PER_QUERY,
   LOKI_QUERY_BATCH_SIZE,
   isErroredVideoAttemptLine,
@@ -37,10 +39,8 @@ import {
   type StatusVideoEvent,
 } from "@/lib/reportEvents";
 import { stripAnsiCodes } from "@/components/AnsiLogLine";
+import { resolveGrafanaDsQueryHeaders } from "@/lib/grafanaAuth";
 
-const GRAFANA_URL = process.env.GRAFANA_URL ?? "";
-const GRAFANA_USER = process.env.GRAFANA_USER ?? "admin";
-const GRAFANA_PASSWORD = process.env.GRAFANA_PASSWORD ?? "";
 const LOKI_DATASOURCE_UID = process.env.LOKI_DATASOURCE_UID ?? "P8E80F9AEF21F6940";
 const INTERVAL_MS: Record<string, number> = {
   "15m": 15 * 60 * 1000,
@@ -111,13 +111,6 @@ type TaskPayloadIatRow = {
   iatTime: string | null;
   invalidToken: boolean;
 };
-
-function getCookieHeader(setCookie: string[]): string {
-  return setCookie
-    .map((c) => c.split(";")[0].trim())
-    .filter(Boolean)
-    .join("; ");
-}
 
 function dedupeLogEntries(entries: LogEntry[]): LogEntry[] {
   const seen = new Set<string>();
@@ -1243,35 +1236,6 @@ function buildInvalidTokenPrefixSet(logs: LogEntry[], relevantPrefixes: Set<stri
   return out;
 }
 
-async function loginCookie(base: string): Promise<string> {
-  const loginUrl = `${base}/login`;
-  const headers: Record<string, string> = {
-    "User-Agent": "Mozilla/5.0 (compatible; Approved-Videos-UI/1.0)",
-    "Accept": "application/json",
-    "Content-Type": "application/json",
-    "Referer": loginUrl,
-  };
-  const loginRes = await fetch(loginUrl, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      user: GRAFANA_USER,
-      password: GRAFANA_PASSWORD,
-    }),
-    redirect: "manual",
-    // @ts-expect-error Node fetch may accept this for self-signed
-    rejectUnauthorized: false,
-  });
-  let setCookie: string[] = [];
-  if (typeof loginRes.headers.getSetCookie === "function") {
-    setCookie = loginRes.headers.getSetCookie();
-  } else {
-    const sc = loginRes.headers.get("set-cookie");
-    if (sc) setCookie = [sc];
-  }
-  return getCookieHeader(setCookie);
-}
-
 function lokiLabelValue(v: string): string {
   return v.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
@@ -1371,7 +1335,7 @@ function logIdnfyParseDebug(
 
 async function queryLogs(params: {
   base: string;
-  cookieHeader: string;
+  grafanaRequestHeaders: Record<string, string>;
   from: number;
   to: number;
   app: string;
@@ -1384,7 +1348,7 @@ async function queryLogs(params: {
 }): Promise<LogEntry[]> {
   const {
     base,
-    cookieHeader,
+    grafanaRequestHeaders,
     from,
     to,
     app,
@@ -1395,11 +1359,8 @@ async function queryLogs(params: {
   } = params;
   const cappedMaxLines = Math.min(maxLines, LOKI_MAX_LINES_PER_QUERY);
   const headers: Record<string, string> = {
+    ...grafanaRequestHeaders,
     "User-Agent": "Mozilla/5.0 (compatible; Approved-Videos-UI/1.0)",
-    "Accept": "application/json",
-    "Content-Type": "application/json",
-    "Cookie": cookieHeader,
-    "Origin": base,
     "Referer": `${base}/login`,
     "x-datasource-uid": LOKI_DATASOURCE_UID,
     "x-grafana-org-id": "1",
@@ -1443,7 +1404,7 @@ export async function POST(req: NextRequest) {
   if (cookieStore.get("admin_auth")?.value !== "true") {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
-  if (!GRAFANA_URL) {
+  if (!isGrafanaConfigured()) {
     return NextResponse.json({ error: "GRAFANA_URL not configured" }, { status: 500 });
   }
 
@@ -1497,18 +1458,18 @@ export async function POST(req: NextRequest) {
     to = Date.now();
     from = to - ms;
   }
-  const base = GRAFANA_URL.replace(/\/$/, "");
-  const cookieHeader = await loginCookie(base);
-
-  if (!cookieHeader) {
-    return NextResponse.json({ error: "Grafana login failed (no session cookie)" }, { status: 502 });
+  const base = getGrafanaBase();
+  const grafanaAuth = await resolveGrafanaDsQueryHeaders(base);
+  if (!grafanaAuth.ok) {
+    return NextResponse.json({ error: grafanaAuth.error }, { status: 502 });
   }
+  const grafanaRequestHeaders = grafanaAuth.headers;
 
   const lokiQueryTasks = [
     () =>
       queryLogs({
         base,
-        cookieHeader,
+        grafanaRequestHeaders,
         from,
         to,
         app: target,
@@ -1519,7 +1480,7 @@ export async function POST(req: NextRequest) {
     () =>
       queryLogs({
         base,
-        cookieHeader,
+        grafanaRequestHeaders,
         from,
         to,
         app: target,
@@ -1530,7 +1491,7 @@ export async function POST(req: NextRequest) {
     () =>
       queryLogs({
         base,
-        cookieHeader,
+        grafanaRequestHeaders,
         from,
         to,
         app: target,
@@ -1543,7 +1504,7 @@ export async function POST(req: NextRequest) {
         ? Promise.all([
             queryLogs({
               base,
-              cookieHeader,
+              grafanaRequestHeaders,
               from,
               to,
               app: target,
@@ -1553,7 +1514,7 @@ export async function POST(req: NextRequest) {
             }),
             queryLogs({
               base,
-              cookieHeader,
+              grafanaRequestHeaders,
               from,
               to,
               app: target,
@@ -1564,7 +1525,7 @@ export async function POST(req: NextRequest) {
           ]).then(([faceDenied, legacyNever]) => dedupeLogEntries([...faceDenied, ...legacyNever]))
         : queryLogs({
             base,
-            cookieHeader,
+            grafanaRequestHeaders,
             from,
             to,
             app: target,
@@ -1575,7 +1536,7 @@ export async function POST(req: NextRequest) {
     () =>
       queryLogs({
         base,
-        cookieHeader,
+        grafanaRequestHeaders,
         from,
         to,
         app: target,
@@ -1587,7 +1548,7 @@ export async function POST(req: NextRequest) {
     () =>
       queryLogs({
         base,
-        cookieHeader,
+        grafanaRequestHeaders,
         from,
         to,
         app: target,
@@ -1599,7 +1560,7 @@ export async function POST(req: NextRequest) {
     () =>
       queryLogs({
         base,
-        cookieHeader,
+        grafanaRequestHeaders,
         from,
         to,
         app: target,
@@ -1610,7 +1571,7 @@ export async function POST(req: NextRequest) {
     () =>
       queryLogs({
         base,
-        cookieHeader,
+        grafanaRequestHeaders,
         from,
         to,
         app: target,
@@ -1621,7 +1582,7 @@ export async function POST(req: NextRequest) {
     () =>
       queryLogs({
         base,
-        cookieHeader,
+        grafanaRequestHeaders,
         from,
         to,
         app: target,
@@ -1633,7 +1594,7 @@ export async function POST(req: NextRequest) {
     () =>
       queryLogs({
         base,
-        cookieHeader,
+        grafanaRequestHeaders,
         from,
         to,
         app: azureLivenessApp,
@@ -1643,7 +1604,7 @@ export async function POST(req: NextRequest) {
     () =>
       queryLogs({
         base,
-        cookieHeader,
+        grafanaRequestHeaders,
         from,
         to,
         app: azureLivenessApp,
@@ -1653,7 +1614,7 @@ export async function POST(req: NextRequest) {
     () =>
       queryLogs({
         base,
-        cookieHeader,
+        grafanaRequestHeaders,
         from,
         to,
         app: azureLivenessApp,
@@ -1663,7 +1624,7 @@ export async function POST(req: NextRequest) {
     () =>
       queryLogs({
         base,
-        cookieHeader,
+        grafanaRequestHeaders,
         from,
         to,
         app: azureLivenessApp,
@@ -1673,7 +1634,7 @@ export async function POST(req: NextRequest) {
     () =>
       queryLogs({
         base,
-        cookieHeader,
+        grafanaRequestHeaders,
         from,
         to,
         app: azureLivenessApp,
@@ -1683,7 +1644,7 @@ export async function POST(req: NextRequest) {
     () =>
       queryLogs({
         base,
-        cookieHeader,
+        grafanaRequestHeaders,
         from,
         to,
         app: azureLivenessApp,
@@ -2168,7 +2129,7 @@ export async function POST(req: NextRequest) {
   let deniedPassportErrors: string[] = [];
   const { rows: deniedPassportRows, errors: deniedLookupErrors } = await buildDeniedPassportRows({
     base,
-    cookieHeader,
+    grafanaRequestHeaders,
     from,
     to,
     app: target,
@@ -2233,7 +2194,7 @@ export async function POST(req: NextRequest) {
   if (emailsNeedingPassport.size > 0) {
     const { passportByEmail, errors: enrichErrors } = await lookupPassportsByEmailBatch({
       base,
-      cookieHeader,
+      grafanaRequestHeaders,
       from,
       to,
       app: target,

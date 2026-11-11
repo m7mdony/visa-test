@@ -9,10 +9,10 @@ import {
   fetchLokiQueryWithRetry,
   getGrafanaBase,
   isGrafanaConfigured,
-  loginGrafanaCookie,
   LOKI_DATASOURCE_UID,
   LOKI_MAX_LINES_PER_QUERY,
 } from "@/lib/grafanaLoki";
+import { resolveGrafanaDsQueryHeaders } from "@/lib/grafanaAuth";
 
 const INTERVAL_MS: Record<string, number> = {
   "15m": 15 * 60 * 1000,
@@ -77,18 +77,11 @@ export async function POST(req: NextRequest) {
   }
 
   const base = getGrafanaBase();
-  let cookieHeader: string;
-  try {
-    cookieHeader = await loginGrafanaCookie(base);
-  } catch (e: unknown) {
-    return NextResponse.json(
-      { error: e instanceof Error ? e.message : "Grafana login failed" },
-      { status: 502 }
-    );
+  const grafanaAuth = await resolveGrafanaDsQueryHeaders(base);
+  if (!grafanaAuth.ok) {
+    return NextResponse.json({ error: grafanaAuth.error }, { status: 502 });
   }
-  if (!cookieHeader) {
-    return NextResponse.json({ error: "Grafana login failed (no session cookie)" }, { status: 502 });
-  }
+  const grafanaRequestHeaders = grafanaAuth.headers;
 
   const queryBody = {
     queries: [
@@ -110,11 +103,8 @@ export async function POST(req: NextRequest) {
   const { httpStatus, raw, logs } = await fetchLokiQueryWithRetry({
     url: `${base}/api/ds/query?ds_type=loki&requestId=${encodeURIComponent("bot-notable-errors")}`,
     headers: {
+      ...grafanaRequestHeaders,
       "User-Agent": "Mozilla/5.0 (compatible; UiTest-BotErrors/1.0)",
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      Cookie: cookieHeader,
-      Origin: base,
       "x-datasource-uid": LOKI_DATASOURCE_UID,
       "x-grafana-org-id": "1",
       "x-plugin-id": "loki",

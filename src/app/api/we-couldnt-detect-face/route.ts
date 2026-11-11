@@ -5,13 +5,13 @@ import {
   fetchLokiQueryWithRetry,
   getGrafanaBase,
   isGrafanaConfigured,
-  loginGrafanaCookie,
   LOKI_DATASOURCE_UID,
   LOKI_MAX_LINES_PER_QUERY,
   LOKI_QUERY_BATCH_SIZE,
   runInBatches,
   type LogEntry,
 } from "@/lib/grafanaLoki";
+import { resolveGrafanaDsQueryHeaders } from "@/lib/grafanaAuth";
 import { buildWeCouldntDetectFaceRows } from "@/lib/weCouldntDetectFaceVideos";
 
 export const maxDuration = 300;
@@ -39,7 +39,7 @@ function parseTime(v: unknown): number | null {
 
 async function queryLokiLogs(params: {
   base: string;
-  cookieHeader: string;
+  grafanaRequestHeaders: Record<string, string>;
   from: number;
   to: number;
   app: string;
@@ -47,7 +47,7 @@ async function queryLokiLogs(params: {
   query: string | string[];
   requestId: string;
 }): Promise<LogEntry[]> {
-  const { base, cookieHeader, from, to, app, lokiNamespace, query, requestId } = params;
+  const { base, grafanaRequestHeaders, from, to, app, lokiNamespace, query, requestId } = params;
   const appEsc = lokiLabelValue(app);
   const selector =
     lokiNamespace && lokiNamespace.trim().length > 0
@@ -73,11 +73,8 @@ async function queryLokiLogs(params: {
   const { logs } = await fetchLokiQueryWithRetry({
     url: `${base}/api/ds/query?ds_type=loki&requestId=${encodeURIComponent(requestId)}`,
     headers: {
+      ...grafanaRequestHeaders,
       "User-Agent": "Mozilla/5.0 (compatible; WeCouldntDetectFace/1.0)",
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      Cookie: cookieHeader,
-      Origin: base,
       "x-datasource-uid": LOKI_DATASOURCE_UID,
       "x-grafana-org-id": "1",
       "x-plugin-id": "loki",
@@ -118,10 +115,11 @@ export async function POST(req: NextRequest) {
     deploymentEnv === "staging" ? AZURE_LIVENESS_BOT_APP_STAGING : AZURE_LIVENESS_BOT_APP_PROD;
 
   const base = getGrafanaBase();
-  const cookieHeader = await loginGrafanaCookie(base);
-  if (!cookieHeader) {
-    return NextResponse.json({ error: "Grafana login failed (no session cookie)" }, { status: 502 });
+  const grafanaAuth = await resolveGrafanaDsQueryHeaders(base);
+  if (!grafanaAuth.ok) {
+    return NextResponse.json({ error: grafanaAuth.error }, { status: 502 });
   }
+  const grafanaRequestHeaders = grafanaAuth.headers;
 
   const queryFrom = Math.max(0, fromVal - LOOKBACK_MS);
 
@@ -131,7 +129,7 @@ export async function POST(req: NextRequest) {
       () =>
         queryLokiLogs({
           base,
-          cookieHeader,
+          grafanaRequestHeaders,
           from: fromVal,
           to: toVal,
           app: target,
@@ -142,7 +140,7 @@ export async function POST(req: NextRequest) {
       () =>
         queryLokiLogs({
           base,
-          cookieHeader,
+          grafanaRequestHeaders,
           from: queryFrom,
           to: toVal,
           app: target,
@@ -153,7 +151,7 @@ export async function POST(req: NextRequest) {
       () =>
         queryLokiLogs({
           base,
-          cookieHeader,
+          grafanaRequestHeaders,
           from: queryFrom,
           to: toVal,
           app: solverApp,
@@ -163,7 +161,7 @@ export async function POST(req: NextRequest) {
       () =>
         queryLokiLogs({
           base,
-          cookieHeader,
+          grafanaRequestHeaders,
           from: queryFrom,
           to: toVal,
           app: solverApp,
@@ -173,7 +171,7 @@ export async function POST(req: NextRequest) {
       () =>
         queryLokiLogs({
           base,
-          cookieHeader,
+          grafanaRequestHeaders,
           from: queryFrom,
           to: toVal,
           app: solverApp,

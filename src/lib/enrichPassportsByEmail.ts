@@ -14,7 +14,7 @@ function lokiLabelValue(v: string): string {
 
 async function queryEmailLogs(params: {
   base: string;
-  cookieHeader: string;
+  grafanaRequestHeaders: Record<string, string>;
   from: number;
   to: number;
   email: string;
@@ -22,7 +22,7 @@ async function queryEmailLogs(params: {
   lokiNamespace?: string | null;
   requestId: string;
 }): Promise<LogEntry[]> {
-  const { base, cookieHeader, from, to, email, app = "vfs-global-bot", lokiNamespace, requestId } = params;
+  const { base, grafanaRequestHeaders, from, to, email, app = "vfs-global-bot", lokiNamespace, requestId } = params;
   const appEsc = lokiLabelValue(app);
   const selector =
     lokiNamespace && lokiNamespace.trim().length > 0
@@ -32,11 +32,7 @@ async function queryEmailLogs(params: {
   const { logs } = await fetchLokiQueryWithRetry({
     url: `${base}/api/ds/query?ds_type=loki&requestId=${encodeURIComponent(requestId)}`,
     headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; UiTest-EnrichPassports/1.0)",
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      Cookie: cookieHeader,
-      Origin: base,
+      ...grafanaRequestHeaders,
       "x-datasource-uid": LOKI_DATASOURCE_UID,
       "x-grafana-org-id": "1",
       "x-plugin-id": "loki",
@@ -66,7 +62,7 @@ async function queryEmailLogs(params: {
 /** Batch Loki `email=…` queries to resolve passport numbers for log emails. */
 export async function lookupPassportsByEmailBatch(params: {
   base: string;
-  cookieHeader: string;
+  grafanaRequestHeaders: Record<string, string>;
   from: number;
   to: number;
   emails: string[];
@@ -74,7 +70,7 @@ export async function lookupPassportsByEmailBatch(params: {
   lokiNamespace?: string | null;
   maxEmails?: number;
 }): Promise<{ passportByEmail: Map<string, string | null>; errors: string[] }> {
-  const { base, cookieHeader, from, to, app, lokiNamespace, maxEmails = 100 } = params;
+  const { base, grafanaRequestHeaders, from, to, app, lokiNamespace, maxEmails = 100 } = params;
   const unique = [...new Set(params.emails.map((e) => e.trim().toLowerCase()).filter((e) => e.includes("@")))].slice(
     0,
     maxEmails
@@ -84,7 +80,7 @@ export async function lookupPassportsByEmailBatch(params: {
     try {
       const logs = await queryEmailLogs({
         base,
-        cookieHeader,
+        grafanaRequestHeaders,
         from,
         to,
         email,
